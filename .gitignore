@@ -1,62 +1,77 @@
-# Everything except explicitly tracked
+# Track only the ESP INT8 source/docs needed to rebuild and review the project.
+# Large/generated artifacts stay local: HLS work dirs, Vivado/Vitis platforms,
+# bitstreams, SD-card data, QAT/hw_artifacts outputs, logs and executables.
+
 /*
 !.gitignore
 
-# Source code
+# PS-side application source.
 !/ESP_INT8_app/
 /ESP_INT8_app/build/
 /ESP_INT8_app/_ide/
+/ESP_INT8_app/.vscode/
 /ESP_INT8_app/*.json
+/ESP_INT8_app/compile_commands.json
+/ESP_INT8_app/src/.cache/
+/ESP_INT8_app/src/.compile_commands/
+/ESP_INT8_app/src/.clangd
 /ESP_INT8_app/src/compile_commands.json
-/ESP_INT8_app/src/.clangd/
 
+# HLS component source, headers, testbenches and configuration files.
 !/ESP_INT8_hls/
 /ESP_INT8_hls/ESP_INT8_hls/
 /ESP_INT8_hls/hls_work*/
 /ESP_INT8_hls/cosim_logs/
-/ESP_INT8_hls/hls_output/
 /ESP_INT8_hls/csim_monitor_logs/
+/ESP_INT8_hls/hls_output/
 /ESP_INT8_hls/hg_p*/
-/ESP_INT8_hls/*.exe
-/ESP_INT8_hls/*.dump
-/ESP_INT8_hls/*.log
-/ESP_INT8_hls/*.err
-/ESP_INT8_hls/*.out
-/ESP_INT8_hls/*.bin
-/ESP_INT8_hls/hs_err*
 /ESP_INT8_hls/.Xil/
 /ESP_INT8_hls/.cache/
 /ESP_INT8_hls/.rigel_lopper/
 /ESP_INT8_hls/compile_commands.json
+/ESP_INT8_hls/dfx_runtime.txt
+/ESP_INT8_hls/*.exe
+/ESP_INT8_hls/*.bin
+/ESP_INT8_hls/*.dump
+/ESP_INT8_hls/*.log
+/ESP_INT8_hls/*.err
+/ESP_INT8_hls/*.out
+/ESP_INT8_hls/hs_err*
 
-# Design docs
-!/int8_npu_design/
-
-# Reports
+# Design notes, workplans and slide/reference documents.
 !/report_and_workplans/
-/report_and_workplans/*.html
 
-# Tools
+# Data-processing and audit scripts.
 !/tools/
 /tools/__pycache__/
 
-# C model
-!/npu_perf_cmodel/
-
-# Backups
+# Large/generated model and hardware artifacts.
 /backups/
-
-# QAT artifacts (large binary files)
-/quantized_artifacts_hw_constrained_qat_3ep/
 /hw_artifacts/
+/quantized_artifacts*/
+/sd_backup/
 
-# Platform/build outputs
+# Vivado/Vitis platform and project outputs.
 /platform_*/
 /ESP_INT8_platform/
 /ESP_INT8_vp*/
+/ESP_Acc*/
 
-# Misc
-/sd_backup/
-/hls_perf_attribution_*.csv
-/*.tmp
-/*.csv
+# Misc generated outputs.
+*.elf
+*.o
+*.d
+*.pdi
+*.bit
+*.bin
+*.csv
+*.tmp
+*.log
+*.out
+*.err
+*.dmp
+*.jou
+*.str
+*.wdb
+*.vcd
+__pycache__/
