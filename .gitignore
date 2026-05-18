@@ -1,0 +1,62 @@
+# Everything except explicitly tracked
+/*
+!.gitignore
+
+# Source code
+!/ESP_INT8_app/
+/ESP_INT8_app/build/
+/ESP_INT8_app/_ide/
+/ESP_INT8_app/*.json
+/ESP_INT8_app/src/compile_commands.json
+/ESP_INT8_app/src/.clangd/
+
+!/ESP_INT8_hls/
+/ESP_INT8_hls/ESP_INT8_hls/
+/ESP_INT8_hls/hls_work*/
+/ESP_INT8_hls/cosim_logs/
+/ESP_INT8_hls/hls_output/
+/ESP_INT8_hls/csim_monitor_logs/
+/ESP_INT8_hls/hg_p*/
+/ESP_INT8_hls/*.exe
+/ESP_INT8_hls/*.dump
+/ESP_INT8_hls/*.log
+/ESP_INT8_hls/*.err
+/ESP_INT8_hls/*.out
+/ESP_INT8_hls/*.bin
+/ESP_INT8_hls/hs_err*
+/ESP_INT8_hls/.Xil/
+/ESP_INT8_hls/.cache/
+/ESP_INT8_hls/.rigel_lopper/
+/ESP_INT8_hls/compile_commands.json
+
+# Design docs
+!/int8_npu_design/
+
+# Reports
+!/report_and_workplans/
+/report_and_workplans/*.html
+
+# Tools
+!/tools/
+/tools/__pycache__/
+
+# C model
+!/npu_perf_cmodel/
+
+# Backups
+/backups/
+
+# QAT artifacts (large binary files)
+/quantized_artifacts_hw_constrained_qat_3ep/
+/hw_artifacts/
+
+# Platform/build outputs
+/platform_*/
+/ESP_INT8_platform/
+/ESP_INT8_vp*/
+
+# Misc
+/sd_backup/
+/hls_perf_attribution_*.csv
+/*.tmp
+/*.csv
