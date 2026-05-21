@@ -539,23 +539,6 @@ bool on_chip_memory_read_byte(u8_t tensor_id, u32_t elem_offset, u8_t& value) {
     return read_bank_byte(desc.bank_id, desc.base_offset + elem_offset, value);
 }
 
-bool on_chip_memory_read_elem(const tensor_desc_t& desc, u16_t h, u16_t w, u16_t c, i8_t& value) {
-#pragma HLS INLINE off
-    if (h >= desc.h || w >= desc.w || c >= desc.c) {
-        value = 0;
-        return false;
-    }
-
-    u8_t raw = 0;
-    const u32_t byte_offset = desc.base_offset + tensor_elem_offset(desc, h, w, c);
-    if (!read_bank_byte(desc.bank_id, byte_offset, raw)) {
-        value = 0;
-        return false;
-    }
-    value.range(7, 0) = raw;
-    return true;
-}
-
 bool on_chip_memory_read_tile(const tensor_desc_t& desc,
                               i32_t h,
                               i32_t w,

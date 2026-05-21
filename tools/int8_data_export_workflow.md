@@ -257,3 +257,53 @@ set "CLEAN_OUTPUT=1"
 - `uop_count=75`
 
 只有满足以上条件的数据，才可作为后续 FPGA/NPU 推理比对基准。若用于板端 bit-level 比对，优先使用 HLS C model 导出的 `hls_output_q.bin` 作为整数硬件语义参考。
+
+## 6. 全验证集板端测试数据导出
+
+`D:\ESPNet\generate_val_dataset.py` 是 FP32 版验证集导出脚本，不能直接用于当前 INT8 NPU。INT8 全验证集应使用：
+
+```bat
+D:\ESP_INT8\tools\export_val_hw_dataset.bat ^
+  --out-dir D:\ESP_INT8\hw_artifacts\hw_constrained_qat_3ep_val ^
+  --batch-size 4
+```
+
+该 `.bat` 会调用 `D:\ESPNet\.venv\Scripts\python.exe`。输出目录采用 SD 友好的短文件名：
+
+- `PARAM.BIN`：共享参数 blob
+- `I0000.BIN`：第 0 张验证图的 NHWC INT8 输入，大小 `1572864` bytes
+- `R0000.BIN`：fake-quant classifier 参考 logits，NHWC INT8，大小 `16384` bytes
+- `T0000.BIN`：remap 后 target mask，大小 `8192` bytes
+- `M0000.BIN`：参考 logits 的 argmax mask，大小 `8192` bytes
+- `VALMAN.CSV` / `manifest.json`：文件索引、原始图片路径和参考 PA/mIoU
+
+轻量自检命令：
+
+```bat
+D:\ESP_INT8\tools\export_val_hw_dataset.bat ^
+  --out-dir D:\ESP_INT8\hw_artifacts\val_export_smoke ^
+  --limit 1 ^
+  --check-single
+```
+
+`--check-single` 会检查 `I0000.BIN/R0000.BIN` 是否与当前单图 `input_q.bin/golden_output_q.bin` bit-exact 一致。完整 val set 约 500 张，单输入文件约 1.5 MB，总数据量约 0.8 GB；后续板端 app 可按 `VALMAN.CSV` 顺序读取 `Ixxxx.BIN` 并输出 `Oxxxx.BIN`，再由主机离线计算全验证集 PA/mIoU。
+
+脚本默认使用 CPU 生成参考 logits，以保持和旧单图 golden dump 完全一致；如只需要快速生成近似软件参考，可显式加 `--cuda`，但不建议与 `--check-single` 混用。
+
+板端批量跑完后，可用下面的脚本离线评估输出：
+
+```bat
+D:\ESP_INT8\tools\eval_val_hw_outputs.bat ^
+  --dataset-dir D:\ESP_INT8\hw_artifacts\hw_constrained_qat_3ep_val ^
+  --output-pattern O%%04d.BIN
+```
+
+该脚本读取 `VALMAN.CSV`、`Txxxx.BIN` 和板端输出 `Oxxxx.BIN`，计算整体验证集 PA/mIoU，并可统计相对 `Rxxxx.BIN` 的 logits/mask 差异。
+
+当前 val set 版 app 的 SD 卡根目录应放置：
+
+- `PARAM.BIN`
+- 可选 `INPUTQ.BIN`：用于上板后先跑一次单图 profiling；若不存在，app 自动使用 `I0000.BIN`
+- `I0000.BIN ... I0499.BIN`
+
+运行流程为：先执行一次单图 `MODE_RUN` 并打印 `NPU: prof SINGLE ...` 计数器，再依次执行验证集 `Ixxxx.BIN -> Oxxxx.BIN`。验证集循环在遇到首个缺失输入文件时停止，并在末尾打印 sample 数、总时间、平均/最小/最大单图延迟。

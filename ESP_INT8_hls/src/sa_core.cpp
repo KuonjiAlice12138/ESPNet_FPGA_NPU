@@ -111,8 +111,7 @@ void systolic_array_core(
     hls::stream<act_vec_t>& act_stream,
     hls::stream<wgt_vec_t>& wgt_stream,
     hls::stream<i32_t>& psum_stream,
-    const conv_cfg_t& cfg,
-    volatile std::uint32_t& dbg_psum_words) {
+    const conv_cfg_t& cfg) {
 #pragma HLS INLINE off
     const u16_t out_h = conv_out_dim(cfg.in_h, cfg.stride);
     const u16_t out_w = conv_out_dim(cfg.in_w, cfg.stride);
@@ -123,8 +122,6 @@ void systolic_array_core(
     const int out_w_i = static_cast<int>(out_w.to_uint());
     const int k_tiles_i = static_cast<int>(k_tiles.to_uint());
     const int oc_tiles_i = static_cast<int>(oc_tiles.to_uint());
-    std::uint32_t emitted = 0;
-    dbg_psum_words = 0;
 
     for (int oc_tile_i = 0; oc_tile_i < MAX_C_TILE_COUNT; ++oc_tile_i) {
         if (oc_tile_i >= oc_tiles_i) {
@@ -174,15 +171,10 @@ void systolic_array_core(
                         break;
                     }
                     psum_stream.write(psum[tm]);
-                    ++emitted;
-                    if ((emitted & 0x3ffU) == 0U) {
-                        dbg_psum_words = emitted;
-                    }
                 }
             }
         }
     }
-    dbg_psum_words = emitted;
 }
 
 void systolic_array_core_row(

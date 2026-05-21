@@ -21,10 +21,6 @@ error_code_t if_dec_error();
 u16_t if_dec_current_uop_id();
 void frame_dma_load(const axi_vec_t* gmem_frame_in);
 void frame_dma_store(axi_vec_t* gmem_frame_out);
-void frame_dma_store_tensor(axi_vec_t* gmem_frame_out,
-                            const tensor_desc_t& desc,
-                            u32_t max_words);
-void perf_irq_update(u32_t mode, u32_t uop_count);
 bool avgpool_unit_checked(const tensor_desc_t& src,
                           const tensor_desc_t& dst,
                           const pool_q_t& qparam,
@@ -66,7 +62,6 @@ void systolic_array_core_row(hls::stream<act_vec_t>& act_stream,
 
 static param_blob_header_t s_param_header;
 static core_status_t s_status;
-static perf_counters_t s_perf;
 static bool s_param_ready = false;
 static tensor_desc_t s_scratch_desc[4];
 static bool s_scratch_valid[4] = {false, false, false, false};
@@ -85,174 +80,6 @@ enum scratch_region_t : unsigned {
   SCRATCH_REGION_L30 = 3,
   SCRATCH_REGION_L3B0 = 4,
 };
-
-struct debug_cfg_t {
-  bool enabled;
-  bool stop_enabled;
-  u16_t stop_after_uop;
-  u8_t dump_tensor_id;
-  u32_t dump_words;
-  u32_t expected_uop_count;
-};
-
-enum debug_phase_t : std::uint8_t {
-  DBG_PHASE_IDLE = 0,
-  DBG_PHASE_INIT = 1,
-  DBG_PHASE_PARAM_DMA = 2,
-  DBG_PHASE_IF_DEC = 3,
-  DBG_PHASE_FRAME_LOAD = 4,
-  DBG_PHASE_UOP_FETCH = 5,
-  DBG_PHASE_POOL = 6,
-  DBG_PHASE_STORE = 7,
-  DBG_PHASE_ADD = 8,
-  DBG_PHASE_AFFINE = 9,
-  DBG_PHASE_CONV = 10,
-  DBG_PHASE_DUMP = 11,
-  DBG_PHASE_FRAME_STORE = 12,
-  DBG_PHASE_DONE = 13,
-  DBG_PHASE_ERROR = 14,
-};
-
-static u8_t s_dbg_opcode = 0;
-static u16_t s_dbg_last_done_uop = 0xffffU;
-static u16_t s_dbg_heartbeat = 0;
-static u32_t s_prof_uop_count = 0;
-static u32_t s_prof_conv_count = 0;
-static u32_t s_prof_win_read_ops = 0;
-static u32_t s_prof_win_words = 0;
-static u32_t s_prof_wgt_words = 0;
-static u32_t s_prof_sa_mac_steps = 0;
-static u32_t s_prof_psum_words = 0;
-static u32_t s_prof_out_tiles = 0;
-static u32_t s_prof_out_rmw_ops = 0;
-static u32_t s_prof_model_cycles = 0;
-static u32_t s_prof2_win_saved_reads = 0;
-static u32_t s_prof2_win_actual_reads = 0;
-static u32_t s_prof2_out_direct_words = 0;
-static u32_t s_prof2_out_rmw_reads = 0;
-static u32_t s_prof3_wgt_cycles = 0;
-static u32_t s_prof3_win_cycles = 0;
-static u32_t s_prof3_sa_cycles = 0;
-static u32_t s_prof3_post_cycles = 0;
-static u32_t s_prof3_write_cycles = 0;
-static u32_t s_prof3_row_region_cycles = 0;
-
-static std::uint32_t pack_debug_status(debug_phase_t phase) {
-#pragma HLS INLINE
-  const std::uint32_t phase_u = static_cast<std::uint32_t>(phase) & 0xffU;
-  const std::uint32_t opcode_u = static_cast<std::uint32_t>(s_dbg_opcode.to_uint()) & 0xffU;
-  const std::uint32_t current_u =
-      static_cast<std::uint32_t>(s_status.current_uop_id.to_uint()) & 0xffU;
-  const std::uint32_t last_done_u =
-      static_cast<std::uint32_t>(s_dbg_last_done_uop.to_uint()) & 0xffU;
-  return phase_u | (opcode_u << 8) | (current_u << 16) | (last_done_u << 24);
-}
-
-static void debug_mark(volatile std::uint32_t& dbg_status,
-                       volatile std::uint32_t& dbg_heartbeat,
-                       debug_phase_t phase) {
-#pragma HLS INLINE
-  s_dbg_heartbeat = static_cast<u16_t>(s_dbg_heartbeat + 1);
-  dbg_status = pack_debug_status(phase);
-  dbg_heartbeat = (static_cast<std::uint32_t>(s_status.error_code.to_uint()) << 16) |
-                  static_cast<std::uint32_t>(s_dbg_heartbeat.to_uint());
-}
-
-static void debug_clear(volatile std::uint32_t& dbg_status,
-                        volatile std::uint32_t& dbg_heartbeat,
-                        volatile std::uint32_t& dbg_act_words,
-                        volatile std::uint32_t& dbg_wgt_words,
-                        volatile std::uint32_t& dbg_psum_words,
-                        volatile std::uint32_t& dbg_out_words) {
-#pragma HLS INLINE
-  s_dbg_opcode = 0;
-  s_dbg_last_done_uop = 0xffffU;
-  s_dbg_heartbeat = 0;
-  dbg_status = 0;
-  dbg_heartbeat = 0;
-  dbg_act_words = 0;
-  dbg_wgt_words = 0;
-  dbg_psum_words = 0;
-  dbg_out_words = 0;
-}
-
-static void debug_set_uop(volatile std::uint32_t& dbg_status,
-                          volatile std::uint32_t& dbg_heartbeat,
-                          u16_t uop_id,
-                          u8_t opcode,
-                          debug_phase_t phase) {
-#pragma HLS INLINE
-  s_status.current_uop_id = uop_id;
-  s_dbg_opcode = opcode;
-  debug_mark(dbg_status, dbg_heartbeat, phase);
-}
-
-static void profile_clear() {
-#pragma HLS INLINE
-  s_prof_uop_count = 0;
-  s_prof_conv_count = 0;
-  s_prof_win_read_ops = 0;
-  s_prof_win_words = 0;
-  s_prof_wgt_words = 0;
-  s_prof_sa_mac_steps = 0;
-  s_prof_psum_words = 0;
-  s_prof_out_tiles = 0;
-  s_prof_out_rmw_ops = 0;
-  s_prof_model_cycles = 0;
-  s_prof2_win_saved_reads = 0;
-  s_prof2_win_actual_reads = 0;
-  s_prof2_out_direct_words = 0;
-  s_prof2_out_rmw_reads = 0;
-  s_prof3_wgt_cycles = 0;
-  s_prof3_win_cycles = 0;
-  s_prof3_sa_cycles = 0;
-  s_prof3_post_cycles = 0;
-  s_prof3_write_cycles = 0;
-  s_prof3_row_region_cycles = 0;
-}
-
-static void profile_publish(volatile std::uint32_t& prof_uop_count,
-                            volatile std::uint32_t& prof_conv_count,
-                            volatile std::uint32_t& prof_win_read_ops,
-                            volatile std::uint32_t& prof_win_words,
-                            volatile std::uint32_t& prof_wgt_words,
-                            volatile std::uint32_t& prof_sa_mac_steps,
-                            volatile std::uint32_t& prof_psum_words,
-                            volatile std::uint32_t& prof_out_tiles,
-                            volatile std::uint32_t& prof_out_rmw_ops,
-                            volatile std::uint32_t& prof_model_cycles,
-                            volatile std::uint32_t& prof2_win_saved_reads,
-                            volatile std::uint32_t& prof2_win_actual_reads,
-                            volatile std::uint32_t& prof2_out_direct_words,
-                            volatile std::uint32_t& prof2_out_rmw_reads,
-                            volatile std::uint32_t& prof3_wgt_cycles,
-                            volatile std::uint32_t& prof3_win_cycles,
-                            volatile std::uint32_t& prof3_sa_cycles,
-                            volatile std::uint32_t& prof3_post_cycles,
-                            volatile std::uint32_t& prof3_write_cycles,
-                            volatile std::uint32_t& prof3_row_region_cycles) {
-#pragma HLS INLINE
-  prof_uop_count = s_prof_uop_count.to_uint();
-  prof_conv_count = s_prof_conv_count.to_uint();
-  prof_win_read_ops = s_prof_win_read_ops.to_uint();
-  prof_win_words = s_prof_win_words.to_uint();
-  prof_wgt_words = s_prof_wgt_words.to_uint();
-  prof_sa_mac_steps = s_prof_sa_mac_steps.to_uint();
-  prof_psum_words = s_prof_psum_words.to_uint();
-  prof_out_tiles = s_prof_out_tiles.to_uint();
-  prof_out_rmw_ops = s_prof_out_rmw_ops.to_uint();
-  prof_model_cycles = s_prof_model_cycles.to_uint();
-  prof2_win_saved_reads = s_prof2_win_saved_reads.to_uint();
-  prof2_win_actual_reads = s_prof2_win_actual_reads.to_uint();
-  prof2_out_direct_words = s_prof2_out_direct_words.to_uint();
-  prof2_out_rmw_reads = s_prof2_out_rmw_reads.to_uint();
-  prof3_wgt_cycles = s_prof3_wgt_cycles.to_uint();
-  prof3_win_cycles = s_prof3_win_cycles.to_uint();
-  prof3_sa_cycles = s_prof3_sa_cycles.to_uint();
-  prof3_post_cycles = s_prof3_post_cycles.to_uint();
-  prof3_write_cycles = s_prof3_write_cycles.to_uint();
-  prof3_row_region_cycles = s_prof3_row_region_cycles.to_uint();
-}
 
 static u32_t axi_lane_u32(const axi_vec_t& word, int lane) {
 #pragma HLS INLINE
@@ -275,38 +102,10 @@ static void clear_status() {
   s_status.current_uop_id = 0;
 }
 
-static void clear_perf() {
-#pragma HLS INLINE
-  s_perf.cycle_count = 0;
-  s_perf.ddr_read_bytes = 0;
-  s_perf.ddr_write_bytes = 0;
-  s_perf.stall_cycles = 0;
-}
-
 static void set_error(error_code_t err, u16_t uop_id) {
 #pragma HLS INLINE
   s_status.error_code = error_code_to_u16(err);
   s_status.current_uop_id = uop_id;
-}
-
-static debug_cfg_t decode_debug_cfg(std::uint32_t mode, std::uint32_t uop_count) {
-#pragma HLS INLINE
-  debug_cfg_t cfg;
-  const std::uint32_t stop_after_plus1 =
-      (uop_count & DEBUG_STOP_AFTER_MASK) >> DEBUG_STOP_AFTER_SHIFT;
-  const std::uint32_t expected = uop_count & DEBUG_UOP_COUNT_MASK;
-
-  cfg.enabled = (mode & DEBUG_MODE_ENABLE_MASK) != 0U;
-  cfg.stop_enabled = cfg.enabled && stop_after_plus1 != 0U;
-  cfg.stop_after_uop = (stop_after_plus1 == 0U)
-                           ? static_cast<u16_t>(0)
-                           : static_cast<u16_t>(stop_after_plus1 - 1U);
-  cfg.dump_tensor_id =
-      static_cast<u8_t>((mode & DEBUG_MODE_DUMP_TENSOR_MASK) >> DEBUG_MODE_DUMP_TENSOR_SHIFT);
-  cfg.dump_words =
-      static_cast<u32_t>((mode & DEBUG_MODE_DUMP_WORDS_MASK) >> DEBUG_MODE_DUMP_WORDS_SHIFT);
-  cfg.expected_uop_count = expected;
-  return cfg;
 }
 
 static std::uint32_t runtime_mode(std::uint32_t mode) {
@@ -758,298 +557,6 @@ static u16_t conv_kernel_flat(const conv_cfg_t& cfg) {
 #pragma HLS INLINE
   const u16_t kernel = conv_effective_kernel(cfg);
   return static_cast<u16_t>(cfg.in_c * kernel * kernel);
-}
-
-static u32_t profile_max_u32(u32_t a, u32_t b) {
-#pragma HLS INLINE
-  return (a > b) ? a : b;
-}
-
-static u32_t profile_min_u32(u32_t a, u32_t b) {
-#pragma HLS INLINE
-  return (a < b) ? a : b;
-}
-
-static u32_t profile_ceil_div_u32(u32_t a, u32_t b) {
-#pragma HLS INLINE
-  return (b == 0U) ? static_cast<u32_t>(0) : static_cast<u32_t>((a + b - 1U) / b);
-}
-
-static u32_t profile_out_write_ops_per_pixel(const uop_t& uop, const conv_cfg_t& cfg) {
-#pragma HLS INLINE
-  const unsigned byte0 = uop.c_offset.to_uint() & 0x1fU;
-  const unsigned lanes = cfg.out_c.to_uint();
-  const unsigned dst = uop.dst_tensor.to_uint();
-  const bool padded_word_stride =
-      dst == static_cast<unsigned>(TID_L20_CAT) ||
-      dst == static_cast<unsigned>(TID_L20_ACT) ||
-      dst == static_cast<unsigned>(TID_L2B0_CAT) ||
-      dst == static_cast<unsigned>(TID_L2B0_ACT) ||
-      dst == static_cast<unsigned>(TID_L30_CAT) ||
-      dst == static_cast<unsigned>(TID_L30_ACT) ||
-      dst == static_cast<unsigned>(TID_L3B0_CAT) ||
-      dst == static_cast<unsigned>(TID_L3B0_ACT) ||
-      dst == static_cast<unsigned>(TID_B3_CAT) ||
-      dst == static_cast<unsigned>(TID_B3_ACT);
-  if (byte0 == 0U && padded_word_stride && lanes <= static_cast<unsigned>(AXI_WORD_BYTES)) {
-    return 1U;
-  }
-  if (byte0 == 0U && lanes == static_cast<unsigned>(AXI_WORD_BYTES)) {
-    return 1U;
-  }
-  if (byte0 + lanes <= static_cast<unsigned>(AXI_WORD_BYTES)) {
-    return 2U;
-  }
-  return 4U;
-}
-
-static bool profile_uses_compact_row_write(const uop_t& uop, const conv_cfg_t& cfg) {
-#pragma HLS INLINE
-  const unsigned dst = uop.dst_tensor.to_uint();
-  const unsigned out_c = cfg.out_c.to_uint();
-  const unsigned pid = uop.param_id.to_uint();
-  if (uop.c_offset.to_uint() != 0U) {
-    return false;
-  }
-  if (out_c == 2U && dst == static_cast<unsigned>(TID_OUT)) {
-    return true;
-  }
-  if (out_c == 16U && dst == static_cast<unsigned>(TID_B1_CAT)) {
-    return true;
-  }
-  if (!(out_c == 12U || out_c == 16U || out_c == 25U || out_c == 28U)) {
-    return false;
-  }
-  const bool local_dst =
-      dst >= static_cast<unsigned>(LS_C1) &&
-      dst <= static_cast<unsigned>(LS_TMP);
-  if (local_dst && out_c == 12U) {
-    return true;
-  }
-  if (local_dst && (out_c == 25U || out_c == 28U)) {
-    return true;
-  }
-  if (pid >= 1U && pid <= 6U) {
-    return dst == static_cast<unsigned>(LS_C1);
-  }
-  if (pid >= 7U && pid <= 18U) {
-    return dst == static_cast<unsigned>(LS_C1) ||
-           dst == static_cast<unsigned>(LS_A) ||
-           dst == static_cast<unsigned>(LS_B) ||
-           dst == static_cast<unsigned>(LS_TMP);
-  }
-  return false;
-}
-
-static u32_t profile_out_write_ops_total(const uop_t& uop,
-                                         const conv_cfg_t& cfg,
-                                         u32_t out_h,
-                                         u32_t out_w,
-                                         u32_t out_pixels,
-                                         u32_t fallback_ops_per_pixel) {
-#pragma HLS INLINE
-  if (profile_uses_compact_row_write(uop, cfg)) {
-    if (cfg.out_c.to_uint() == 2U && (out_w.to_uint() & 15U) == 0U) {
-      return out_h * (out_w / 16U);
-    }
-    if (cfg.out_c.to_uint() == 12U && (out_w.to_uint() & 7U) == 0U) {
-      return out_h * (out_w / 8U) * 3U;
-    }
-    if (cfg.out_c.to_uint() == 16U && (out_w.to_uint() & 1U) == 0U) {
-      if (uop.dst_tensor.to_uint() == static_cast<unsigned>(TID_B1_CAT) &&
-          (out_w.to_uint() & 31U) == 0U) {
-        return out_h * (out_w / 32U) * 19U;
-      }
-      return out_h * (out_w / 2U);
-    }
-    if (cfg.out_c.to_uint() == 25U && (out_w.to_uint() & 31U) == 0U) {
-      return out_h * (out_w / 32U) * 25U;
-    }
-    if (cfg.out_c.to_uint() == 28U && (out_w.to_uint() & 7U) == 0U) {
-      return out_h * (out_w / 8U) * 7U;
-    }
-  }
-  return out_pixels * fallback_ops_per_pixel;
-}
-
-static u32_t profile_act_read_ops_per_pixel(const conv_cfg_t& cfg) {
-#pragma HLS INLINE
-  const u16_t kernel = conv_effective_kernel(cfg);
-  if (kernel == 1) {
-    return static_cast<u32_t>(ceil_div_u16(cfg.in_c, static_cast<u16_t>(TK)).to_uint());
-  }
-  return static_cast<u32_t>(9U) *
-         static_cast<u32_t>(ceil_div_u16(cfg.in_c, static_cast<u16_t>(TK)).to_uint());
-}
-
-static u32_t profile_win_actual_read_ops(const conv_cfg_t& cfg, u32_t out_h, u32_t out_w) {
-#pragma HLS INLINE
-  const u16_t kernel = conv_effective_kernel(cfg);
-  const u32_t out_pixels = out_h * out_w;
-  const unsigned in_c = cfg.in_c.to_uint();
-  if (kernel == 1) {
-    return out_pixels *
-           static_cast<u32_t>(ceil_div_u16(cfg.in_c, static_cast<u16_t>(TK)).to_uint());
-  }
-  if (in_c == 3U && cfg.stride.to_uint() == 2U && cfg.dilation.to_uint() == 1U) {
-    const unsigned out_w_u = out_w.to_uint();
-    u32_t row_reads = 0;
-    if (out_w_u != 0U) {
-      const unsigned inner = out_w_u - 1U;
-      const unsigned pair_count = inner >> 1;
-      const unsigned tail_count = inner & 1U;
-      row_reads = static_cast<u32_t>(9U + pair_count * 3U + tail_count * 3U);
-    }
-    return out_h * row_reads;
-  }
-  if (in_c == 19U && cfg.stride.to_uint() == 2U && cfg.dilation.to_uint() == 1U) {
-    const unsigned out_w_u = out_w.to_uint();
-    if (out_w_u == 0U || out_h.to_uint() == 0U) {
-      return 0;
-    }
-    const u32_t top_row_reads = out_w * static_cast<u32_t>(9U);
-    const unsigned inner = out_w_u - 1U;
-    const unsigned pair_count = inner >> 1;
-    const unsigned tail_count = inner & 1U;
-    const u32_t inner_row_reads =
-        static_cast<u32_t>(9U + pair_count * 9U + tail_count * 6U);
-    return top_row_reads + static_cast<u32_t>(out_h.to_uint() - 1U) * inner_row_reads;
-  }
-  if (in_c <= 32U && cfg.stride.to_uint() == 1U && cfg.dilation.to_uint() == 1U) {
-    const unsigned out_w_u = out_w.to_uint();
-    u32_t row_reads = 0;
-    if (out_w_u != 0U) {
-      row_reads = static_cast<u32_t>(9U + (out_w_u - 1U) * 3U);
-    }
-    return out_h * row_reads;
-  }
-  return out_pixels * profile_act_read_ops_per_pixel(cfg);
-}
-
-static u32_t profile_window_pack_cycles(const conv_cfg_t& cfg, u32_t out_pixels, u16_t k_tiles) {
-#pragma HLS INLINE
-  const u16_t kernel = conv_effective_kernel(cfg);
-  const unsigned in_c = cfg.in_c.to_uint();
-  const u16_t stride = conv_effective_stride(cfg);
-  const u16_t out_w = conv_out_dim(cfg.in_w, stride);
-  if (kernel == 1) {
-    return out_pixels * static_cast<u32_t>(k_tiles.to_uint());
-  }
-  if (in_c == 3U && cfg.stride.to_uint() == 2U && cfg.dilation.to_uint() == 1U) {
-    const unsigned out_w_u = out_w.to_uint();
-    const u16_t out_h = conv_out_dim(cfg.in_h, stride);
-    u32_t row_reads = 0;
-    if (out_w_u != 0U) {
-      const unsigned inner = out_w_u - 1U;
-      const unsigned pair_count = inner >> 1;
-      const unsigned tail_count = inner & 1U;
-      row_reads = static_cast<u32_t>(9U + pair_count * 3U + tail_count * 3U);
-    }
-    return static_cast<u32_t>(out_h.to_uint()) * row_reads;
-  }
-  if (in_c == 19U && cfg.stride.to_uint() == 2U && cfg.dilation.to_uint() == 1U) {
-    const unsigned out_w_u = out_w.to_uint();
-    const u16_t out_h = conv_out_dim(cfg.in_h, stride);
-    if (out_w_u == 0U || out_h.to_uint() == 0U) {
-      return 0;
-    }
-    const u32_t top_row_reads = static_cast<u32_t>(out_w_u) * static_cast<u32_t>(9U);
-    const unsigned inner = out_w_u - 1U;
-    const unsigned pair_count = inner >> 1;
-    const unsigned tail_count = inner & 1U;
-    const u32_t inner_row_reads =
-        static_cast<u32_t>(9U + pair_count * 9U + tail_count * 6U);
-    return top_row_reads + static_cast<u32_t>(out_h.to_uint() - 1U) * inner_row_reads;
-  }
-  if (in_c <= 32U) {
-    const u32_t segments_per_kt =
-        profile_min_u32(9U, profile_ceil_div_u32(static_cast<u32_t>(TK), static_cast<u32_t>(in_c)));
-    return out_pixels * static_cast<u32_t>(k_tiles.to_uint()) * segments_per_kt;
-  }
-  return out_pixels * profile_act_read_ops_per_pixel(cfg);
-}
-
-static u32_t profile_post_drain_cycles_per_pixel(const conv_cfg_t& cfg) {
-#pragma HLS INLINE
-  return profile_ceil_div_u32(static_cast<u32_t>(cfg.out_c.to_uint()), 4U);
-}
-
-static void profile_record_executed_uop() {
-#pragma HLS INLINE
-  s_prof_uop_count = static_cast<u32_t>(s_prof_uop_count + 1U);
-}
-
-static void profile_record_conv_uop(const uop_t& uop, const conv_cfg_t& cfg) {
-#pragma HLS INLINE
-  const u16_t stride = conv_effective_stride(cfg);
-  const u16_t out_h = conv_out_dim(cfg.in_h, stride);
-  const u16_t out_w = conv_out_dim(cfg.in_w, stride);
-  const u16_t k_total = conv_kernel_flat(cfg);
-  const u16_t k_tiles = ceil_div_u16(k_total, static_cast<u16_t>(TK));
-  const u16_t oc_tiles = ceil_div_u16(cfg.out_c, static_cast<u16_t>(TM));
-  const u32_t out_h_u = static_cast<u32_t>(out_h.to_uint());
-  const u32_t out_w_u = static_cast<u32_t>(out_w.to_uint());
-  const u32_t out_pixels = out_h_u * out_w_u;
-  const u32_t k_tiles_u = static_cast<u32_t>(k_tiles.to_uint());
-  const u32_t oc_tiles_u = static_cast<u32_t>(oc_tiles.to_uint());
-  const u32_t out_c_u = static_cast<u32_t>(cfg.out_c.to_uint());
-  const u32_t write_ops_per_pixel = profile_out_write_ops_per_pixel(uop, cfg);
-  const u32_t win_read_ops_baseline = out_pixels * profile_act_read_ops_per_pixel(cfg);
-  const u32_t win_read_ops = profile_win_actual_read_ops(cfg, out_h_u, out_w_u);
-  const u32_t win_words = out_pixels * k_tiles_u;
-  const u32_t wgt_stream_words = out_h_u * oc_tiles_u * k_tiles_u * static_cast<u32_t>(TM);
-  const u32_t sa_steps = out_pixels * oc_tiles_u * k_tiles_u;
-  const u32_t out_tiles = out_pixels * oc_tiles_u;
-  const u32_t psum_words = out_tiles;
-  const u32_t out_rmw_ops =
-      profile_out_write_ops_total(uop, cfg, out_h_u, out_w_u, out_pixels, write_ops_per_pixel);
-  u32_t win_saved_reads = 0;
-  if (win_read_ops_baseline > win_read_ops) {
-    win_saved_reads = static_cast<u32_t>(win_read_ops_baseline - win_read_ops);
-  }
-
-  const u32_t weight_cache_cycles = oc_tiles_u * k_tiles_u * static_cast<u32_t>(TM);
-  const u32_t win_cycles = profile_max_u32(win_read_ops,
-                                           profile_window_pack_cycles(cfg, out_pixels, k_tiles));
-  const u32_t win_row = profile_ceil_div_u32(win_cycles, out_h_u);
-  const u32_t output_drain_per_pixel = profile_post_drain_cycles_per_pixel(cfg);
-  const u32_t sa_per_pixel = oc_tiles_u * k_tiles_u;
-  const u32_t row_core = weight_cache_cycles +
-                         out_w_u * (sa_per_pixel + output_drain_per_pixel);
-  const u32_t write_row = profile_ceil_div_u32(out_rmw_ops, out_h_u);
-  const u32_t total_wgt_cycles = out_h_u * weight_cache_cycles;
-  const u32_t total_sa_cycles = out_pixels * sa_per_pixel;
-  const u32_t total_post_cycles = out_pixels * output_drain_per_pixel;
-  const u32_t total_write_cycles = out_h_u * write_row;
-  const u32_t total_row_region_cycles =
-      out_h_u * profile_max_u32(win_row, row_core);
-  const u32_t model_cycles = weight_cache_cycles +
-                             total_row_region_cycles + total_write_cycles;
-
-  s_prof_conv_count = static_cast<u32_t>(s_prof_conv_count + 1U);
-  s_prof_win_read_ops = static_cast<u32_t>(s_prof_win_read_ops + win_read_ops);
-  s_prof_win_words = static_cast<u32_t>(s_prof_win_words + win_words);
-  s_prof_wgt_words = static_cast<u32_t>(s_prof_wgt_words + wgt_stream_words);
-  s_prof_sa_mac_steps = static_cast<u32_t>(s_prof_sa_mac_steps + sa_steps);
-  s_prof_psum_words = static_cast<u32_t>(s_prof_psum_words + psum_words);
-  s_prof_out_tiles = static_cast<u32_t>(s_prof_out_tiles + out_tiles);
-  s_prof_out_rmw_ops = static_cast<u32_t>(s_prof_out_rmw_ops + out_rmw_ops);
-  s_prof_model_cycles = static_cast<u32_t>(s_prof_model_cycles + model_cycles);
-  s_prof2_win_saved_reads = static_cast<u32_t>(s_prof2_win_saved_reads + win_saved_reads);
-  s_prof2_win_actual_reads = static_cast<u32_t>(s_prof2_win_actual_reads + win_read_ops);
-  if (write_ops_per_pixel == 1U || profile_uses_compact_row_write(uop, cfg)) {
-    s_prof2_out_direct_words = static_cast<u32_t>(s_prof2_out_direct_words + out_rmw_ops);
-  }
-  if (out_rmw_ops > out_tiles && !profile_uses_compact_row_write(uop, cfg)) {
-    s_prof2_out_rmw_reads = static_cast<u32_t>(s_prof2_out_rmw_reads + out_rmw_ops - out_tiles);
-  }
-  s_prof3_wgt_cycles = static_cast<u32_t>(s_prof3_wgt_cycles + total_wgt_cycles);
-  s_prof3_win_cycles = static_cast<u32_t>(s_prof3_win_cycles + win_cycles);
-  s_prof3_sa_cycles = static_cast<u32_t>(s_prof3_sa_cycles + total_sa_cycles);
-  s_prof3_post_cycles = static_cast<u32_t>(s_prof3_post_cycles + total_post_cycles);
-  s_prof3_write_cycles = static_cast<u32_t>(s_prof3_write_cycles + total_write_cycles);
-  s_prof3_row_region_cycles =
-      static_cast<u32_t>(s_prof3_row_region_cycles + total_row_region_cycles);
 }
 
 static void set_act_vec_i8_dynamic(act_vec_t& word, int lane, i8_t value) {
@@ -1601,18 +1108,13 @@ static void execute_conv_stream_datapath(const tensor_desc_t& src,
                                          const conv_cfg_t& cfg,
                                          const uop_t& uop,
                                          const conv_q_t& qparam,
-                                         bool& ok_out,
-                                         volatile std::uint32_t& dbg_act_words,
-                                         volatile std::uint32_t& dbg_wgt_words,
-                                         volatile std::uint32_t& dbg_psum_words,
-                                         volatile std::uint32_t& dbg_out_words) {
+                                         bool& ok_out) {
 #pragma HLS INLINE off
   act_vec_t row_buf[MAX_FM_W];
 #pragma HLS BIND_STORAGE variable=row_buf type=ram_2p impl=bram
 
   const u16_t stride = conv_effective_stride(cfg);
   const u16_t out_h = conv_out_dim(cfg.in_h, stride);
-  const u16_t out_w = conv_out_dim(cfg.in_w, stride);
   const u16_t k_total = conv_kernel_flat(cfg);
   const u16_t k_tiles = ceil_div_u16(k_total, static_cast<u16_t>(TK));
   const u16_t oc_tiles = ceil_div_u16(cfg.out_c, static_cast<u16_t>(TM));
@@ -1643,11 +1145,6 @@ static void execute_conv_stream_datapath(const tensor_desc_t& src,
     }
   }
 
-  dbg_act_words = 0;
-  dbg_wgt_words = 0;
-  dbg_psum_words = 0;
-  dbg_out_words = 0;
-
   for (int oh_i = 0; oh_i < MAX_FM_H; ++oh_i) {
     if (oh_i >= out_h_i) {
       break;
@@ -1664,17 +1161,6 @@ static void execute_conv_stream_datapath(const tensor_desc_t& src,
     if (!store_conv_output_row(dst, oh, uop.c_offset, cfg, row_buf)) {
       write_ok = false;
     }
-
-    const std::uint32_t rows_done = static_cast<std::uint32_t>(oh_i + 1);
-    const std::uint32_t row_pixels = static_cast<std::uint32_t>(out_w.to_uint());
-    const std::uint32_t out_channels = static_cast<std::uint32_t>(cfg.out_c.to_uint());
-    dbg_act_words = rows_done * row_pixels * static_cast<std::uint32_t>(k_tiles.to_uint());
-    dbg_wgt_words = rows_done *
-                    static_cast<std::uint32_t>(oc_tiles.to_uint()) *
-                    static_cast<std::uint32_t>(k_tiles.to_uint()) *
-                    static_cast<std::uint32_t>(TM);
-    dbg_psum_words = rows_done * row_pixels * out_channels;
-    dbg_out_words = dbg_psum_words;
   }
   ok_out = write_ok;
 }
@@ -1702,11 +1188,7 @@ static error_code_t execute_pool_uop(const uop_t& uop) {
   return ERR_NONE;
 }
 
-static error_code_t execute_conv_uop(const uop_t& uop,
-                                     volatile std::uint32_t& dbg_act_words,
-                                     volatile std::uint32_t& dbg_wgt_words,
-                                     volatile std::uint32_t& dbg_psum_words,
-                                     volatile std::uint32_t& dbg_out_words) {
+static error_code_t execute_conv_uop(const uop_t& uop) {
 #pragma HLS INLINE off
   tensor_desc_t src;
   tensor_desc_t dst;
@@ -1739,21 +1221,12 @@ static error_code_t execute_conv_uop(const uop_t& uop,
   }
 
   bool conv_ok = false;
-  profile_record_conv_uop(uop, cfg);
-  dbg_act_words = 0;
-  dbg_wgt_words = 0;
-  dbg_psum_words = 0;
-  dbg_out_words = 0;
   execute_conv_stream_datapath(src,
                                dst,
                                cfg,
                                uop,
                                qparam,
-                               conv_ok,
-                               dbg_act_words,
-                               dbg_wgt_words,
-                               dbg_psum_words,
-                               dbg_out_words);
+                               conv_ok);
   if (!conv_ok) {
     return ERR_BANK_OVERFLOW;
   }
@@ -1930,13 +1403,7 @@ static error_code_t execute_store_uop(const uop_t& uop) {
   return ERR_NONE;
 }
 
-static error_code_t execute_uop_partial(const uop_t& uop,
-                                        volatile std::uint32_t& dbg_status,
-                                        volatile std::uint32_t& dbg_heartbeat,
-                                        volatile std::uint32_t& dbg_act_words,
-                                        volatile std::uint32_t& dbg_wgt_words,
-                                        volatile std::uint32_t& dbg_psum_words,
-                                        volatile std::uint32_t& dbg_out_words) {
+static error_code_t execute_uop_partial(const uop_t& uop) {
 #pragma HLS INLINE off
   const unsigned opcode = uop.opcode.to_uint();
   if (opcode == static_cast<unsigned>(UOP_NOP) ||
@@ -1944,28 +1411,19 @@ static error_code_t execute_uop_partial(const uop_t& uop,
     return ERR_NONE;
   }
   if (opcode == static_cast<unsigned>(UOP_POOL)) {
-    debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_POOL);
     return execute_pool_uop(uop);
   }
   if (opcode == static_cast<unsigned>(UOP_STORE)) {
-    debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_STORE);
     return execute_store_uop(uop);
   }
   if (opcode == static_cast<unsigned>(UOP_ADD)) {
-    debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_ADD);
     return execute_add_uop(uop);
   }
   if (opcode == static_cast<unsigned>(UOP_AFFINE)) {
-    debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_AFFINE);
     return execute_affine_uop(uop);
   }
   if (opcode == static_cast<unsigned>(UOP_CONV)) {
-    debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_CONV);
-    return execute_conv_uop(uop,
-                            dbg_act_words,
-                            dbg_wgt_words,
-                            dbg_psum_words,
-                            dbg_out_words);
+    return execute_conv_uop(uop);
   }
   if (opcode == static_cast<unsigned>(UOP_END)) {
     return ERR_NONE;
@@ -2052,128 +1510,75 @@ static error_code_t validate_param_header(const param_blob_header_t& header) {
   return ERR_NONE;
 }
 
-static void core_mode_init(const axi_vec_t* gmem_param,
-                           volatile std::uint32_t& dbg_status,
-                           volatile std::uint32_t& dbg_heartbeat) {
+static void core_mode_init(const axi_vec_t* gmem_param) {
 #pragma HLS INLINE off
   clear_status();
-  clear_perf();
   reset_scratch_state();
   s_param_ready = false;
-  debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_INIT);
 
   load_param_header(gmem_param, s_param_header);
   const error_code_t err = validate_param_header(s_param_header);
   if (err != ERR_NONE) {
     set_error(err, 0);
-    debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_ERROR);
     return;
   }
 
-  debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_PARAM_DMA);
   param_dma_init(gmem_param);
   if (!param_dma_ready()) {
     set_error(param_dma_error(), 0);
-    debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_ERROR);
     return;
   }
   s_param_ready = true;
-  debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_DONE);
 }
 
 static void core_mode_run(const axi_vec_t* gmem_frame_in,
                           axi_vec_t* gmem_frame_out,
                           const axi_vec_t* gmem_param,
-                          const debug_cfg_t& debug_cfg,
-                          volatile std::uint32_t& dbg_status,
-                          volatile std::uint32_t& dbg_heartbeat,
-                          volatile std::uint32_t& dbg_act_words,
-                          volatile std::uint32_t& dbg_wgt_words,
-                          volatile std::uint32_t& dbg_psum_words,
-                          volatile std::uint32_t& dbg_out_words) {
+                          u32_t expected_uop_count) {
 #pragma HLS INLINE off
   clear_status();
-  debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_INIT);
 
   if (!s_param_ready) {
     set_error(ERR_BAD_BLOB, 0);
-    debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_ERROR);
     return;
   }
 
-  if (debug_cfg.expected_uop_count != s_param_header.uop_count.to_uint()) {
+  if (expected_uop_count != s_param_header.uop_count.to_uint()) {
     set_error(ERR_UOP_DECODE, 0);
-    debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_ERROR);
     return;
   }
 
-  debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_IF_DEC);
-  instruction_fetch_decode(gmem_param, static_cast<u32_t>(debug_cfg.expected_uop_count));
+  instruction_fetch_decode(gmem_param, expected_uop_count);
   if (if_dec_error() != ERR_NONE) {
     set_error(if_dec_error(), if_dec_current_uop_id());
-    debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_ERROR);
     return;
   }
 
-  debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_FRAME_LOAD);
   frame_dma_load(gmem_frame_in);
 
   for (int uop_idx = 0; uop_idx < MAX_UOP_COUNT; ++uop_idx) {
-    if (uop_idx >= static_cast<int>(debug_cfg.expected_uop_count)) {
+    if (uop_idx >= static_cast<int>(expected_uop_count)) {
       break;
     }
 
     uop_t uop;
     if (!param_dma_get_uop(static_cast<u16_t>(uop_idx), uop)) {
       set_error(ERR_UOP_DECODE, static_cast<u16_t>(uop_idx));
-      debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_ERROR);
       return;
     }
-    debug_set_uop(dbg_status,
-                  dbg_heartbeat,
-                  static_cast<u16_t>(uop_idx),
-                  uop.opcode,
-                  DBG_PHASE_UOP_FETCH);
+    s_status.current_uop_id = static_cast<u16_t>(uop_idx);
     if (uop.opcode.to_uint() == static_cast<unsigned>(UOP_END)) {
       break;
     }
-    profile_record_executed_uop();
 
-    const error_code_t err = execute_uop_partial(uop,
-                                                 dbg_status,
-                                                 dbg_heartbeat,
-                                                 dbg_act_words,
-                                                 dbg_wgt_words,
-                                                 dbg_psum_words,
-                                                 dbg_out_words);
+    const error_code_t err = execute_uop_partial(uop);
     if (err != ERR_NONE) {
       set_error(err, static_cast<u16_t>(uop_idx));
-      debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_ERROR);
       return;
-    }
-    s_dbg_last_done_uop = static_cast<u16_t>(uop_idx);
-    debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_DONE);
-    if (debug_cfg.stop_enabled &&
-        static_cast<unsigned>(uop_idx) >= debug_cfg.stop_after_uop.to_uint()) {
-      break;
     }
   }
 
-  if (debug_cfg.enabled &&
-      debug_cfg.dump_tensor_id.to_uint() != static_cast<unsigned>(DEBUG_DUMP_TENSOR_DISABLED)) {
-    tensor_desc_t dump_desc;
-    debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_DUMP);
-    if (!resolve_tensor_read(debug_cfg.dump_tensor_id, dump_desc)) {
-      set_error(ERR_TENSOR_DESC_RANGE, s_status.current_uop_id);
-      debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_ERROR);
-      return;
-    }
-    frame_dma_store_tensor(gmem_frame_out, dump_desc, debug_cfg.dump_words);
-  } else {
-    debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_FRAME_STORE);
-    frame_dma_store(gmem_frame_out);
-  }
-  debug_mark(dbg_status, dbg_heartbeat, DBG_PHASE_DONE);
+  frame_dma_store(gmem_frame_out);
 }
 
 }  // namespace esp_int8
@@ -2187,67 +1592,13 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
                               esp_int8::axi_vec_t* gmem_frame_out,
                               const esp_int8::axi_vec_t* gmem_param,
                               std::uint32_t mode,
-                              std::uint32_t uop_count,
-                              volatile std::uint32_t& dbg_status,
-                              volatile std::uint32_t& dbg_heartbeat,
-                              volatile std::uint32_t& dbg_act_words,
-                              volatile std::uint32_t& dbg_wgt_words,
-                              volatile std::uint32_t& dbg_psum_words,
-                              volatile std::uint32_t& dbg_out_words,
-                              volatile std::uint32_t& dbg_hw_version,
-                              volatile std::uint32_t& prof_uop_count,
-                              volatile std::uint32_t& prof_conv_count,
-                              volatile std::uint32_t& prof_win_read_ops,
-                              volatile std::uint32_t& prof_win_words,
-                              volatile std::uint32_t& prof_wgt_words,
-                              volatile std::uint32_t& prof_sa_mac_steps,
-                              volatile std::uint32_t& prof_psum_words,
-                              volatile std::uint32_t& prof_out_tiles,
-                              volatile std::uint32_t& prof_out_rmw_ops,
-                              volatile std::uint32_t& prof_model_cycles,
-                              volatile std::uint32_t& prof2_win_saved_reads,
-                              volatile std::uint32_t& prof2_win_actual_reads,
-                              volatile std::uint32_t& prof2_out_direct_words,
-                              volatile std::uint32_t& prof2_out_rmw_reads,
-                              volatile std::uint32_t& prof3_wgt_cycles,
-                              volatile std::uint32_t& prof3_win_cycles,
-                              volatile std::uint32_t& prof3_sa_cycles,
-                              volatile std::uint32_t& prof3_post_cycles,
-                              volatile std::uint32_t& prof3_write_cycles,
-                              volatile std::uint32_t& prof3_row_region_cycles) {
+                              std::uint32_t uop_count) {
 #ifdef ESP_INT8_COSIM_LITE
 #pragma HLS INTERFACE ap_memory port=gmem_frame_in depth=49152
 #pragma HLS INTERFACE ap_memory port=gmem_frame_out depth=512
 #pragma HLS INTERFACE ap_memory port=gmem_param depth=4096
 #pragma HLS INTERFACE ap_none port=mode
 #pragma HLS INTERFACE ap_none port=uop_count
-#pragma HLS INTERFACE ap_none port=dbg_status
-#pragma HLS INTERFACE ap_none port=dbg_heartbeat
-#pragma HLS INTERFACE ap_none port=dbg_act_words
-#pragma HLS INTERFACE ap_none port=dbg_wgt_words
-#pragma HLS INTERFACE ap_none port=dbg_psum_words
-#pragma HLS INTERFACE ap_none port=dbg_out_words
-#pragma HLS INTERFACE ap_none port=dbg_hw_version
-#pragma HLS INTERFACE ap_none port=prof_uop_count
-#pragma HLS INTERFACE ap_none port=prof_conv_count
-#pragma HLS INTERFACE ap_none port=prof_win_read_ops
-#pragma HLS INTERFACE ap_none port=prof_win_words
-#pragma HLS INTERFACE ap_none port=prof_wgt_words
-#pragma HLS INTERFACE ap_none port=prof_sa_mac_steps
-#pragma HLS INTERFACE ap_none port=prof_psum_words
-#pragma HLS INTERFACE ap_none port=prof_out_tiles
-#pragma HLS INTERFACE ap_none port=prof_out_rmw_ops
-#pragma HLS INTERFACE ap_none port=prof_model_cycles
-#pragma HLS INTERFACE ap_none port=prof2_win_saved_reads
-#pragma HLS INTERFACE ap_none port=prof2_win_actual_reads
-#pragma HLS INTERFACE ap_none port=prof2_out_direct_words
-#pragma HLS INTERFACE ap_none port=prof2_out_rmw_reads
-#pragma HLS INTERFACE ap_none port=prof3_wgt_cycles
-#pragma HLS INTERFACE ap_none port=prof3_win_cycles
-#pragma HLS INTERFACE ap_none port=prof3_sa_cycles
-#pragma HLS INTERFACE ap_none port=prof3_post_cycles
-#pragma HLS INTERFACE ap_none port=prof3_write_cycles
-#pragma HLS INTERFACE ap_none port=prof3_row_region_cycles
 #pragma HLS INTERFACE ap_ctrl_hs port=return
 #else
 #pragma HLS INTERFACE m_axi port=gmem_frame_in offset=slave bundle=gmem0 depth=49152 max_read_burst_length=64 num_read_outstanding=4
@@ -2258,113 +1609,26 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
 #pragma HLS INTERFACE s_axilite port=gmem_param bundle=control
 #pragma HLS INTERFACE s_axilite port=mode bundle=control
 #pragma HLS INTERFACE s_axilite port=uop_count bundle=control
-#pragma HLS INTERFACE s_axilite port=dbg_status bundle=control
-#pragma HLS INTERFACE s_axilite port=dbg_heartbeat bundle=control
-#pragma HLS INTERFACE s_axilite port=dbg_act_words bundle=control
-#pragma HLS INTERFACE s_axilite port=dbg_wgt_words bundle=control
-#pragma HLS INTERFACE s_axilite port=dbg_psum_words bundle=control
-#pragma HLS INTERFACE s_axilite port=dbg_out_words bundle=control
-#pragma HLS INTERFACE s_axilite port=dbg_hw_version bundle=control
-#pragma HLS INTERFACE s_axilite port=prof_uop_count bundle=control
-#pragma HLS INTERFACE s_axilite port=prof_conv_count bundle=control
-#pragma HLS INTERFACE s_axilite port=prof_win_read_ops bundle=control
-#pragma HLS INTERFACE s_axilite port=prof_win_words bundle=control
-#pragma HLS INTERFACE s_axilite port=prof_wgt_words bundle=control
-#pragma HLS INTERFACE s_axilite port=prof_sa_mac_steps bundle=control
-#pragma HLS INTERFACE s_axilite port=prof_psum_words bundle=control
-#pragma HLS INTERFACE s_axilite port=prof_out_tiles bundle=control
-#pragma HLS INTERFACE s_axilite port=prof_out_rmw_ops bundle=control
-#pragma HLS INTERFACE s_axilite port=prof_model_cycles bundle=control
-#pragma HLS INTERFACE s_axilite port=prof2_win_saved_reads bundle=control
-#pragma HLS INTERFACE s_axilite port=prof2_win_actual_reads bundle=control
-#pragma HLS INTERFACE s_axilite port=prof2_out_direct_words bundle=control
-#pragma HLS INTERFACE s_axilite port=prof2_out_rmw_reads bundle=control
-#pragma HLS INTERFACE s_axilite port=prof3_wgt_cycles bundle=control
-#pragma HLS INTERFACE s_axilite port=prof3_win_cycles bundle=control
-#pragma HLS INTERFACE s_axilite port=prof3_sa_cycles bundle=control
-#pragma HLS INTERFACE s_axilite port=prof3_post_cycles bundle=control
-#pragma HLS INTERFACE s_axilite port=prof3_write_cycles bundle=control
-#pragma HLS INTERFACE s_axilite port=prof3_row_region_cycles bundle=control
 #pragma HLS INTERFACE s_axilite port=return bundle=control
 #endif
 
-  esp_int8::debug_clear(dbg_status,
-                        dbg_heartbeat,
-                        dbg_act_words,
-                        dbg_wgt_words,
-                        dbg_psum_words,
-                        dbg_out_words);
-  esp_int8::profile_clear();
-  esp_int8::profile_publish(prof_uop_count,
-                            prof_conv_count,
-                            prof_win_read_ops,
-                            prof_win_words,
-                            prof_wgt_words,
-                            prof_sa_mac_steps,
-                            prof_psum_words,
-                            prof_out_tiles,
-                            prof_out_rmw_ops,
-                            prof_model_cycles,
-                            prof2_win_saved_reads,
-                            prof2_win_actual_reads,
-                            prof2_out_direct_words,
-                            prof2_out_rmw_reads,
-                            prof3_wgt_cycles,
-                            prof3_win_cycles,
-                            prof3_sa_cycles,
-                            prof3_post_cycles,
-                            prof3_write_cycles,
-                            prof3_row_region_cycles);
-  dbg_hw_version = 0x20260518U;
-  const esp_int8::u32_t mode_hls = mode;
-  const esp_int8::u32_t uop_count_hls = uop_count;
   const std::uint32_t mode_runtime = esp_int8::runtime_mode(mode);
-  const esp_int8::debug_cfg_t debug_cfg = esp_int8::decode_debug_cfg(mode, uop_count);
+  const esp_int8::u32_t expected_uop_count = uop_count;
 
   switch (mode_runtime) {
     case esp_int8::MODE_INIT:
-      esp_int8::core_mode_init(gmem_param, dbg_status, dbg_heartbeat);
-      esp_int8::perf_irq_update(mode_hls, uop_count_hls);
+      esp_int8::core_mode_init(gmem_param);
       break;
     case esp_int8::MODE_RUN:
       esp_int8::core_mode_run(gmem_frame_in,
                               gmem_frame_out,
                               gmem_param,
-                              debug_cfg,
-                              dbg_status,
-                              dbg_heartbeat,
-                              dbg_act_words,
-                              dbg_wgt_words,
-                              dbg_psum_words,
-                              dbg_out_words);
-      esp_int8::perf_irq_update(mode_hls, uop_count_hls);
+                              expected_uop_count);
       break;
     case esp_int8::MODE_IDLE:
       break;
     default:
       esp_int8::set_error(esp_int8::ERR_INVALID_MODE, 0);
-      esp_int8::debug_mark(dbg_status, dbg_heartbeat, esp_int8::DBG_PHASE_ERROR);
-      esp_int8::perf_irq_update(mode_hls, uop_count_hls);
       break;
   }
-  esp_int8::profile_publish(prof_uop_count,
-                            prof_conv_count,
-                            prof_win_read_ops,
-                            prof_win_words,
-                            prof_wgt_words,
-                            prof_sa_mac_steps,
-                            prof_psum_words,
-                            prof_out_tiles,
-                            prof_out_rmw_ops,
-                            prof_model_cycles,
-                            prof2_win_saved_reads,
-                            prof2_win_actual_reads,
-                            prof2_out_direct_words,
-                            prof2_out_rmw_reads,
-                            prof3_wgt_cycles,
-                            prof3_win_cycles,
-                            prof3_sa_cycles,
-                            prof3_post_cycles,
-                            prof3_write_cycles,
-                            prof3_row_region_cycles);
 }

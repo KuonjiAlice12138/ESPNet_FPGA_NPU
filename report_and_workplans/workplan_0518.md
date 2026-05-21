@@ -2,51 +2,64 @@
 
 ## 1. 当前进展
 
-今天继续推进 P2 阶段性能收敛，目标是在保持 bit-exact 和 stream 主路径不变的前提下，一次性合并前四项局部优化，然后进入综合验证。
+今天完成 P2D 和 P2E 两版硬件的综合、平台导出和上板 full `MODE_RUN` 测试。P2D 证明 compact write/RMW 缩减方向有效；P2E 在此基础上继续推进 window read 和写回路径收敛，并加入/使用 profiling v3 计数器观察阶段开销。
 
-| 项目 | 当前状态 |
+| 项目 | 结果 |
 |---|---|
-| 已验证上板基线 | `INT8-BOARD-20260515-P2B-WGTFIFO-FLWIN` |
-| 基线延迟 | full `MODE_RUN = 46,893,423 cycles = 468 ms` |
-| 基线正确性 | `D72OUT.BIN` 与 HLS reference bit-exact |
-| 最新源码版本 | `INT8-BOARD-20260518-P2D-4OPT-PROFV3` |
-| 最新 HLS CSim | 整网 `top_tb` 通过，0 errors |
-| 当前阶段 | 等待 C synthesis 和 audit 报告 |
+| 当前最新版本 | `INT8-BOARD-20260518-P2E-WINPACK-PROFV3` |
+| full `MODE_RUN` | `39,941,854 cycles = 399 ms` |
+| 相比 P2D `407 ms` | 减少 `794,139 cycles`，约 `7.94 ms / 1.95%` |
+| 相比 P2B `468 ms` | 减少 `6,951,569 cycles`，约 `69.5 ms / 14.8%` |
+| 相比 PROF01 `817 ms` | 约 `51.2%` 总体降幅 |
+| 输出正确性 | `D72OUT.BIN` 与 HLS reference bit-exact，`0 / 16384` mismatch |
 
-P2B 的 profiling 数据显示，当前主要瓶颈仍集中在 window generation、写回/RMW、post/output drain 和低 PE 利用率的小通道卷积上。因此今天的修改不再只加计数器，而是直接做一轮更激进的硬件路径收敛。
+P2E 可以作为当前新的上板性能基线。相比 P2D，本轮收益较小，但它把剩余 RMW read 完全清零，说明输出写回路径已经基本收敛到当前数据布局下的较优状态。
 
-## 2. 今日修改
+## 2. Profiling 对比
 
-| 方向 | 修改 | 预期作用 |
-|---|---|---|
-| AvgPool C3 | 保留已实现的 C3 packed row fast path | 继续压缩 `U01_POOL1` 的前端开销 |
-| Small-C 3x3 | 将 C12/C19/C25 pack 函数改为内联，并新增 `C19 stride2` 行段读取路径 | 减少 level2 early conv 的 window read/pack 开销 |
-| Large-C 3x3 | 新增 `C131 stride2` 专用路径 | 针对 `U40` 这类大通道降采样卷积减少动态分段调度开销 |
-| Writeback/RMW | 增加 C12/C16 compact row aligned write | 将部分 scratch 输出从逐像素 RMW 改为整字写回 |
-| Profiling 模型 | 同步更新硬件 prof3 和离线 attribution 估计 | 便于后续解释优化收益来源 |
+| 计数项 | P2D | P2E | 变化 |
+|---|---:|---:|---:|
+| `win_read` | `4,419,328` | `4,077,946` | 减少 `341,382` |
+| `win_words` | `2,760,704` | `2,760,704` | 无变化 |
+| `wgt` | `468,992` | `468,992` | 无变化 |
+| `sa_steps` | `2,760,704` | `2,760,704` | 无变化 |
+| `psum` | `630,784` | `630,784` | 无变化 |
+| `out_tiles` | `630,784` | `630,784` | 无变化 |
+| `rmw_ops` | `860,160` | `347,136` | 减少 `513,024` |
+| `rmw_reads` | `352,256` | `0` | 清零 |
+| `direct_words` | `155,648` | `347,136` | 增加 `191,488` |
+| `model_cycles` | `8,044,096` | `7,457,344` | 减少 `586,752` |
 
-硬件接口和 uop 协议未改变；本轮改动集中在 `win_gen.cpp`、`memory.cpp`、`int8_core.cpp` 和性能分析脚本。
+P2E 的主要结构性收益仍来自写回路径：`rmw_reads=0`，`direct_words` 增加到 `347,136`。Window read 也有下降，但 `win_words` 和 `sa_steps` 不变，说明核心计算映射和 k-tile 数没有改变。
 
-## 3. 当前判断
+## 3. Profiling v3 观察
 
-本轮源码已经通过整网 CSim，说明功能路径与当前 golden reference 对齐。但这些修改对综合调度有一定风险，尤其是新增专用 window path 和 compact row write 后，必须重新检查：
+| 阶段计数 | cycles | 占实测比例 |
+|---|---:|---:|
+| `wgt_cyc` | `468,992` | `1.17%` |
+| `win_cyc` | `6,123,642` | `15.33%` |
+| `sa_cyc` | `2,760,704` | `6.91%` |
+| `post_cyc` | `2,465,792` | `6.17%` |
+| `write_cyc` | `347,136` | `0.87%` |
+| `row_region_cyc` | `7,104,512` | `17.79%` |
 
-| 风险项 | 检查重点 |
+P2E 的 `model_cycles = 7.46M`，但实测为 `39.94M cycles`，仍有约 `32.48M cycles` residual。也就是说，当前显式计数器解释了方向性收益，但还不能解释大部分真实延迟。后续不能再只围绕单个算子局部循环盲改，必须把 row-level 调度、memory back-pressure 和函数边界控制开销纳入模型。
+
+## 4. 当前判断
+
+| 方向 | 判断 |
 |---|---|
-| Dataflow 正确性 | 不能再出现 `HLS 214-475`、`HLS 200-975` 或 stream 读写冲突 |
-| Pipeline II | 关注 `emit_window_row_3x3_*`、`store_compact_*`、`on_chip_memory_*` 的 II 是否异常放大 |
-| 资源 | URAM 已满、BRAM 接近上限，不能引入新的大 buffer/FIFO |
-| Timing/LUT | HLS LUT 估计长期偏高，但若明显恶化，需要先收敛再上板 |
+| Output/RMW | 当前基本收敛，继续优化空间有限 |
+| Window generation | `win_read` 有下降但仍是显著阶段开销，需要继续做 row/window 级 profiling |
+| SA 阵列 | `sa_steps` 不变，短期不是主要收益点 |
+| Weight path | `wgt_cyc` 很低，不是瓶颈 |
+| Residual cycles | 最大未解释项，下一轮必须优先定位 |
+| 阵列形状 | 暂不建议改，单改阵列无法解决 `32M+` residual cycles |
 
-本轮离线模型的 lower-bound 从约 `83.6 ms` 降到约 `79.7 ms`，只能说明局部结构确有收益；真实收益仍以后续综合和上板 full `MODE_RUN` 为准。
+## 5. 下一步计划
 
-## 4. 下一步计划
-
-1. 手动运行当前版本 C synthesis。
-2. 使用 audit 脚本检查最新综合报告，确认无 dataflow/deadlock 类 blocker。
-3. 若综合通过且资源风险可接受，package IP 并导出新硬件平台，建议命名为 `platform_p2d_0518`。
-4. 在 Vitis 中 clean rebuild platform/app，确认 app tag 为 `INT8-BOARD-20260518-P2D-4OPT-PROFV3`。
-5. 上板运行单次 full `MODE_RUN`，记录 cycles、prof/prof2/prof3，并保存 `D72OUT.BIN`。
-6. 离线比对 `D72OUT.BIN` 与 HLS reference，bit-exact 后再把该版作为新的性能基线。
-
-若 P2D 延迟能明显低于 `468 ms`，下一轮继续沿 window/writeback 路线收敛；若收益有限，则需要转向更结构性的并行化，例如 small-Cout 多空间点并行或 post/writeback 与 row dataflow 的更深融合。
+1. 保留 P2E 作为当前 bit-exact 上板基线，记录 `399 ms`。
+2. 做 profiling v4：增加每层/每 row 的实际 cycle 计数，而不仅是全网累计阶段估计。
+3. 在 HLS 中定位 row-region 外的额外等待来源，重点检查 `execute_conv_stream_datapath` 外层循环、store 后同步、uop 调度和 on-chip memory 访问仲裁。
+4. 继续优化 window path，但必须以 `win_read/win_cyc/row_region_cyc` 的上板下降作为验收标准。
+5. 暂停大规模阵列形状调整；如后续评估 `64x16`，必须同步设计 activation-window replay/broadcast，否则会放大 window 生成压力。

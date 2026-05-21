@@ -430,12 +430,10 @@ static void emit_first_layer_3x3_windows(const tensor_desc_t& src_desc,
                                          hls::stream<act_vec_t>& act_stream,
                                          const conv_cfg_t& cfg,
                                          u16_t out_h,
-                                         u16_t out_w,
-                                         volatile std::uint32_t& dbg_act_words) {
+                                         u16_t out_w) {
 #pragma HLS INLINE off
     const int out_h_i = static_cast<int>(out_h.to_uint());
     const int out_w_i = static_cast<int>(out_w.to_uint());
-    std::uint32_t emitted = 0;
 
     for (int oh_i = 0; oh_i < MAX_FM_H; ++oh_i) {
         if (oh_i >= out_h_i) {
@@ -469,13 +467,8 @@ static void emit_first_layer_3x3_windows(const tensor_desc_t& src_desc,
             }
 
             act_stream.write(word);
-            ++emitted;
-            if ((emitted & 0x3ffU) == 0U) {
-                dbg_act_words = emitted;
-            }
         }
     }
-    dbg_act_words = emitted;
 }
 #endif
 
@@ -723,8 +716,7 @@ static void load_window_vector(const tensor_desc_t& src_desc,
 
 void window_generator(const tensor_desc_t& src_desc,
                       hls::stream<act_vec_t>& act_stream,
-                      const conv_cfg_t& cfg,
-                      volatile std::uint32_t& dbg_act_words) {
+                      const conv_cfg_t& cfg) {
 #pragma HLS INLINE off
     i8_t line_buf[1024][TK];
 #pragma HLS BIND_STORAGE variable=line_buf type=ram_2p impl=bram
@@ -740,11 +732,9 @@ void window_generator(const tensor_desc_t& src_desc,
     const int out_h_i = static_cast<int>(out_h.to_uint());
     const int out_w_i = static_cast<int>(out_w.to_uint());
     const int k_tiles_i = static_cast<int>(k_tiles.to_uint());
-    std::uint32_t emitted = 0;
-    dbg_act_words = 0;
 
     if (k_tiles == 1 && is_first_layer_3x3(cfg)) {
-        emit_first_layer_3x3_windows(src_desc, act_stream, cfg, out_h, out_w, dbg_act_words);
+        emit_first_layer_3x3_windows(src_desc, act_stream, cfg, out_h, out_w);
         return;
     }
 
@@ -766,10 +756,6 @@ void window_generator(const tensor_desc_t& src_desc,
                     set_vec_i8(word, lane, line_buf[ow_i][lane]);
                 }
                 act_stream.write(word);
-                ++emitted;
-                if ((emitted & 0x3ffU) == 0U) {
-                    dbg_act_words = emitted;
-                }
             }
         } else {
             for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
@@ -789,15 +775,10 @@ void window_generator(const tensor_desc_t& src_desc,
                         set_vec_i8(word, lane, vec_buf[lane]);
                     }
                     act_stream.write(word);
-                    ++emitted;
-                    if ((emitted & 0x3ffU) == 0U) {
-                        dbg_act_words = emitted;
-                    }
                 }
             }
         }
     }
-    dbg_act_words = emitted;
 }
 
 static void emit_window_row_1ktile(const tensor_desc_t& src_desc,

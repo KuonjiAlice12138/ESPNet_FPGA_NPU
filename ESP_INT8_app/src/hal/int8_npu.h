@@ -46,6 +46,10 @@ int int8_npu_run_debug(Int8NpuContext *ctx, UINTPTR input_addr,
                        UINTPTR output_addr, UINTPTR param_addr, u32 uop_count,
                        u32 stop_after_uop, u32 dump_tensor_id,
                        u32 dump_words, u32 timeout_polls, const char *tag);
+int int8_npu_run_profile_prefix(Int8NpuContext *ctx, UINTPTR input_addr,
+                                UINTPTR output_addr, UINTPTR param_addr,
+                                u32 uop_count, u32 stop_after_uop,
+                                u32 timeout_polls, const char *tag);
 void int8_npu_dump_regs(const Int8NpuContext *ctx, const char *tag);
 void int8_npu_dump_profile_regs(const Int8NpuContext *ctx, const char *tag);
 u32 int8_npu_read_ap_ctrl(const Int8NpuContext *ctx);

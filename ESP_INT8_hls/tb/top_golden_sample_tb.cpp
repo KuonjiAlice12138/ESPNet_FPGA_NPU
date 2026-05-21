@@ -11,34 +11,7 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
                               esp_int8::axi_vec_t* gmem_frame_out,
                               const esp_int8::axi_vec_t* gmem_param,
                               std::uint32_t mode,
-                              std::uint32_t uop_count,
-                              volatile std::uint32_t& dbg_status,
-                              volatile std::uint32_t& dbg_heartbeat,
-                              volatile std::uint32_t& dbg_act_words,
-                              volatile std::uint32_t& dbg_wgt_words,
-                              volatile std::uint32_t& dbg_psum_words,
-                              volatile std::uint32_t& dbg_out_words,
-                              volatile std::uint32_t& dbg_hw_version,
-                              volatile std::uint32_t& prof_uop_count,
-                              volatile std::uint32_t& prof_conv_count,
-                              volatile std::uint32_t& prof_win_read_ops,
-                              volatile std::uint32_t& prof_win_words,
-                              volatile std::uint32_t& prof_wgt_words,
-                              volatile std::uint32_t& prof_sa_mac_steps,
-                              volatile std::uint32_t& prof_psum_words,
-                              volatile std::uint32_t& prof_out_tiles,
-                              volatile std::uint32_t& prof_out_rmw_ops,
-                              volatile std::uint32_t& prof_model_cycles,
-                              volatile std::uint32_t& prof2_win_saved_reads,
-                              volatile std::uint32_t& prof2_win_actual_reads,
-                              volatile std::uint32_t& prof2_out_direct_words,
-                              volatile std::uint32_t& prof2_out_rmw_reads,
-                              volatile std::uint32_t& prof3_wgt_cycles,
-                              volatile std::uint32_t& prof3_win_cycles,
-                              volatile std::uint32_t& prof3_sa_cycles,
-                              volatile std::uint32_t& prof3_post_cycles,
-                              volatile std::uint32_t& prof3_write_cycles,
-                              volatile std::uint32_t& prof3_row_region_cycles);
+                              std::uint32_t uop_count);
 
 static bool read_binary(const char* path, std::vector<std::uint8_t>& bytes) {
     std::ifstream in(path, std::ios::binary);
@@ -120,33 +93,6 @@ int main() {
     static esp_int8::axi_vec_t frame_in[esp_int8::INPUT_FRAME_AXI_WORDS];
     static esp_int8::axi_vec_t frame_out[esp_int8::OUTPUT_FRAME_AXI_WORDS];
     static esp_int8::axi_vec_t param[4096];
-    volatile std::uint32_t dbg_status = 0;
-    volatile std::uint32_t dbg_heartbeat = 0;
-    volatile std::uint32_t dbg_act_words = 0;
-    volatile std::uint32_t dbg_wgt_words = 0;
-    volatile std::uint32_t dbg_psum_words = 0;
-    volatile std::uint32_t dbg_out_words = 0;
-    volatile std::uint32_t dbg_hw_version = 0;
-    volatile std::uint32_t prof_uop_count = 0;
-    volatile std::uint32_t prof_conv_count = 0;
-    volatile std::uint32_t prof_win_read_ops = 0;
-    volatile std::uint32_t prof_win_words = 0;
-    volatile std::uint32_t prof_wgt_words = 0;
-    volatile std::uint32_t prof_sa_mac_steps = 0;
-    volatile std::uint32_t prof_psum_words = 0;
-    volatile std::uint32_t prof_out_tiles = 0;
-    volatile std::uint32_t prof_out_rmw_ops = 0;
-    volatile std::uint32_t prof_model_cycles = 0;
-    volatile std::uint32_t prof2_win_saved_reads = 0;
-    volatile std::uint32_t prof2_win_actual_reads = 0;
-    volatile std::uint32_t prof2_out_direct_words = 0;
-    volatile std::uint32_t prof2_out_rmw_reads = 0;
-    volatile std::uint32_t prof3_wgt_cycles = 0;
-    volatile std::uint32_t prof3_win_cycles = 0;
-    volatile std::uint32_t prof3_sa_cycles = 0;
-    volatile std::uint32_t prof3_post_cycles = 0;
-    volatile std::uint32_t prof3_write_cycles = 0;
-    volatile std::uint32_t prof3_row_region_cycles = 0;
 
     if (param_words > 4096U) {
         std::printf("[FAIL] param blob too large for top TB buffer: words=%zu\n", param_words);
@@ -161,64 +107,10 @@ int main() {
 
     espnet_encoder_int8_core(frame_in, frame_out, param,
                              esp_int8::MODE_INIT,
-                             esp_int8::UOP_COUNT_ENCODER,
-                             dbg_status,
-                             dbg_heartbeat,
-                             dbg_act_words,
-                             dbg_wgt_words,
-                             dbg_psum_words,
-                             dbg_out_words,
-                             dbg_hw_version,
-                             prof_uop_count,
-                             prof_conv_count,
-                             prof_win_read_ops,
-                             prof_win_words,
-                             prof_wgt_words,
-                             prof_sa_mac_steps,
-                             prof_psum_words,
-                             prof_out_tiles,
-                             prof_out_rmw_ops,
-                             prof_model_cycles,
-                             prof2_win_saved_reads,
-                             prof2_win_actual_reads,
-                             prof2_out_direct_words,
-                             prof2_out_rmw_reads,
-                             prof3_wgt_cycles,
-                             prof3_win_cycles,
-                             prof3_sa_cycles,
-                             prof3_post_cycles,
-                             prof3_write_cycles,
-                             prof3_row_region_cycles);
+                             esp_int8::UOP_COUNT_ENCODER);
     espnet_encoder_int8_core(frame_in, frame_out, param,
                              esp_int8::MODE_RUN,
-                             esp_int8::UOP_COUNT_ENCODER,
-                             dbg_status,
-                             dbg_heartbeat,
-                             dbg_act_words,
-                             dbg_wgt_words,
-                             dbg_psum_words,
-                             dbg_out_words,
-                             dbg_hw_version,
-                             prof_uop_count,
-                             prof_conv_count,
-                             prof_win_read_ops,
-                             prof_win_words,
-                             prof_wgt_words,
-                             prof_sa_mac_steps,
-                             prof_psum_words,
-                             prof_out_tiles,
-                             prof_out_rmw_ops,
-                             prof_model_cycles,
-                             prof2_win_saved_reads,
-                             prof2_win_actual_reads,
-                             prof2_out_direct_words,
-                             prof2_out_rmw_reads,
-                             prof3_wgt_cycles,
-                             prof3_win_cycles,
-                             prof3_sa_cycles,
-                             prof3_post_cycles,
-                             prof3_write_cycles,
-                             prof3_row_region_cycles);
+                             esp_int8::UOP_COUNT_ENCODER);
 
     std::vector<std::uint8_t> hls_output(golden_bytes.size());
     for (std::size_t i = 0; i < hls_output.size(); ++i) {
@@ -229,39 +121,6 @@ int main() {
         return 1;
     }
     std::printf("wrote HLS output: %s bytes=%zu\n", hls_output_path, hls_output.size());
-    std::printf("top golden dbg status=0x%08x hb=0x%08x act=%u wgt=%u psum=%u out=%u hw=0x%08x\n",
-                static_cast<unsigned>(dbg_status),
-                static_cast<unsigned>(dbg_heartbeat),
-                static_cast<unsigned>(dbg_act_words),
-                static_cast<unsigned>(dbg_wgt_words),
-                static_cast<unsigned>(dbg_psum_words),
-                static_cast<unsigned>(dbg_out_words),
-                static_cast<unsigned>(dbg_hw_version));
-    std::printf("top golden prof uop=%u conv=%u win_read=%u win_words=%u wgt=%u "
-                "sa_steps=%u psum=%u out_tiles=%u rmw_ops=%u model_cycles=%u "
-                "win_saved=%u win_actual=%u direct_words=%u rmw_reads=%u "
-                "p3_wgt=%u p3_win=%u p3_sa=%u p3_post=%u p3_write=%u p3_row=%u\n",
-                static_cast<unsigned>(prof_uop_count),
-                static_cast<unsigned>(prof_conv_count),
-                static_cast<unsigned>(prof_win_read_ops),
-                static_cast<unsigned>(prof_win_words),
-                static_cast<unsigned>(prof_wgt_words),
-                static_cast<unsigned>(prof_sa_mac_steps),
-                static_cast<unsigned>(prof_psum_words),
-                static_cast<unsigned>(prof_out_tiles),
-                static_cast<unsigned>(prof_out_rmw_ops),
-                static_cast<unsigned>(prof_model_cycles),
-                static_cast<unsigned>(prof2_win_saved_reads),
-                static_cast<unsigned>(prof2_win_actual_reads),
-                static_cast<unsigned>(prof2_out_direct_words),
-                static_cast<unsigned>(prof2_out_rmw_reads),
-                static_cast<unsigned>(prof3_wgt_cycles),
-                static_cast<unsigned>(prof3_win_cycles),
-                static_cast<unsigned>(prof3_sa_cycles),
-                static_cast<unsigned>(prof3_post_cycles),
-                static_cast<unsigned>(prof3_write_cycles),
-                static_cast<unsigned>(prof3_row_region_cycles));
-
     int failures = 0;
     int max_abs_diff = 0;
     int max_signed_diff = std::numeric_limits<int>::min();

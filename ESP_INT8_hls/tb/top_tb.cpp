@@ -8,34 +8,7 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
                               esp_int8::axi_vec_t* gmem_frame_out,
                               const esp_int8::axi_vec_t* gmem_param,
                               std::uint32_t mode,
-                              std::uint32_t uop_count,
-                              volatile std::uint32_t& dbg_status,
-                              volatile std::uint32_t& dbg_heartbeat,
-                              volatile std::uint32_t& dbg_act_words,
-                              volatile std::uint32_t& dbg_wgt_words,
-                              volatile std::uint32_t& dbg_psum_words,
-                              volatile std::uint32_t& dbg_out_words,
-                              volatile std::uint32_t& dbg_hw_version,
-                              volatile std::uint32_t& prof_uop_count,
-                              volatile std::uint32_t& prof_conv_count,
-                              volatile std::uint32_t& prof_win_read_ops,
-                              volatile std::uint32_t& prof_win_words,
-                              volatile std::uint32_t& prof_wgt_words,
-                              volatile std::uint32_t& prof_sa_mac_steps,
-                              volatile std::uint32_t& prof_psum_words,
-                              volatile std::uint32_t& prof_out_tiles,
-                              volatile std::uint32_t& prof_out_rmw_ops,
-                              volatile std::uint32_t& prof_model_cycles,
-                              volatile std::uint32_t& prof2_win_saved_reads,
-                              volatile std::uint32_t& prof2_win_actual_reads,
-                              volatile std::uint32_t& prof2_out_direct_words,
-                              volatile std::uint32_t& prof2_out_rmw_reads,
-                              volatile std::uint32_t& prof3_wgt_cycles,
-                              volatile std::uint32_t& prof3_win_cycles,
-                              volatile std::uint32_t& prof3_sa_cycles,
-                              volatile std::uint32_t& prof3_post_cycles,
-                              volatile std::uint32_t& prof3_write_cycles,
-                              volatile std::uint32_t& prof3_row_region_cycles);
+                              std::uint32_t uop_count);
 
 static constexpr std::uint32_t OFF_TENSOR = 128;
 static constexpr std::uint32_t OFF_SCALE = 512;
@@ -135,33 +108,6 @@ int main() {
     static esp_int8::axi_vec_t frame_in[esp_int8::INPUT_FRAME_AXI_WORDS];
     static esp_int8::axi_vec_t frame_out[esp_int8::OUTPUT_FRAME_AXI_WORDS];
     static esp_int8::axi_vec_t param[64];
-    volatile std::uint32_t dbg_status = 0;
-    volatile std::uint32_t dbg_heartbeat = 0;
-    volatile std::uint32_t dbg_act_words = 0;
-    volatile std::uint32_t dbg_wgt_words = 0;
-    volatile std::uint32_t dbg_psum_words = 0;
-    volatile std::uint32_t dbg_out_words = 0;
-    volatile std::uint32_t dbg_hw_version = 0;
-    volatile std::uint32_t prof_uop_count = 0;
-    volatile std::uint32_t prof_conv_count = 0;
-    volatile std::uint32_t prof_win_read_ops = 0;
-    volatile std::uint32_t prof_win_words = 0;
-    volatile std::uint32_t prof_wgt_words = 0;
-    volatile std::uint32_t prof_sa_mac_steps = 0;
-    volatile std::uint32_t prof_psum_words = 0;
-    volatile std::uint32_t prof_out_tiles = 0;
-    volatile std::uint32_t prof_out_rmw_ops = 0;
-    volatile std::uint32_t prof_model_cycles = 0;
-    volatile std::uint32_t prof2_win_saved_reads = 0;
-    volatile std::uint32_t prof2_win_actual_reads = 0;
-    volatile std::uint32_t prof2_out_direct_words = 0;
-    volatile std::uint32_t prof2_out_rmw_reads = 0;
-    volatile std::uint32_t prof3_wgt_cycles = 0;
-    volatile std::uint32_t prof3_win_cycles = 0;
-    volatile std::uint32_t prof3_sa_cycles = 0;
-    volatile std::uint32_t prof3_post_cycles = 0;
-    volatile std::uint32_t prof3_write_cycles = 0;
-    volatile std::uint32_t prof3_row_region_cycles = 0;
 
     for (int i = 0; i < esp_int8::INPUT_FRAME_AXI_WORDS; ++i) {
         frame_in[i] = 0;
@@ -173,64 +119,10 @@ int main() {
 
     espnet_encoder_int8_core(frame_in, frame_out, param,
                              esp_int8::MODE_INIT,
-                             1,
-                             dbg_status,
-                             dbg_heartbeat,
-                             dbg_act_words,
-                             dbg_wgt_words,
-                             dbg_psum_words,
-                             dbg_out_words,
-                             dbg_hw_version,
-                             prof_uop_count,
-                             prof_conv_count,
-                             prof_win_read_ops,
-                             prof_win_words,
-                             prof_wgt_words,
-                             prof_sa_mac_steps,
-                             prof_psum_words,
-                             prof_out_tiles,
-                             prof_out_rmw_ops,
-                             prof_model_cycles,
-                             prof2_win_saved_reads,
-                             prof2_win_actual_reads,
-                             prof2_out_direct_words,
-                             prof2_out_rmw_reads,
-                             prof3_wgt_cycles,
-                             prof3_win_cycles,
-                             prof3_sa_cycles,
-                             prof3_post_cycles,
-                             prof3_write_cycles,
-                             prof3_row_region_cycles);
+                             1);
     espnet_encoder_int8_core(frame_in, frame_out, param,
                              esp_int8::MODE_RUN,
-                             1,
-                             dbg_status,
-                             dbg_heartbeat,
-                             dbg_act_words,
-                             dbg_wgt_words,
-                             dbg_psum_words,
-                             dbg_out_words,
-                             dbg_hw_version,
-                             prof_uop_count,
-                             prof_conv_count,
-                             prof_win_read_ops,
-                             prof_win_words,
-                             prof_wgt_words,
-                             prof_sa_mac_steps,
-                             prof_psum_words,
-                             prof_out_tiles,
-                             prof_out_rmw_ops,
-                             prof_model_cycles,
-                             prof2_win_saved_reads,
-                             prof2_win_actual_reads,
-                             prof2_out_direct_words,
-                             prof2_out_rmw_reads,
-                             prof3_wgt_cycles,
-                             prof3_win_cycles,
-                             prof3_sa_cycles,
-                             prof3_post_cycles,
-                             prof3_write_cycles,
-                             prof3_row_region_cycles);
+                             1);
 
     for (int i = 0; i < 16; ++i) {
         if (get_byte(frame_out[0], i) != 0) {

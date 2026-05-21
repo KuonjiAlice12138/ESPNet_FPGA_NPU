@@ -35,7 +35,18 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
                               volatile std::uint32_t& prof3_sa_cycles,
                               volatile std::uint32_t& prof3_post_cycles,
                               volatile std::uint32_t& prof3_write_cycles,
-                              volatile std::uint32_t& prof3_row_region_cycles);
+                              volatile std::uint32_t& prof3_row_region_cycles,
+                              volatile std::uint32_t& prof5_if_words,
+                              volatile std::uint32_t& prof5_frame_load_words,
+                              volatile std::uint32_t& prof5_frame_store_words,
+                              volatile std::uint32_t& prof5_uop_fetches,
+                              volatile std::uint32_t& prof5_pool_tiles,
+                              volatile std::uint32_t& prof5_affine_tiles,
+                              volatile std::uint32_t& prof5_add_tiles,
+                              volatile std::uint32_t& prof5_store_tiles,
+                              volatile std::uint32_t& prof5_nonconv_mem_ops,
+                              volatile std::uint32_t& prof5_conv_model_cycles,
+                              volatile std::uint32_t& prof5_total_work_units);
 
 static constexpr std::uint32_t OFF_TENSOR = 128;
 static constexpr std::uint32_t OFF_SCALE = 512;
@@ -281,6 +292,17 @@ int main() {
     volatile std::uint32_t prof3_post_cycles = 0;
     volatile std::uint32_t prof3_write_cycles = 0;
     volatile std::uint32_t prof3_row_region_cycles = 0;
+    volatile std::uint32_t prof5_if_words = 0;
+    volatile std::uint32_t prof5_frame_load_words = 0;
+    volatile std::uint32_t prof5_frame_store_words = 0;
+    volatile std::uint32_t prof5_uop_fetches = 0;
+    volatile std::uint32_t prof5_pool_tiles = 0;
+    volatile std::uint32_t prof5_affine_tiles = 0;
+    volatile std::uint32_t prof5_add_tiles = 0;
+    volatile std::uint32_t prof5_store_tiles = 0;
+    volatile std::uint32_t prof5_nonconv_mem_ops = 0;
+    volatile std::uint32_t prof5_conv_model_cycles = 0;
+    volatile std::uint32_t prof5_total_work_units = 0;
 
     for (int i = 0; i < esp_int8::INPUT_FRAME_AXI_WORDS; ++i) {
         frame_in[i] = 0;
@@ -328,7 +350,18 @@ int main() {
                              prof3_sa_cycles,
                              prof3_post_cycles,
                              prof3_write_cycles,
-                             prof3_row_region_cycles);
+                             prof3_row_region_cycles,
+                             prof5_if_words,
+                             prof5_frame_load_words,
+                             prof5_frame_store_words,
+                             prof5_uop_fetches,
+                             prof5_pool_tiles,
+                             prof5_affine_tiles,
+                             prof5_add_tiles,
+                             prof5_store_tiles,
+                             prof5_nonconv_mem_ops,
+                             prof5_conv_model_cycles,
+                             prof5_total_work_units);
     espnet_encoder_int8_core(frame_in, frame_out, param,
                              esp_int8::MODE_RUN,
                              4,
@@ -358,7 +391,18 @@ int main() {
                              prof3_sa_cycles,
                              prof3_post_cycles,
                              prof3_write_cycles,
-                             prof3_row_region_cycles);
+                             prof3_row_region_cycles,
+                             prof5_if_words,
+                             prof5_frame_load_words,
+                             prof5_frame_store_words,
+                             prof5_uop_fetches,
+                             prof5_pool_tiles,
+                             prof5_affine_tiles,
+                             prof5_add_tiles,
+                             prof5_store_tiles,
+                             prof5_nonconv_mem_ops,
+                             prof5_conv_model_cycles,
+                             prof5_total_work_units);
 
     for (int h = 0; h < 3; ++h) {
         for (int w = 0; w < 3; ++w) {
