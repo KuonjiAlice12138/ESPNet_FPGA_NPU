@@ -188,18 +188,6 @@ struct post_cfg_t {
   ap_uint<6> valid_tm;
 };
 
-struct core_status_t {
-  u16_t error_code;
-  u16_t current_uop_id;
-};
-
-struct perf_counters_t {
-  u64_t cycle_count;
-  u64_t ddr_read_bytes;
-  u64_t ddr_write_bytes;
-  u64_t stall_cycles;
-};
-
 using conv_q_t = conv_qparam_t;
 using aff_q_t = affine_qparam_t;
 using add_q_t = add_qparam_t;

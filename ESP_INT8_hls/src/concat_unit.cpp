@@ -3,18 +3,18 @@
 
 namespace esp_int8 {
 
-bool on_chip_memory_read_tile(const tensor_desc_t& desc,
-                              i32_t h,
-                              i32_t w,
-                              u16_t c_begin,
-                              u8_t valid_c,
-                              i8_t tile[TM]);
-bool on_chip_memory_write_tile(const tensor_desc_t& desc,
-                               u16_t h,
-                               u16_t w,
-                               u16_t c_begin,
-                               u8_t valid_c,
-                               const i8_t tile[TM]);
+bool on_chip_memory_read_packed_tile(const tensor_desc_t& desc,
+                                     i32_t h,
+                                     i32_t w,
+                                     u16_t c_begin,
+                                     u8_t valid_c,
+                                     act_vec_t& packed);
+bool on_chip_memory_write_packed_tile(const tensor_desc_t& desc,
+                                      u16_t h,
+                                      u16_t w,
+                                      u16_t c_begin,
+                                      u8_t valid_c,
+                                      act_vec_t packed);
 
 static u16_t desc_phys_c(const tensor_desc_t& desc) {
 #pragma HLS INLINE
@@ -91,22 +91,21 @@ bool concat_writer(const tensor_desc_t& src,
                 const u16_t c = static_cast<u16_t>(c_blk * TM);
                 const u16_t remaining = static_cast<u16_t>(valid_c - c);
                 const u8_t lanes = concat_lanes(remaining);
-                i8_t tile[TM];
-#pragma HLS ARRAY_PARTITION variable=tile complete dim=1
-                if (!on_chip_memory_read_tile(src,
-                                              static_cast<i32_t>(h),
-                                              static_cast<i32_t>(w),
-                                              c,
-                                              lanes,
-                                              tile)) {
+                act_vec_t packed = 0;
+                if (!on_chip_memory_read_packed_tile(src,
+                                                     static_cast<i32_t>(h),
+                                                     static_cast<i32_t>(w),
+                                                     c,
+                                                     lanes,
+                                                     packed)) {
                     return false;
                 }
-                if (!on_chip_memory_write_tile(dst,
-                                               h,
-                                               w,
-                                               static_cast<u16_t>(c_offset + c),
-                                               lanes,
-                                               tile)) {
+                if (!on_chip_memory_write_packed_tile(dst,
+                                                      h,
+                                                      w,
+                                                      static_cast<u16_t>(c_offset + c),
+                                                      lanes,
+                                                      packed)) {
                     return false;
                 }
             }

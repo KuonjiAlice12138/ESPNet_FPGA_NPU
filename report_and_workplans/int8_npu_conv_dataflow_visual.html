@@ -224,6 +224,74 @@
       font-size: 13px;
     }
 
+    .arch-panel {
+      overflow-x: auto;
+      padding: 10px 4px 2px;
+    }
+
+    .arch-svg {
+      display: block;
+      width: 100%;
+      min-width: 900px;
+      height: auto;
+    }
+
+    .arch-box {
+      fill: #ffffff;
+      stroke: #000000;
+      stroke-width: 1.4;
+    }
+
+    .arch-box.npu {
+      fill: #ffffff;
+      stroke: #000000;
+      stroke-width: 2;
+    }
+
+    .arch-title {
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      font-size: 14px;
+      font-weight: 850;
+      fill: #000000;
+    }
+
+    .arch-text {
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      font-size: 11px;
+      font-weight: 700;
+      fill: #000000;
+    }
+
+    .arch-small {
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 10px;
+      font-weight: 750;
+      fill: #000000;
+    }
+
+    .arch-link {
+      fill: none;
+      stroke: #000000;
+      stroke-width: 1.7;
+      marker-end: url(#archArrow);
+    }
+
+    .arch-link.ctrl {
+      stroke: #000000;
+      stroke-dasharray: 7 6;
+      marker-end: url(#archArrow);
+    }
+
+    .arch-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      margin-top: 12px;
+      color: #000000;
+      font-size: 13px;
+      font-weight: 720;
+    }
+
     .conv-map {
       display: grid;
       grid-template-columns: 1fr 1fr 1fr;
@@ -867,6 +935,101 @@
         <code>psum[oc] += A[k] * W[oc,k]</code>。
       </p>
     </header>
+
+    <section>
+      <h2>NPU 硬件架构总览</h2>
+      <p>
+        框图按当前 HLS 硬件模块粒度组织。PS 侧只保留处理器和 DDR，PL 侧突出以
+        <code>sa_core</code> 为中心的卷积计算数据流。
+      </p>
+      <div class="arch-panel">
+        <svg class="arch-svg" viewBox="0 0 1060 560" role="img" aria-label="ESPNet INT8 NPU hardware architecture block diagram">
+          <defs>
+            <marker id="archArrow" markerWidth="6" markerHeight="6" refX="5.5" refY="3" orient="auto">
+              <path d="M0,0 L6,3 L0,6 Z" fill="#000000"></path>
+            </marker>
+          </defs>
+
+          <rect x="96" y="36" width="868" height="494" rx="0" class="arch-box npu"></rect>
+          <rect x="124" y="88" width="812" height="76" rx="0" class="arch-box"></rect>
+          <rect x="124" y="206" width="812" height="34" rx="0" class="arch-box"></rect>
+          <rect x="124" y="272" width="812" height="230" rx="0" class="arch-box"></rect>
+
+          <text x="132" y="74" class="arch-title">Zynq UltraScale+ MPSoC</text>
+          <text x="138" y="112" class="arch-title">PS Side</text>
+          <text x="138" y="296" class="arch-title">PL Side</text>
+
+          <rect x="220" y="106" width="230" height="42" rx="0" class="arch-box"></rect>
+          <text x="280" y="131" class="arch-title">ARM Cortex-A53</text>
+
+          <rect x="568" y="106" width="250" height="42" rx="0" class="arch-box"></rect>
+          <text x="648" y="131" class="arch-title">DDR Memory</text>
+
+          <text x="476" y="229" class="arch-title">AXI Interconnect</text>
+
+          <rect x="172" y="316" width="108" height="44" rx="0" class="arch-box"></rect>
+          <text x="199" y="343" class="arch-title">frame_dma</text>
+
+          <rect x="172" y="386" width="108" height="44" rx="0" class="arch-box"></rect>
+          <text x="196" y="413" class="arch-title">param_dma</text>
+
+          <rect x="316" y="316" width="108" height="44" rx="0" class="arch-box"></rect>
+          <text x="344" y="343" class="arch-title">if_dec</text>
+
+          <rect x="316" y="386" width="108" height="44" rx="0" class="arch-box"></rect>
+          <text x="344" y="413" class="arch-title">memory</text>
+
+          <rect x="460" y="316" width="108" height="44" rx="0" class="arch-box"></rect>
+          <text x="486" y="343" class="arch-title">int8_core</text>
+          <text x="480" y="356" class="arch-small">top / add / affine</text>
+
+          <rect x="480" y="404" width="126" height="56" rx="0" class="arch-box"></rect>
+          <text x="518" y="438" class="arch-title">win_gen</text>
+
+          <rect x="642" y="382" width="154" height="86" rx="0" class="arch-box"></rect>
+          <text x="686" y="417" class="arch-title">sa_core</text>
+          <text x="684" y="440" class="arch-small">32x32 MAC</text>
+
+          <rect x="832" y="404" width="88" height="56" rx="0" class="arch-box"></rect>
+          <text x="860" y="438" class="arch-title">ppu</text>
+
+          <rect x="602" y="306" width="104" height="44" rx="0" class="arch-box"></rect>
+          <text x="630" y="333" class="arch-title">avgpool</text>
+
+          <rect x="740" y="306" width="104" height="44" rx="0" class="arch-box"></rect>
+          <text x="770" y="333" class="arch-title">concat</text>
+
+          <text x="704" y="94" class="arch-small">Data</text>
+          <text x="326" y="202" class="arch-small">Ctrl</text>
+          <text x="226" y="270" class="arch-small">MM</text>
+          <text x="692" y="270" class="arch-small">MM</text>
+
+          <path d="M335 148 V206" class="arch-link ctrl"></path>
+          <path d="M693 148 V206" class="arch-link"></path>
+          <path d="M226 240 V316" class="arch-link"></path>
+          <path d="M226 240 V386" class="arch-link"></path>
+          <path d="M370 240 V316" class="arch-link ctrl"></path>
+          <path d="M370 240 V386" class="arch-link"></path>
+          <path d="M514 240 V316" class="arch-link ctrl"></path>
+          <path d="M692 240 V382" class="arch-link"></path>
+
+          <path d="M568 432 H642" class="arch-link"></path>
+          <path d="M796 432 H832" class="arch-link"></path>
+          <path d="M876 404 V350 H844" class="arch-link"></path>
+          <path d="M654 350 V382" class="arch-link"></path>
+          <path d="M792 350 V382 H796" class="arch-link"></path>
+          <path d="M424 408 H480" class="arch-link"></path>
+        </svg>
+      </div>
+      <div class="arch-legend">
+        <span>实线：数据通路</span>
+        <span>虚线：控制/调度</span>
+      </div>
+      <div class="callout">
+        <strong>模块粒度：</strong>
+        <code>ADD/AFFINE</code> 当前仍作为顶层内部执行分支；如果后续独立成硬件子模块，再单独画出即可。
+      </div>
+    </section>
 
     <section>
       <h2>1. 顶层卷积数据流</h2>

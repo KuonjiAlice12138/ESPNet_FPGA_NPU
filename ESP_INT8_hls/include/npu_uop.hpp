@@ -90,36 +90,6 @@ inline bool uop_has_bias(const uop_t& uop) {
   return uop_flag(uop, UOP_FLAG_BIAS_EN);
 }
 
-inline bool uop_has_relu(const uop_t& uop) {
-#pragma HLS INLINE
-  return uop_flag(uop, UOP_FLAG_RELU_EN);
-}
-
-inline bool uop_requant_bypass(const uop_t& uop) {
-#pragma HLS INLINE
-  return uop_flag(uop, UOP_FLAG_REQUANT_BYPASS);
-}
-
-inline bool uop_concat_mode(const uop_t& uop) {
-#pragma HLS INLINE
-  return uop_flag(uop, UOP_FLAG_CONCAT_MODE);
-}
-
-inline bool uop_alias_enable(const uop_t& uop) {
-#pragma HLS INLINE
-  return uop_flag(uop, UOP_FLAG_ALIAS_ENABLE);
-}
-
-inline bool uop_pool_same_scale(const uop_t& uop) {
-#pragma HLS INLINE
-  return uop_flag(uop, UOP_FLAG_POOL_SAME_SCALE);
-}
-
-inline bool uop_last_of_stage(const uop_t& uop) {
-#pragma HLS INLINE
-  return uop_flag(uop, UOP_FLAG_LAST_UOP_OF_STAGE);
-}
-
 inline bool tensor_is_global(u8_t tensor_id) {
 #pragma HLS INLINE
   return tensor_id <= 0x3f;

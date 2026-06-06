@@ -175,6 +175,35 @@ PA   = 0.9818317506
 mIoU = 0.8882841695
 ```
 
+如需同时得到 full-resolution 指标，使用模型侧 full-res 评估脚本：
+
+```bat
+D:\ESPNet\.venv\Scripts\python.exe D:\ESP_INT8\tools\eval_hw_constrained_qat_fullres.py ^
+  --artifact-dir D:\ESP_INT8\quantized_artifacts_hw_constrained_qat_3ep ^
+  --out-json D:\ESP_INT8\hw_artifacts\hw_constrained_qat_3ep_single\int8_baseline_metrics_fullres.json ^
+  --batch-size 4 ^
+  --num-workers 0 ^
+  --progress-every 25
+```
+
+该脚本同时输出三套指标：
+
+```text
+lowres_argmax                  # 旧口径：64x128 logits argmax vs 64x128 target
+fullres_bilinear_logits_argmax # 主 full-res 口径：logits 双线性上采样到 512x1024 后 argmax
+fullres_nearest_mask           # 硬件友好口径：64x128 mask 最近邻上采样到 512x1024
+```
+
+若使用 `PERF125-UPFULL` 这类板端直接输出 `512x1024` mask 的硬件版本，板端验证集输出不再适用于旧的 logits 评估脚本，应使用：
+
+```bat
+D:\ESPNet\.venv\Scripts\python.exe D:\ESP_INT8\tools\eval_val_hw_masks_fullres.py ^
+  --output-dir E:\ ^
+  --output-pattern O%%04d.BIN ^
+  --out-json D:\ESP_INT8\hw_artifacts\hw_constrained_qat_3ep_val\board_val_fullres_mask_metrics.json ^
+  --progress-every 25
+```
+
 ### Step 4: 验证 param_blob 可被 HLS 控制域解析
 
 如果 `blob_file_tb.exe` 已存在：

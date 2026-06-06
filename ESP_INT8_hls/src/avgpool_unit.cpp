@@ -3,30 +3,18 @@
 
 namespace esp_int8 {
 
-bool on_chip_memory_read_tile(const tensor_desc_t& desc,
-                              i32_t h,
-                              i32_t w,
-                              u16_t c_begin,
-                              u8_t valid_c,
-                              i8_t tile[TM]);
-bool on_chip_memory_write_tile(const tensor_desc_t& desc,
-                               u16_t h,
-                               u16_t w,
-                               u16_t c_begin,
-                               u8_t valid_c,
-                               const i8_t tile[TM]);
 bool on_chip_memory_read_packed_contiguous(const tensor_desc_t& desc,
                                            i32_t h,
                                            i32_t w,
                                            u16_t c_begin,
                                            u8_t valid_bytes,
                                            act_vec_t& packed);
-
-static u8_t pool_lanes(u16_t remaining_c) {
-#pragma HLS INLINE
-    const unsigned rem = remaining_c.to_uint();
-    return static_cast<u8_t>((rem > static_cast<unsigned>(TM)) ? TM : rem);
-}
+bool on_chip_memory_write_packed_tile(const tensor_desc_t& desc,
+                                      u16_t h,
+                                      u16_t w,
+                                      u16_t c_begin,
+                                      u8_t valid_c,
+                                      act_vec_t packed);
 
 static i32_t round_div9(i32_t x) {
 #pragma HLS INLINE
@@ -53,6 +41,11 @@ static i8_t packed_i8(act_vec_t word, int lane) {
     return value;
 }
 
+static void set_packed_i8(act_vec_t& word, int lane, i8_t value) {
+#pragma HLS INLINE
+    word.range(lane * 8 + 7, lane * 8) = static_cast<u8_t>(value);
+}
+
 static bool pool_shape_supported(const tensor_desc_t& src,
                                  const tensor_desc_t& dst,
                                  const pool_q_t& qparam) {
@@ -76,14 +69,8 @@ static bool avgpool_pixel_c3_generic(const tensor_desc_t& src,
                                      u16_t ow) {
 #pragma HLS INLINE off
     i32_t sum[3];
-    i8_t out_tile[TM];
 #pragma HLS ARRAY_PARTITION variable=sum complete dim=1
-#pragma HLS ARRAY_PARTITION variable=out_tile complete dim=1
 
-    for (int lane = 0; lane < TM; ++lane) {
-#pragma HLS UNROLL
-        out_tile[lane] = 0;
-    }
     for (int c = 0; c < 3; ++c) {
 #pragma HLS UNROLL
         sum[c] = 0;
@@ -91,36 +78,96 @@ static bool avgpool_pixel_c3_generic(const tensor_desc_t& src,
 
     for (int kh = 0; kh < 3; ++kh) {
         for (int kw = 0; kw < 3; ++kw) {
-            i8_t in_tile[TM];
-#pragma HLS ARRAY_PARTITION variable=in_tile complete dim=1
+#pragma HLS PIPELINE off
+            act_vec_t in_packed = 0;
             const i32_t ih = static_cast<i32_t>(oh) * 2 + kh - 1;
             const i32_t iw = static_cast<i32_t>(ow) * 2 + kw - 1;
-            if (!on_chip_memory_read_tile(src, ih, iw, 0, static_cast<u8_t>(3), in_tile)) {
+            if (!on_chip_memory_read_packed_contiguous(
+                    src, ih, iw, 0, static_cast<u8_t>(3), in_packed)) {
                 return false;
             }
             for (int c = 0; c < 3; ++c) {
 #pragma HLS UNROLL
-                sum[c] += static_cast<i32_t>(in_tile[c]);
+                sum[c] += static_cast<i32_t>(packed_i8(in_packed, c));
             }
         }
     }
 
+    act_vec_t out_packed = 0;
     for (int c = 0; c < 3; ++c) {
 #pragma HLS UNROLL
-        out_tile[c] = requant_pool_avg(round_div9(sum[c]), qparam);
+        set_packed_i8(out_packed, c, requant_pool_avg(round_div9(sum[c]), qparam));
     }
-    return on_chip_memory_write_tile(dst, oh, ow, 0, static_cast<u8_t>(3), out_tile);
+    return on_chip_memory_write_packed_tile(dst, oh, ow, 0, static_cast<u8_t>(3), out_packed);
 }
 
-static void accumulate_c3_row(act_vec_t row, i32_t sum[3]) {
-#pragma HLS INLINE
-    for (int px = 0; px < 3; ++px) {
-#pragma HLS UNROLL
-        for (int c = 0; c < 3; ++c) {
-#pragma HLS UNROLL
-            sum[c] += static_cast<i32_t>(packed_i8(row, px * 3 + c));
-        }
+static bool read_c3_fast_rows(const tensor_desc_t& src,
+                              i32_t base_h,
+                              i32_t base_w,
+                              act_vec_t& row0,
+                              act_vec_t& row1,
+                              act_vec_t& row2) {
+#pragma HLS INLINE off
+    if (!on_chip_memory_read_packed_contiguous(
+            src, base_h + 0, base_w, 0, static_cast<u8_t>(9), row0)) {
+        return false;
     }
+    if (!on_chip_memory_read_packed_contiguous(
+            src, base_h + 1, base_w, 0, static_cast<u8_t>(9), row1)) {
+        return false;
+    }
+    if (!on_chip_memory_read_packed_contiguous(
+            src, base_h + 2, base_w, 0, static_cast<u8_t>(9), row2)) {
+        return false;
+    }
+    return true;
+}
+
+static void sum_c3_fast_rows(act_vec_t row0,
+                             act_vec_t row1,
+                             act_vec_t row2,
+                             i32_t sum[3]) {
+#pragma HLS INLINE off
+#pragma HLS ARRAY_PARTITION variable=sum complete dim=1
+    i32_t row_sum0[3];
+    i32_t row_sum1[3];
+    i32_t row_sum2[3];
+#pragma HLS ARRAY_PARTITION variable=row_sum0 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=row_sum1 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=row_sum2 complete dim=1
+
+    for (int c = 0; c < 3; ++c) {
+#pragma HLS UNROLL
+        row_sum0[c] = static_cast<i32_t>(packed_i8(row0, c)) +
+                      static_cast<i32_t>(packed_i8(row0, c + 3)) +
+                      static_cast<i32_t>(packed_i8(row0, c + 6));
+        row_sum1[c] = static_cast<i32_t>(packed_i8(row1, c)) +
+                      static_cast<i32_t>(packed_i8(row1, c + 3)) +
+                      static_cast<i32_t>(packed_i8(row1, c + 6));
+        row_sum2[c] = static_cast<i32_t>(packed_i8(row2, c)) +
+                      static_cast<i32_t>(packed_i8(row2, c + 3)) +
+                      static_cast<i32_t>(packed_i8(row2, c + 6));
+    }
+
+    for (int c = 0; c < 3; ++c) {
+#pragma HLS UNROLL
+        sum[c] = row_sum0[c] + row_sum1[c] + row_sum2[c];
+    }
+}
+
+static bool write_c3_avg_pixel(const tensor_desc_t& dst,
+                               const pool_q_t& qparam,
+                               u16_t oh,
+                               u16_t ow,
+                               const i32_t sum[3]) {
+#pragma HLS INLINE off
+#pragma HLS ARRAY_PARTITION variable=sum complete dim=1
+    act_vec_t out_packed = 0;
+    for (int c = 0; c < 3; ++c) {
+#pragma HLS UNROLL
+        set_packed_i8(out_packed, c, requant_pool_avg(round_div9(sum[c]), qparam));
+    }
+    return on_chip_memory_write_packed_tile(dst, oh, ow, 0, static_cast<u8_t>(3), out_packed);
 }
 
 static bool avgpool_pixel_c3_inner_fast(const tensor_desc_t& src,
@@ -135,37 +182,14 @@ static bool avgpool_pixel_c3_inner_fast(const tensor_desc_t& src,
     act_vec_t row1 = 0;
     act_vec_t row2 = 0;
     i32_t sum[3];
-    i8_t out_tile[TM];
 #pragma HLS ARRAY_PARTITION variable=sum complete dim=1
-#pragma HLS ARRAY_PARTITION variable=out_tile complete dim=1
 
-    for (int lane = 0; lane < TM; ++lane) {
-#pragma HLS UNROLL
-        out_tile[lane] = 0;
-    }
-    for (int c = 0; c < 3; ++c) {
-#pragma HLS UNROLL
-        sum[c] = 0;
-    }
-
-    if (!on_chip_memory_read_packed_contiguous(
-            src, base_h + 0, base_w, 0, static_cast<u8_t>(9), row0) ||
-        !on_chip_memory_read_packed_contiguous(
-            src, base_h + 1, base_w, 0, static_cast<u8_t>(9), row1) ||
-        !on_chip_memory_read_packed_contiguous(
-            src, base_h + 2, base_w, 0, static_cast<u8_t>(9), row2)) {
+    if (!read_c3_fast_rows(src, base_h, base_w, row0, row1, row2)) {
         return false;
     }
 
-    accumulate_c3_row(row0, sum);
-    accumulate_c3_row(row1, sum);
-    accumulate_c3_row(row2, sum);
-
-    for (int c = 0; c < 3; ++c) {
-#pragma HLS UNROLL
-        out_tile[c] = requant_pool_avg(round_div9(sum[c]), qparam);
-    }
-    return on_chip_memory_write_tile(dst, oh, ow, 0, static_cast<u8_t>(3), out_tile);
+    sum_c3_fast_rows(row0, row1, row2, sum);
+    return write_c3_avg_pixel(dst, qparam, oh, ow, sum);
 }
 
 static bool avgpool_unit_c3_fast(const tensor_desc_t& src,
@@ -239,85 +263,7 @@ bool avgpool_unit_checked(
         return false;
     }
 
-    if (src.c.to_uint() == 3U && dst.c.to_uint() == 3U) {
-        return avgpool_unit_c3_fast(src, dst, qparam);
-    }
-
-    const int out_h_i = static_cast<int>(dst.h.to_uint());
-    const int out_w_i = static_cast<int>(dst.w.to_uint());
-    const int c_blocks = static_cast<int>((dst.c.to_uint() + static_cast<unsigned>(TM) - 1U) /
-                                          static_cast<unsigned>(TM));
-
-    for (int oh_i = 0; oh_i < MAX_FM_H; ++oh_i) {
-        if (oh_i >= out_h_i) {
-            break;
-        }
-        const u16_t oh = static_cast<u16_t>(oh_i);
-        for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
-            if (ow_i >= out_w_i) {
-                break;
-            }
-            const u16_t ow = static_cast<u16_t>(ow_i);
-            for (int c_blk = 0; c_blk < MAX_C_TILE_COUNT; ++c_blk) {
-#pragma HLS PIPELINE off
-                if (c_blk >= c_blocks) {
-                    break;
-                }
-                const u16_t cb = static_cast<u16_t>(c_blk * TM);
-                const u16_t remaining = static_cast<u16_t>(dst.c - cb);
-                const u8_t lanes = pool_lanes(remaining);
-                i32_t sum[TM];
-                i8_t out_tile[TM];
-#pragma HLS ARRAY_PARTITION variable=sum complete dim=1
-#pragma HLS ARRAY_PARTITION variable=out_tile complete dim=1
-
-                for (int lane = 0; lane < TM; ++lane) {
-#pragma HLS UNROLL
-                    sum[lane] = 0;
-                    out_tile[lane] = 0;
-                }
-
-                for (int kh = 0; kh < 3; ++kh) {
-                    for (int kw = 0; kw < 3; ++kw) {
-                        i8_t in_tile[TM];
-#pragma HLS ARRAY_PARTITION variable=in_tile complete dim=1
-                        const i32_t ih = static_cast<i32_t>(oh) * 2 + kh - 1;
-                        const i32_t iw = static_cast<i32_t>(ow) * 2 + kw - 1;
-                        if (!on_chip_memory_read_tile(src, ih, iw, cb, lanes, in_tile)) {
-                            return false;
-                        }
-                        for (int lane = 0; lane < TM; ++lane) {
-#pragma HLS UNROLL
-                            if (static_cast<unsigned>(lane) < lanes.to_uint()) {
-                                sum[lane] += static_cast<i32_t>(in_tile[lane]);
-                            }
-                        }
-                    }
-                }
-
-                for (int lane = 0; lane < TM; ++lane) {
-#pragma HLS UNROLL
-                    if (static_cast<unsigned>(lane) < lanes.to_uint()) {
-                        out_tile[lane] = requant_pool_avg(round_div9(sum[lane]), qparam);
-                    }
-                }
-
-                if (!on_chip_memory_write_tile(dst, oh, ow, cb, lanes, out_tile)) {
-                    return false;
-                }
-            }
-        }
-    }
-
-    return true;
-}
-
-void avgpool_unit(
-    const tensor_desc_t& src,
-    const tensor_desc_t& dst,
-    const pool_q_t& qparam,
-    i8_t* fmbuf_base) {
-    (void)avgpool_unit_checked(src, dst, qparam, fmbuf_base);
+    return avgpool_unit_c3_fast(src, dst, qparam);
 }
 
 }  // namespace esp_int8

@@ -3,10 +3,7 @@
 
 namespace esp_int8 {
 
-bool on_chip_memory_write_byte(u8_t tensor_id, u32_t elem_offset, u8_t value);
-bool on_chip_memory_read_byte(u8_t tensor_id, u32_t elem_offset, u8_t& value);
 bool on_chip_memory_write_axi_word(u8_t tensor_id, u32_t word_offset, axi_vec_t value);
-bool on_chip_memory_read_axi_word(u8_t tensor_id, u32_t word_offset, axi_vec_t& value);
 
 void frame_dma_load(const axi_vec_t* gmem_frame_in) {
 #pragma HLS INLINE off
@@ -19,13 +16,7 @@ void frame_dma_load(const axi_vec_t* gmem_frame_in) {
 
 void frame_dma_store(axi_vec_t* gmem_frame_out) {
 #pragma HLS INLINE off
-    const u8_t output_tensor = static_cast<u8_t>(static_cast<unsigned>(TID_OUT));
-    for (int word_idx = 0; word_idx < OUTPUT_FRAME_AXI_WORDS; ++word_idx) {
-#pragma HLS PIPELINE II=1
-        axi_vec_t word = 0;
-        on_chip_memory_read_axi_word(output_tensor, static_cast<u32_t>(word_idx), word);
-        gmem_frame_out[word_idx] = word;
-    }
+    (void)gmem_frame_out;
 }
 
 }  // namespace esp_int8

@@ -22,23 +22,25 @@ constexpr int MAX_KERNEL_ELEMS = 9;
 constexpr int MAX_C_TILE_COUNT = (MAX_FM_C + TM - 1) / TM;
 constexpr int MAX_K_TILE_COUNT = (MAX_FM_C * MAX_KERNEL_ELEMS + TK - 1) / TK;
 
-constexpr int INPUT_FRAME_BYTES = 512 * 1024 * 3;
+constexpr int INPUT_FRAME_H = 512;
+constexpr int INPUT_FRAME_W = 1024;
+constexpr int INPUT_FRAME_C = 3;
+constexpr int ENCODER_OUT_H = 64;
+constexpr int ENCODER_OUT_W = 128;
+constexpr int ENCODER_OUT_C = 2;
+constexpr int UPSAMPLE_SCALE = 8;
+constexpr int FULLRES_MASK_H = INPUT_FRAME_H;
+constexpr int FULLRES_MASK_W = INPUT_FRAME_W;
+constexpr int FULLRES_MASK_C = 1;
+
+constexpr int INPUT_FRAME_BYTES = INPUT_FRAME_H * INPUT_FRAME_W * INPUT_FRAME_C;
 constexpr int INPUT_FRAME_AXI_WORDS = (INPUT_FRAME_BYTES + AXI_WORD_BYTES - 1) / AXI_WORD_BYTES;
-constexpr int OUTPUT_FRAME_BYTES = 64 * 128 * 2;
+constexpr int ENCODER_LOGITS_BYTES = ENCODER_OUT_H * ENCODER_OUT_W * ENCODER_OUT_C;
+constexpr int FULLRES_MASK_BYTES = FULLRES_MASK_H * FULLRES_MASK_W * FULLRES_MASK_C;
+constexpr int OUTPUT_FRAME_BYTES = FULLRES_MASK_BYTES;
 constexpr int OUTPUT_FRAME_AXI_WORDS = (OUTPUT_FRAME_BYTES + AXI_WORD_BYTES - 1) / AXI_WORD_BYTES;
 
 constexpr std::uint32_t RUNTIME_MODE_MASK = 0x0000000fU;
-constexpr std::uint32_t DEBUG_MODE_ENABLE_MASK = 0x00000010U;
-constexpr std::uint32_t DEBUG_MODE_SKIP_STORE_MASK = 0x00000020U;
-constexpr int DEBUG_MODE_DUMP_TENSOR_SHIFT = 8;
-constexpr int DEBUG_MODE_DUMP_WORDS_SHIFT = 16;
-constexpr std::uint32_t DEBUG_MODE_DUMP_TENSOR_MASK = 0x0000ff00U;
-constexpr std::uint32_t DEBUG_MODE_DUMP_WORDS_MASK = 0xffff0000U;
-constexpr std::uint32_t DEBUG_UOP_COUNT_MASK = 0x0000ffffU;
-constexpr int DEBUG_STOP_AFTER_SHIFT = 16;
-constexpr std::uint32_t DEBUG_STOP_AFTER_MASK = 0xffff0000U;
-constexpr std::uint32_t DEBUG_DUMP_TENSOR_DISABLED = 0xffU;
-constexpr int DEBUG_DUMP_MAX_AXI_WORDS = OUTPUT_FRAME_AXI_WORDS;
 
 constexpr int FMBUF_BYTES = 0x598000;
 constexpr int FMBUF_BANK_COUNT = 3;

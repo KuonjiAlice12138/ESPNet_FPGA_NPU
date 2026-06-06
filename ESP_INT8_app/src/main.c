@@ -4,15 +4,66 @@
 #include "./app_config.h"
 #include "drivers/sd_card.h"
 #include "hal/int8_npu.h"
+#include "sleep.h"
 #include "xil_cache.h"
 #include "xil_printf.h"
+#include "xparameters.h"
 #include "xstatus.h"
 
-static inline u64 read_cycle_counter(void)
+static inline u64 read_timer_counter(void)
 {
     u64 val;
     asm volatile("mrs %0, CNTPCT_EL0" : "=r"(val));
     return val;
+}
+
+static inline u64 read_timer_frequency(void)
+{
+    u64 val;
+    asm volatile("mrs %0, CNTFRQ_EL0" : "=r"(val));
+    return val;
+}
+
+static u64 timer_ticks_to_ms(u64 ticks)
+{
+    u64 hz = read_timer_frequency();
+    if (hz == 0ULL) {
+        return 0ULL;
+    }
+    return (ticks * 1000ULL + (hz / 2ULL)) / hz;
+}
+
+static void print_timer_selftest(void)
+{
+    u64 cntfrq_hz = read_timer_frequency();
+#ifdef XPAR_CPU_TIMESTAMP_CLK_FREQ
+    u64 bsp_hz = (u64)XPAR_CPU_TIMESTAMP_CLK_FREQ;
+#else
+    u64 bsp_hz = 0ULL;
+#endif
+    u64 start;
+    u64 end;
+    u64 ticks;
+    u64 expected;
+    u64 err;
+    u64 err_ppm;
+
+    start = read_timer_counter();
+    usleep((unsigned long)INT8_APP_TIMER_SELFTEST_US);
+    end = read_timer_counter();
+
+    ticks = (end >= start) ? (end - start) : 0ULL;
+    expected = (cntfrq_hz * (u64)INT8_APP_TIMER_SELFTEST_US + 500000ULL) /
+               1000000ULL;
+    err = (ticks >= expected) ? (ticks - expected) : (expected - ticks);
+    err_ppm = (expected > 0ULL) ? ((err * 1000000ULL) / expected) : 0ULL;
+
+    xil_printf("APP: timer selftest wait_us=%u cntfrq=%llu Hz bsp=%llu Hz\r\n",
+               INT8_APP_TIMER_SELFTEST_US, cntfrq_hz, bsp_hz);
+    xil_printf("APP: timer selftest ticks=%llu expected=%llu err=%llu ppm %s\r\n",
+               ticks, expected, err_ppm,
+               (err_ppm <= (u64)INT8_APP_TIMER_SELFTEST_MAX_ERR_PPM) ?
+                   "PASS" : "WARN");
 }
 
 static u8 g_input[INT8_INPUT_BYTES] __attribute__((aligned(64)));
@@ -30,44 +81,38 @@ typedef struct {
 static PerfEntry s_perf[32];
 static u32 s_perf_count = 0U;
 
-static void record_perf_start(const char *tag, u32 stop_after)
+static void record_perf_value(const char *tag, u32 stop_after, u64 ticks)
 {
     if (s_perf_count >= 32U) return;
     s_perf[s_perf_count].tag = tag;
     s_perf[s_perf_count].stop_after = stop_after;
-    s_perf[s_perf_count].cycles = 0ULL;
-    s_perf[s_perf_count].start_lo = read_cycle_counter();
+    s_perf[s_perf_count].cycles = ticks;
+    s_perf[s_perf_count].start_lo = 0ULL;
+    s_perf[s_perf_count].end_lo = ticks;
     s_perf_count++;
-}
-
-static void record_perf_end(void)
-{
-    if (s_perf_count == 0U) return;
-    u32 idx = s_perf_count - 1U;
-    u64 tEnd = read_cycle_counter();
-    s_perf[idx].end_lo = tEnd;
-    s_perf[idx].cycles = (s_perf[idx].end_lo >= s_perf[idx].start_lo)
-        ? (s_perf[idx].end_lo - s_perf[idx].start_lo) : 0ULL;
 }
 
 static void print_perf_summary(void)
 {
     u32 i;
     u64 total = 0ULL;
+    u64 timer_hz = read_timer_frequency();
     xil_printf("\r\nAPP: ==== PERFORMANCE ====\r\n");
-    xil_printf("APP: APU freq ~100MHz, 1 cycle ~10ns\r\n\r\n");
-    xil_printf("APP: %-18s %6s %12s %10s\r\n", "Tag", "UOPs", "Cycles", "ms");
+    xil_printf("APP: ARM timer=%llu Hz (CNTPCT_EL0), PL target=%llu Hz (%uns)\r\n\r\n",
+               timer_hz, (u64)INT8_APP_PL_TARGET_HZ,
+               INT8_APP_PL_TARGET_PERIOD_NS);
+    xil_printf("APP: %-18s %6s %12s %10s\r\n", "Tag", "UOPs", "Ticks", "ms");
     for (i = 0U; i < s_perf_count; ++i) {
         if (s_perf[i].cycles == 0ULL) continue;
-        u64 ms = s_perf[i].cycles / 100000ULL;
+        u64 ms = timer_ticks_to_ms(s_perf[i].cycles);
         total += s_perf[i].cycles;
         xil_printf("APP: %-18s %6u %12llu %10llu\r\n",
                    s_perf[i].tag, s_perf[i].stop_after,
                    s_perf[i].cycles, ms);
     }
     xil_printf("APP: --------------------------------\r\n");
-    xil_printf("APP: FULL TOTAL %18llu cycles = %llu ms\r\n",
-               total, total / 100000ULL);
+    xil_printf("APP: FULL TOTAL %18llu ticks = %llu ms\r\n",
+               total, timer_ticks_to_ms(total));
 }
 
 static void print_addr(const char *name, UINTPTR addr, u32 bytes)
@@ -103,13 +148,13 @@ static int run_full_infer_once(Int8NpuContext *npu, u32 uop_count,
     Xil_DCacheFlushRange((UINTPTR)g_input, INT8_INPUT_BYTES);
     Xil_DCacheFlushRange((UINTPTR)g_output, INT8_OUTPUT_BYTES);
 
-    start = read_cycle_counter();
+    start = read_timer_counter();
     if (int8_npu_run_infer(npu, (UINTPTR)g_input, (UINTPTR)g_output,
                            (UINTPTR)g_param, uop_count,
                            INT8_NPU_TIMEOUT_POLLS) != XST_SUCCESS) {
         return XST_FAILURE;
     }
-    end = read_cycle_counter();
+    end = read_timer_counter();
 
     Xil_DCacheInvalidateRange((UINTPTR)g_output, INT8_OUTPUT_BYTES);
     if (cycles != NULL) {
@@ -151,12 +196,11 @@ static int run_single_image(Int8NpuContext *npu, u32 uop_count)
     }
 
     xil_printf("APP: single full MODE_RUN timing start\r\n");
-    record_perf_start("FULL_MODE_RUN", uop_count);
     if (run_full_infer_once(npu, uop_count, &cycles) != XST_SUCCESS) {
         xil_printf("APP: MODE_RUN failed\r\n");
         return XST_FAILURE;
     }
-    record_perf_end();
+    record_perf_value("FULL_MODE_RUN", uop_count, cycles);
 
     xil_printf("APP: single MODE_RUN done\r\n");
     print_perf_summary();
@@ -244,7 +288,7 @@ static int run_val_set(Int8NpuContext *npu, u32 uop_count)
             (processed == 1U ||
              (processed % INT8_APP_VAL_PROGRESS_EVERY) == 0U)) {
             xil_printf("APP: VALSET idx=%u cycles=%llu ms=%llu out=%s\r\n",
-                       index, cycles, cycles / 100000ULL, output_file);
+                       index, cycles, timer_ticks_to_ms(cycles), output_file);
         }
     }
 
@@ -255,11 +299,11 @@ static int run_val_set(Int8NpuContext *npu, u32 uop_count)
 
     xil_printf("\r\nAPP: ==== VALSET SUMMARY ====\r\n");
     xil_printf("APP: samples=%u total_cycles=%llu total_ms=%llu\r\n",
-               processed, total_cycles, total_cycles / 100000ULL);
+               processed, total_cycles, timer_ticks_to_ms(total_cycles));
     xil_printf("APP: avg_cycles=%llu avg_ms=%llu min_ms=%llu max_ms=%llu\r\n",
-               total_cycles / processed, (total_cycles / processed) / 100000ULL,
-               min_cycles / 100000ULL, max_cycles / 100000ULL);
-    xil_printf("APP: run host eval_val_hw_outputs on Oxxxx.BIN files\r\n");
+               total_cycles / processed, timer_ticks_to_ms(total_cycles / processed),
+               timer_ticks_to_ms(min_cycles), timer_ticks_to_ms(max_cycles));
+    xil_printf("APP: run host eval_val_hw_masks_fullres on Oxxxx.BIN files\r\n");
     return XST_SUCCESS;
 }
 
@@ -273,6 +317,7 @@ int main(void)
     print_addr("input", (UINTPTR)g_input, INT8_INPUT_BYTES);
     print_addr("output", (UINTPTR)g_output, INT8_OUTPUT_BYTES);
     print_addr("param", (UINTPTR)g_param, INT8_PARAM_HW_MAX_BYTES);
+    print_timer_selftest();
 
     if (SD_Init() != XST_SUCCESS) {
         xil_printf("APP: SD init failed\r\n");

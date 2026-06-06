@@ -1,0 +1,75 @@
+{
+  "dataset_dir": "E:\\",
+  "output_dir": "E:\\",
+  "output_pattern": "O%04d.BIN",
+  "processed": 500,
+  "missing": [],
+  "board_metrics": {
+    "valid_pixels": 3569689,
+    "pixel_accuracy": 0.981561979208833,
+    "mIoU": 0.884528985716656,
+    "per_class_accuracy": [
+      0.8492036632870127,
+      0.9932468789947175
+    ],
+    "per_class_IoU": [
+      0.7888601244037251,
+      0.9801978470295868
+    ],
+    "confusion": [
+      {
+        "class": 0,
+        "tp": 245909,
+        "fp": 22151,
+        "fn": 43667,
+        "support": 289576
+      },
+      {
+        "class": 1,
+        "tp": 3257962,
+        "fp": 43667,
+        "fn": 22151,
+        "support": 3280113
+      }
+    ]
+  },
+  "reference_metrics": {
+    "valid_pixels": 3569689,
+    "pixel_accuracy": 0.9818376334745128,
+    "mIoU": 0.8883244071431424,
+    "per_class_accuracy": [
+      0.8746892007624941,
+      0.9912969461722813
+    ],
+    "per_class_IoU": [
+      0.7961983258047988,
+      0.980450488481486
+    ],
+    "confusion": [
+      {
+        "class": 0,
+        "tp": 253289,
+        "fp": 28547,
+        "fn": 36287,
+        "support": 289576
+      },
+      {
+        "class": 1,
+        "tp": 3251566,
+        "fp": 36287,
+        "fn": 28547,
+        "support": 3280113
+      }
+    ]
+  },
+  "reference_diff": {
+    "logit_bytes": 8192000,
+    "logit_mismatches": 7864072,
+    "logit_mismatch_rate": 0.9599697265625,
+    "max_abs_diff": 78,
+    "mean_abs_diff": 9.44600927734375,
+    "mask_pixels": 4096000,
+    "mask_mismatches": 38904,
+    "mask_mismatch_rate": 0.009498046875
+  }
+}

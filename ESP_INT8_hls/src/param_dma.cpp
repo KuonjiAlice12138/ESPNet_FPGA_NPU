@@ -5,7 +5,6 @@ namespace esp_int8 {
 
 static param_blob_header_t s_header;
 static tensor_desc_t s_tensor_desc[MAX_TENSOR_DESC_COUNT];
-static scale_desc_t s_scale_desc[SCALE_DESC_COUNT_MAX];
 static conv_param_desc_t s_conv_desc[MAX_CONV_PARAM_DESC_COUNT];
 static affine_param_desc_t s_affine_desc[MAX_AFFINE_PARAM_DESC_COUNT];
 static add_param_desc_t s_add_desc[MAX_ADD_PARAM_DESC_COUNT];
@@ -19,7 +18,6 @@ static uop_t s_uop_table[MAX_UOP_COUNT];
 static u32_t s_weight_bytes = 0;
 
 static bool s_ready = false;
-static error_code_t s_error = ERR_NONE;
 
 static axi_vec_t* get_wbuf() {
 #pragma HLS INLINE
@@ -63,11 +61,6 @@ static i32_t read_i32_le(const axi_vec_t* gmem_param, u32_t byte_offset) {
 static bool is_aligned64(u32_t offset) {
 #pragma HLS INLINE
     return (offset & (SECTION_ALIGNMENT_BYTES - 1)) == 0;
-}
-
-static u16_t ceil_div_u16(u16_t a, u16_t b) {
-#pragma HLS INLINE
-    return static_cast<u16_t>((a + b - 1) / b);
 }
 
 static u16_t effective_kernel(const conv_cfg_t& cfg) {
@@ -152,17 +145,6 @@ static tensor_desc_t load_tensor_desc(const axi_vec_t* gmem_param, u32_t offset)
     desc.w = read_u16_le(gmem_param, offset + 10);
     desc.c = read_u16_le(gmem_param, offset + 12);
     desc.reserved1 = read_u16_le(gmem_param, offset + 14);
-    return desc;
-}
-
-static scale_desc_t load_scale_desc(const axi_vec_t* gmem_param, u32_t offset) {
-#pragma HLS INLINE
-    scale_desc_t desc;
-    desc.mult = static_cast<i32_t>(read_u32_le(gmem_param, offset + 0));
-    desc.shift = read_u8(gmem_param, offset + 4);
-    desc.reserved[0] = read_u8(gmem_param, offset + 5);
-    desc.reserved[1] = read_u8(gmem_param, offset + 6);
-    desc.reserved[2] = read_u8(gmem_param, offset + 7);
     return desc;
 }
 
@@ -303,13 +285,13 @@ static bool load_weight_data(const axi_vec_t* gmem_param) {
     }
 
     const u32_t src_word_base = s_header.weight_data_offset >> 5;
+    const u32_t weight_words = (s_weight_bytes + static_cast<u32_t>(AXI_WORD_BYTES - 1)) >> 5;
     for (int i = 0; i < WBUF_AXI_WORDS; ++i) {
 #pragma HLS PIPELINE off
-        if (static_cast<unsigned>(i * AXI_WORD_BYTES) < s_weight_bytes.to_uint()) {
-            get_wbuf()[i] = gmem_param[src_word_base + i];
-        } else {
-            get_wbuf()[i] = 0;
+        if (static_cast<unsigned>(i) >= weight_words.to_uint()) {
+            break;
         }
+        get_wbuf()[i] = gmem_param[src_word_base + i];
     }
     return true;
 }
@@ -336,63 +318,17 @@ static void set_wgt_vec_lane_dynamic(wgt_vec_t& word, int lane, i8_t value) {
     word |= static_cast<wgt_vec_t>(widened << (lane * 8));
 }
 
-static void clear_tables() {
-#pragma HLS INLINE off
-    s_weight_bytes = 0;
-    for (int i = 0; i < WBUF_AXI_WORDS; ++i) {
-#pragma HLS PIPELINE off
-        get_wbuf()[i] = 0;
-    }
-    for (int i = 0; i < MAX_TENSOR_DESC_COUNT; ++i) {
-#pragma HLS PIPELINE off
-        s_tensor_desc[i] = tensor_desc_t();
-    }
-    for (int i = 0; i < SCALE_DESC_COUNT_MAX; ++i) {
-#pragma HLS PIPELINE off
-        s_scale_desc[i] = scale_desc_t();
-    }
-    for (int i = 0; i < MAX_CONV_PARAM_DESC_COUNT; ++i) {
-#pragma HLS PIPELINE off
-        s_conv_desc[i] = conv_param_desc_t();
-        s_conv_qparam[i] = conv_qparam_t();
-    }
-    for (int i = 0; i < MAX_AFFINE_PARAM_DESC_COUNT; ++i) {
-#pragma HLS PIPELINE off
-        s_affine_desc[i] = affine_param_desc_t();
-        s_affine_qparam_count[i] = 0;
-        for (int block = 0; block < 8; ++block) {
-            s_affine_qparam[i][block] = affine_qparam_t();
-        }
-    }
-    for (int i = 0; i < MAX_ADD_PARAM_DESC_COUNT; ++i) {
-#pragma HLS PIPELINE off
-        s_add_desc[i] = add_param_desc_t();
-        s_add_qparam[i] = add_qparam_t();
-    }
-    for (int i = 0; i < MAX_POOL_PARAM_DESC_COUNT; ++i) {
-#pragma HLS PIPELINE off
-        s_pool_desc[i] = pool_param_desc_t();
-        s_pool_qparam[i] = pool_qparam_t();
-    }
-    for (int i = 0; i < MAX_UOP_COUNT; ++i) {
-#pragma HLS PIPELINE off
-        s_uop_table[i] = uop_t();
-    }
-}
-
 void param_dma_init(const axi_vec_t* gmem_param) {
 #pragma HLS INLINE off
     s_ready = false;
-    s_error = ERR_NONE;
-    clear_tables();
+    s_weight_bytes = 0;
 
     load_header(gmem_param, s_header);
-    s_error = validate_header(s_header);
-    if (s_error != ERR_NONE) {
+    const error_code_t header_error = validate_header(s_header);
+    if (header_error != ERR_NONE) {
         return;
     }
     if (!load_weight_data(gmem_param)) {
-        s_error = ERR_BANK_OVERFLOW;
         return;
     }
 
@@ -400,12 +336,6 @@ void param_dma_init(const axi_vec_t* gmem_param) {
 #pragma HLS PIPELINE off
         if (i < static_cast<int>(s_header.tensor_desc_count.to_uint())) {
             s_tensor_desc[i] = load_tensor_desc(gmem_param, s_header.tensor_desc_offset + i * 16);
-        }
-    }
-    for (int i = 0; i < SCALE_DESC_COUNT_MAX; ++i) {
-#pragma HLS PIPELINE off
-        if (i < static_cast<int>(s_header.scale_desc_count.to_uint())) {
-            s_scale_desc[i] = load_scale_desc(gmem_param, s_header.scale_desc_offset + i * 8);
         }
     }
     for (int i = 0; i < MAX_CONV_PARAM_DESC_COUNT; ++i) {
@@ -484,22 +414,6 @@ bool param_dma_ready() {
     return s_ready;
 }
 
-error_code_t param_dma_error() {
-#pragma HLS INLINE
-    return s_error;
-}
-
-bool param_dma_get_header(param_blob_header_t& header) {
-#pragma HLS INLINE
-    header = s_header;
-    return s_ready;
-}
-
-u32_t param_dma_uop_count() {
-#pragma HLS INLINE
-    return s_header.uop_count;
-}
-
 bool param_dma_get_tensor_desc(u8_t tensor_id, tensor_desc_t& desc) {
 #pragma HLS INLINE
     const int idx = static_cast<int>(tensor_id.to_uint());
@@ -517,16 +431,6 @@ bool param_dma_get_uop(u16_t uop_id, uop_t& uop) {
         return false;
     }
     uop = s_uop_table[idx];
-    return true;
-}
-
-bool param_dma_get_scale_desc(u8_t scale_id, scale_desc_t& desc) {
-#pragma HLS INLINE
-    const int idx = static_cast<int>(scale_id.to_uint());
-    if (!s_ready || idx < 0 || idx >= static_cast<int>(s_header.scale_desc_count.to_uint())) {
-        return false;
-    }
-    desc = s_scale_desc[idx];
     return true;
 }
 
@@ -554,8 +458,8 @@ bool param_dma_get_weight_vec(u8_t param_id,
                               u16_t oc,
                               u16_t kt,
                               const conv_cfg_t& cfg,
-                              wgt_vec_t& word) {
-#pragma HLS INLINE
+                               wgt_vec_t& word) {
+#pragma HLS INLINE off
     const int idx = static_cast<int>(param_id.to_uint());
     if (!s_ready || idx < 0 || idx >= static_cast<int>(s_header.conv_desc_count.to_uint())) {
         word = 0;

@@ -22,12 +22,12 @@ ESP_INT8_hls/
 | `frame_dma` | `src/frame_dma.cpp` |
 | `param_dma` | `src/param_dma.cpp` |
 | `on_chip_memory` | `src/memory.cpp` |
-| `window_generator` | `src/win_gen.cpp` |
-| `systolic_array_core` | `src/sa_core.cpp` |
-| `post_process_unit` | `src/ppu.cpp` |
-| `avgpool_unit` | `src/avgpool_unit.cpp` |
+| `window_generator_row` | `src/win_gen.cpp` |
+| `systolic_array_core_row` | `src/sa_core.cpp` |
+| `conv_post_process / row_store` | `src/int8_core.cpp` |
+| `avgpool_unit_checked / affine / add / store` | `src/avgpool_unit.cpp` |
 | `concat_writer` | `src/concat_unit.cpp` |
-| `perf_counter_and_irq` | `src/perf_irq.cpp` |
+| `fullres_upsample` | `src/upsample_unit.cpp` |
 
 公共头文件：
 

@@ -3,13 +3,6 @@
 
 namespace esp_int8 {
 
-bool on_chip_memory_read_tile(const tensor_desc_t& desc,
-                              i32_t h,
-                              i32_t w,
-                              u16_t c_begin,
-                              u8_t valid_c,
-                              i8_t tile[TM]);
-
 bool on_chip_memory_read_packed_tile(const tensor_desc_t& desc,
                                      i32_t h,
                                      i32_t w,
@@ -59,56 +52,6 @@ static u16_t kernel_flat(const conv_cfg_t& cfg) {
 #pragma HLS INLINE
     const u16_t k = effective_kernel(cfg);
     return static_cast<u16_t>(cfg.in_c * k * k);
-}
-
-#ifndef __SYNTHESIS__
-static bool map_k_index(const conv_cfg_t& cfg,
-                        u16_t oh,
-                        u16_t ow,
-                        u16_t k_idx,
-                        i32_t& ih,
-                        i32_t& iw,
-                        u16_t& cin) {
-#pragma HLS INLINE
-    const u16_t k_total = kernel_flat(cfg);
-    if (k_idx >= k_total) {
-        ih = 0;
-        iw = 0;
-        cin = 0;
-        return false;
-    }
-
-    const u16_t kernel = effective_kernel(cfg);
-    const u16_t stride = effective_stride(cfg);
-    const u16_t dilation = effective_dilation(cfg);
-
-    if (kernel == 1) {
-        cin = k_idx;
-        ih = static_cast<i32_t>(oh * stride);
-        iw = static_cast<i32_t>(ow * stride);
-    } else {
-        cin = static_cast<u16_t>(k_idx % cfg.in_c);
-        const u16_t spatial_idx = static_cast<u16_t>(k_idx / cfg.in_c);
-        const u16_t kh = static_cast<u16_t>(spatial_idx / kernel);
-        const u16_t kw = static_cast<u16_t>(spatial_idx % kernel);
-        const i32_t pad = static_cast<i32_t>(dilation);
-        ih = static_cast<i32_t>(oh * stride) + static_cast<i32_t>(kh * dilation) - pad;
-        iw = static_cast<i32_t>(ow * stride) + static_cast<i32_t>(kw * dilation) - pad;
-    }
-
-    if (cin >= cfg.in_c ||
-        ih < 0 || iw < 0 ||
-        ih >= static_cast<i32_t>(cfg.in_h) ||
-        iw >= static_cast<i32_t>(cfg.in_w)) {
-        return false;
-    }
-    return true;
-}
-#endif
-
-static void set_vec_i8(act_vec_t& word, int lane, i8_t value) {
-#pragma HLS INLINE
-    word.range(lane * 8 + 7, lane * 8) = value.range(7, 0);
 }
 
 static void set_vec_i8_dynamic(act_vec_t& word, int lane, i8_t value) {
@@ -425,53 +368,6 @@ static void emit_smallc_generic_words(const act_vec_t spatial_word[9],
     }
 }
 
-#ifndef __SYNTHESIS__
-static void emit_first_layer_3x3_windows(const tensor_desc_t& src_desc,
-                                         hls::stream<act_vec_t>& act_stream,
-                                         const conv_cfg_t& cfg,
-                                         u16_t out_h,
-                                         u16_t out_w) {
-#pragma HLS INLINE off
-    const int out_h_i = static_cast<int>(out_h.to_uint());
-    const int out_w_i = static_cast<int>(out_w.to_uint());
-
-    for (int oh_i = 0; oh_i < MAX_FM_H; ++oh_i) {
-        if (oh_i >= out_h_i) {
-            break;
-        }
-        for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
-            if (ow_i >= out_w_i) {
-                break;
-            }
-
-            act_vec_t word = 0;
-            const i32_t base_h = static_cast<i32_t>(oh_i * 2 - 1);
-            const i32_t base_w = static_cast<i32_t>(ow_i * 2 - 1);
-
-            for (int kh = 0; kh < 3; ++kh) {
-                for (int kw = 0; kw < 3; ++kw) {
-#pragma HLS PIPELINE off
-                    i8_t tile[TM];
-#pragma HLS ARRAY_PARTITION variable=tile complete dim=1
-                    const i32_t ih = base_h + kh;
-                    const i32_t iw = base_w + kw;
-                    const bool ok =
-                        on_chip_memory_read_tile(src_desc, ih, iw, 0, static_cast<u8_t>(3), tile);
-
-                    for (int c = 0; c < 3; ++c) {
-#pragma HLS UNROLL
-                        const int lane = (kh * 3 + kw) * 3 + c;
-                        set_vec_i8(word, lane, ok ? tile[c] : i8_t(0));
-                    }
-                }
-            }
-
-            act_stream.write(word);
-        }
-    }
-}
-#endif
-
 static void emit_first_layer_3x3_window_row(const tensor_desc_t& src_desc,
                                             hls::stream<act_vec_t>& act_stream,
                                             u16_t out_row,
@@ -520,328 +416,6 @@ static void emit_first_layer_3x3_window_row(const tensor_desc_t& src_desc,
     }
 }
 
-#ifndef __SYNTHESIS__
-static bool can_merge_lane(const conv_cfg_t& cfg,
-                           u16_t oh,
-                           u16_t ow,
-                           u16_t k_idx,
-                           i32_t base_ih,
-                           i32_t base_iw,
-                           u16_t expected_cin) {
-#pragma HLS INLINE
-    i32_t ih = 0;
-    i32_t iw = 0;
-    u16_t cin = 0;
-    if (!map_k_index(cfg, oh, ow, k_idx, ih, iw, cin)) {
-        return false;
-    }
-    return ih == base_ih && iw == base_iw && cin == expected_cin;
-}
-
-static void load_window_line(const tensor_desc_t& src_desc,
-                             const conv_cfg_t& cfg,
-                             u16_t oh,
-                             u16_t kt,
-                             u16_t out_w,
-                             i8_t line_buf[1024][TK]) {
-#pragma HLS INLINE off
-    const int out_w_i = static_cast<int>(out_w.to_uint());
-
-    if (effective_kernel(cfg) == 1) {
-        const u16_t stride = effective_stride(cfg);
-        const u16_t c_begin = static_cast<u16_t>(kt * TK);
-        const u16_t remaining = (c_begin < cfg.in_c) ? static_cast<u16_t>(cfg.in_c - c_begin) : static_cast<u16_t>(0);
-        const u8_t lanes = (remaining > static_cast<u16_t>(TK)) ? static_cast<u8_t>(TK) : static_cast<u8_t>(remaining);
-        const i32_t ih = static_cast<i32_t>(oh * stride);
-
-        for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
-#pragma HLS PIPELINE II=1
-            if (ow_i >= out_w_i) {
-                break;
-            }
-            const i32_t iw = static_cast<i32_t>(static_cast<u16_t>(ow_i) * stride);
-            i8_t tile[TM];
-#pragma HLS ARRAY_PARTITION variable=tile complete dim=1
-            bool ok = false;
-            if (lanes != 0) {
-                ok = on_chip_memory_read_tile(src_desc, ih, iw, c_begin, lanes, tile);
-            }
-            for (int lane = 0; lane < TK; ++lane) {
-#pragma HLS UNROLL
-                line_buf[ow_i][lane] = (ok && static_cast<unsigned>(lane) < lanes.to_uint()) ? tile[lane] : i8_t(0);
-            }
-        }
-        return;
-    }
-
-    for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
-        if (ow_i >= out_w_i) {
-            break;
-        }
-        const u16_t ow = static_cast<u16_t>(ow_i);
-        int lane = 0;
-        for (int lane_iter = 0; lane_iter < TK; ++lane_iter) {
-#pragma HLS PIPELINE off
-            if (lane >= TK) {
-                break;
-            }
-            const u16_t k_idx = static_cast<u16_t>(kt * TK + lane);
-            i32_t ih = 0;
-            i32_t iw = 0;
-            u16_t cin = 0;
-
-            if (!map_k_index(cfg, oh, ow, k_idx, ih, iw, cin)) {
-                line_buf[ow_i][lane] = 0;
-                ++lane;
-                continue;
-            }
-
-            int run = 1;
-            for (int run_i = 1; run_i < TM; ++run_i) {
-                if (lane + run_i >= TK ||
-                    !can_merge_lane(cfg,
-                                    oh,
-                                    ow,
-                                    static_cast<u16_t>(k_idx + run_i),
-                                    ih,
-                                    iw,
-                                    static_cast<u16_t>(cin + run_i))) {
-                    break;
-                }
-                run = run_i + 1;
-            }
-
-            i8_t tile[TM];
-#pragma HLS ARRAY_PARTITION variable=tile complete dim=1
-            if (!on_chip_memory_read_tile(src_desc, ih, iw, cin, static_cast<u8_t>(run), tile)) {
-                for (int i = 0; i < TM; ++i) {
-#pragma HLS UNROLL
-                    if (i < run) {
-                        line_buf[ow_i][lane + i] = 0;
-                    }
-                }
-            } else {
-                for (int i = 0; i < TM; ++i) {
-#pragma HLS UNROLL
-                    if (i < run) {
-                        line_buf[ow_i][lane + i] = tile[i];
-                    }
-                }
-            }
-            lane += run;
-        }
-    }
-}
-
-static void load_window_vector(const tensor_desc_t& src_desc,
-                               const conv_cfg_t& cfg,
-                               u16_t oh,
-                               u16_t ow,
-                               u16_t kt,
-                               i8_t vec_buf[TK]) {
-#pragma HLS INLINE off
-    if (effective_kernel(cfg) == 1) {
-        const u16_t stride = effective_stride(cfg);
-        const u16_t c_begin = static_cast<u16_t>(kt * TK);
-        const u16_t remaining = (c_begin < cfg.in_c) ? static_cast<u16_t>(cfg.in_c - c_begin) : static_cast<u16_t>(0);
-        const u8_t lanes = (remaining > static_cast<u16_t>(TK)) ? static_cast<u8_t>(TK) : static_cast<u8_t>(remaining);
-        const i32_t ih = static_cast<i32_t>(oh * stride);
-        const i32_t iw = static_cast<i32_t>(ow * stride);
-
-        i8_t tile[TM];
-#pragma HLS ARRAY_PARTITION variable=tile complete dim=1
-        bool ok = false;
-        if (lanes != 0) {
-            ok = on_chip_memory_read_tile(src_desc, ih, iw, c_begin, lanes, tile);
-        }
-        for (int lane = 0; lane < TK; ++lane) {
-#pragma HLS UNROLL
-            vec_buf[lane] = (ok && static_cast<unsigned>(lane) < lanes.to_uint()) ? tile[lane] : i8_t(0);
-        }
-        return;
-    }
-
-    int lane = 0;
-    for (int lane_iter = 0; lane_iter < TK; ++lane_iter) {
-#pragma HLS PIPELINE off
-        if (lane >= TK) {
-            break;
-        }
-        const u16_t k_idx = static_cast<u16_t>(kt * TK + lane);
-        i32_t ih = 0;
-        i32_t iw = 0;
-        u16_t cin = 0;
-
-        if (!map_k_index(cfg, oh, ow, k_idx, ih, iw, cin)) {
-            vec_buf[lane] = 0;
-            ++lane;
-            continue;
-        }
-
-        int run = 1;
-        for (int run_i = 1; run_i < TM; ++run_i) {
-            if (lane + run_i >= TK ||
-                !can_merge_lane(cfg,
-                                oh,
-                                ow,
-                                static_cast<u16_t>(k_idx + run_i),
-                                ih,
-                                iw,
-                                static_cast<u16_t>(cin + run_i))) {
-                break;
-            }
-            run = run_i + 1;
-        }
-
-        i8_t tile[TM];
-#pragma HLS ARRAY_PARTITION variable=tile complete dim=1
-        if (!on_chip_memory_read_tile(src_desc, ih, iw, cin, static_cast<u8_t>(run), tile)) {
-            for (int i = 0; i < TM; ++i) {
-#pragma HLS UNROLL
-                if (i < run) {
-                    vec_buf[lane + i] = 0;
-                }
-            }
-        } else {
-            for (int i = 0; i < TM; ++i) {
-#pragma HLS UNROLL
-                if (i < run) {
-                    vec_buf[lane + i] = tile[i];
-                }
-            }
-        }
-        lane += run;
-    }
-}
-
-void window_generator(const tensor_desc_t& src_desc,
-                      hls::stream<act_vec_t>& act_stream,
-                      const conv_cfg_t& cfg) {
-#pragma HLS INLINE off
-    i8_t line_buf[1024][TK];
-#pragma HLS BIND_STORAGE variable=line_buf type=ram_2p impl=bram
-#pragma HLS ARRAY_PARTITION variable=line_buf complete dim=2
-    i8_t vec_buf[TK];
-#pragma HLS ARRAY_PARTITION variable=vec_buf complete dim=1
-
-    const u16_t stride = effective_stride(cfg);
-    const u16_t out_h = conv_out_dim(cfg.in_h, stride);
-    const u16_t out_w = conv_out_dim(cfg.in_w, stride);
-    const u16_t k_total = kernel_flat(cfg);
-    const u16_t k_tiles = ceil_div_u16(k_total, TK);
-    const int out_h_i = static_cast<int>(out_h.to_uint());
-    const int out_w_i = static_cast<int>(out_w.to_uint());
-    const int k_tiles_i = static_cast<int>(k_tiles.to_uint());
-
-    if (k_tiles == 1 && is_first_layer_3x3(cfg)) {
-        emit_first_layer_3x3_windows(src_desc, act_stream, cfg, out_h, out_w);
-        return;
-    }
-
-    for (int oh_i = 0; oh_i < MAX_FM_H; ++oh_i) {
-        if (oh_i >= out_h_i) {
-            break;
-        }
-        const u16_t oh = static_cast<u16_t>(oh_i);
-        if (k_tiles == 1) {
-            load_window_line(src_desc, cfg, oh, 0, out_w, line_buf);
-            for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
-#pragma HLS PIPELINE II=1
-                if (ow_i >= out_w_i) {
-                    break;
-                }
-                act_vec_t word = 0;
-                for (int lane = 0; lane < TK; ++lane) {
-#pragma HLS UNROLL
-                    set_vec_i8(word, lane, line_buf[ow_i][lane]);
-                }
-                act_stream.write(word);
-            }
-        } else {
-            for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
-                if (ow_i >= out_w_i) {
-                    break;
-                }
-                const u16_t ow = static_cast<u16_t>(ow_i);
-                for (int kt_i = 0; kt_i < MAX_K_TILE_COUNT; ++kt_i) {
-                    if (kt_i >= k_tiles_i) {
-                        break;
-                    }
-                    const u16_t kt = static_cast<u16_t>(kt_i);
-                    load_window_vector(src_desc, cfg, oh, ow, kt, vec_buf);
-                    act_vec_t word = 0;
-                    for (int lane = 0; lane < TK; ++lane) {
-#pragma HLS UNROLL
-                        set_vec_i8(word, lane, vec_buf[lane]);
-                    }
-                    act_stream.write(word);
-                }
-            }
-        }
-    }
-}
-
-static void emit_window_row_1ktile(const tensor_desc_t& src_desc,
-                                   hls::stream<act_vec_t>& act_stream,
-                                   const conv_cfg_t& cfg,
-                                   u16_t out_row,
-                                   u16_t out_w) {
-#pragma HLS INLINE off
-    i8_t line_buf[1024][TK];
-#pragma HLS BIND_STORAGE variable=line_buf type=ram_2p impl=bram
-#pragma HLS ARRAY_PARTITION variable=line_buf complete dim=2
-    const int out_w_i = static_cast<int>(out_w.to_uint());
-
-    load_window_line(src_desc, cfg, out_row, 0, out_w, line_buf);
-    for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
-#pragma HLS PIPELINE II=1
-        if (ow_i >= out_w_i) {
-            break;
-        }
-        act_vec_t word = 0;
-        for (int lane = 0; lane < TK; ++lane) {
-#pragma HLS UNROLL
-            set_vec_i8(word, lane, line_buf[ow_i][lane]);
-        }
-        act_stream.write(word);
-    }
-}
-
-static void emit_window_row_multikt(const tensor_desc_t& src_desc,
-                                    hls::stream<act_vec_t>& act_stream,
-                                    const conv_cfg_t& cfg,
-                                    u16_t out_row,
-                                    u16_t out_w) {
-#pragma HLS INLINE off
-    i8_t vec_buf[TK];
-#pragma HLS ARRAY_PARTITION variable=vec_buf complete dim=1
-    const u16_t k_total = kernel_flat(cfg);
-    const u16_t k_tiles = ceil_div_u16(k_total, TK);
-    const int out_w_i = static_cast<int>(out_w.to_uint());
-    const int k_tiles_i = static_cast<int>(k_tiles.to_uint());
-
-    for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
-        if (ow_i >= out_w_i) {
-            break;
-        }
-        const u16_t ow = static_cast<u16_t>(ow_i);
-        for (int kt_i = 0; kt_i < MAX_K_TILE_COUNT; ++kt_i) {
-            if (kt_i >= k_tiles_i) {
-                break;
-            }
-            const u16_t kt = static_cast<u16_t>(kt_i);
-            load_window_vector(src_desc, cfg, out_row, ow, kt, vec_buf);
-            act_vec_t word = 0;
-            for (int lane = 0; lane < TK; ++lane) {
-#pragma HLS UNROLL
-                set_vec_i8(word, lane, vec_buf[lane]);
-            }
-            act_stream.write(word);
-        }
-    }
-}
-#endif
-
 static void emit_window_row_3x3_smallc_fast(const tensor_desc_t& src_desc,
                                             hls::stream<act_vec_t>& act_stream,
                                             const conv_cfg_t& cfg,
@@ -865,6 +439,7 @@ static void emit_window_row_3x3_smallc_fast(const tensor_desc_t& src_desc,
 #pragma HLS ARRAY_PARTITION variable=spatial_word complete dim=1
 
         for (int sp = 0; sp < 9; ++sp) {
+#pragma HLS PIPELINE II=10
             const int kh = sp / 3;
             const int kw = sp - kh * 3;
             const i32_t ih = base_h + static_cast<i32_t>(kh * static_cast<int>(dilation.to_uint()));
@@ -1024,6 +599,7 @@ static void emit_window_row_3x3_c19_stride2_fast(const tensor_desc_t& src_desc,
 
     int ow_i = 1;
     for (; ow_i + 1 < MAX_FM_W; ow_i += 2) {
+#pragma HLS PIPELINE off
         if (ow_i + 1 >= out_w_i) break;
         const i32_t base_w = static_cast<i32_t>(ow_i * 2) - 1;
         const bool inner_pair =
@@ -1052,6 +628,7 @@ static void emit_window_row_3x3_c19_stride2_fast(const tensor_desc_t& src_desc,
     }
 
     for (; ow_i < MAX_FM_W; ++ow_i) {
+#pragma HLS PIPELINE off
         if (ow_i >= out_w_i) break;
         const i32_t base_w = static_cast<i32_t>(ow_i * 2) - 1;
         emit_window_row_3x3_c19_stride2_single(src_desc, act_stream, cfg, base_h, base_w);
@@ -1073,6 +650,7 @@ static void emit_window_row_3x3_smallc_stride1_reuse(const tensor_desc_t& src_de
 #pragma HLS ARRAY_PARTITION variable=spatial_word complete dim=1
 
     for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
+#pragma HLS PIPELINE off
         if (ow_i >= out_w_i) break;
         const i32_t base_w = static_cast<i32_t>(ow_i) - 1;
         if (ow_i == 0) {
@@ -1147,6 +725,7 @@ static void emit_window_row_3x3_fast(const tensor_desc_t& src_desc,
         int spatial_idx = 0;
         int cin_idx = 0;
         for (int kt = 0; kt < MAX_K_TILE_COUNT; ++kt) {
+#pragma HLS PIPELINE II=20
             if (kt >= k_tiles_i) break;
             act_vec_t word = 0;
             int lane_offset = 0;
@@ -1202,7 +781,7 @@ static void emit_window_row_3x3_c131_stride2_fast(const tensor_desc_t& src_desc,
         if (ow_i >= out_w_i) break;
         const i32_t base_w = static_cast<i32_t>(ow_i * 2) - 1;
         for (int kt = 0; kt < MAX_K_TILE_COUNT; ++kt) {
-#pragma HLS PIPELINE II=1
+#pragma HLS PIPELINE II=20
             if (kt >= k_tiles_i) break;
             const int start_k = kt * TK;
             const int spatial_idx = start_k / 131;
@@ -1266,7 +845,7 @@ static void emit_window_row_1x1_fast(const tensor_desc_t& src_desc,
         if (ow_i >= out_w_i) break;
         const i32_t iw = static_cast<i32_t>(ow_i * stride);
         for (int kt = 0; kt < MAX_K_TILE_COUNT; ++kt) {
-#pragma HLS PIPELINE II=1
+#pragma HLS PIPELINE II=10
             if (kt >= k_tiles_i) break;
             const u16_t c_begin = static_cast<u16_t>(kt * TK);
             const u16_t remaining = static_cast<u16_t>(cfg.in_c.to_uint() - c_begin.to_uint());
@@ -1296,7 +875,7 @@ static void emit_window_row_1x1_aligned_full_fast(const tensor_desc_t& src_desc,
         if (ow_i >= out_w_i) break;
         const i32_t iw = static_cast<i32_t>(ow_i * stride);
         for (int kt = 0; kt < MAX_K_TILE_COUNT; ++kt) {
-#pragma HLS PIPELINE II=1
+#pragma HLS PIPELINE II=10
             if (kt >= k_tiles_i) break;
             act_vec_t word = 0;
             on_chip_memory_read_aligned_full_tile(src_desc,
