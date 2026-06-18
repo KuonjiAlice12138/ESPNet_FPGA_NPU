@@ -26,14 +26,14 @@
 
 ## 2. 性能结果
 
-当前完整整网单次 `MODE_RUN` 实测：
+当前完整整网单次 `MODE_RUN` 实测如下。注意：这些数值后来确认是 A53 `CNTPCT_EL0` timer ticks，频率约 `33.333MHz`，不是 PL `100MHz` cycle；旧版 app 按 `100MHz/10ns` 换算出的 ms 已作废。
 
-| 版本 | cycles | 延迟 |
+| 版本 | A53 timer ticks | 修正后真实延迟 |
 |---|---:|---:|
-| profiling v1 | `81,787,640` | `817 ms` |
-| `PROFWG1` | `52,600,953` | `526 ms` |
+| profiling v1 | `81,787,640` | 约 `2454 ms` |
+| `PROFWG1` | `52,600,953` | 约 `1578 ms` |
 
-`PROFWG1` 相比 profiling v1 约 `1.56x` 加速，延迟降低约 `35.7%`。这说明 window/packed-path 方向有效，但距离 50ms 目标仍有数量级差距。
+`PROFWG1` 相比 profiling v1 约 `1.56x` 加速，延迟降低约 `35.7%`。这说明 window/packed-path 方向有效，但绝对延迟应按 `33.333MHz` timer 计算，距离 50ms/100ms 目标仍有数量级差距。
 
 `PROFWG1` profiling counter：
 
@@ -52,7 +52,7 @@
 ## 3. 当前风险
 
 1. HLS 资源仍紧：BRAM 约 95%，URAM 100%，LUT 仍超过器件估计容量；Vivado 实现虽然可能继续通过，但后续优化不能随意增加大 FIFO 或重复 buffer。
-2. 当前 526ms 仍远高于 50ms 目标，后续必须做结构性性能收敛，不能只依赖 pragma 微调。
+2. 当前真实延迟约 `1.58s`，远高于 50ms 目标；后续必须做结构性性能收敛，不能只依赖 pragma 微调。
 3. profiling v1 已能记录事件规模，但缺少 per-phase cycle、FIFO stall、SA wait 等周期级信息；优化后模型残差增大，下一版应补这类计数器。
 4. 每轮切换 platform 后必须 clean/reconfigure app，避免 BSP/include/lib 仍引用旧平台。
 
@@ -73,7 +73,7 @@
 
 | 计数器方向 | 目的 |
 |---|---|
-| conv/window/SA/post/writeback phase cycles | 拆分 526ms 的真实来源 |
+| conv/window/SA/post/writeback phase cycles | 拆分约 `1.58s` 真实延迟的来源 |
 | stream empty/full 或 wait counter | 判断是否存在 back-pressure |
 | SA valid step / drain step | 估算有效 PE 利用率和无效 lane 代价 |
 | RMW/writeback cycles | 量化 partial-word 写回瓶颈 |
@@ -91,4 +91,4 @@
 | P2.3 | writeback/RMW | 降低 `rmw_ops=1,261,568` 的 partial-word 写回代价 |
 | P2.4 | small-Cout 多空间点并行 | 在确认瓶颈后提高 level2 小通道层 SA 利用率 |
 
-短期目标先把 full `MODE_RUN` 从 `526ms` 压到 `300-400ms` 区间，并保持 D72 bit-exact；50ms 目标需要更激进的结构性并行化，不能用当前事件模型直接保证。
+短期目标应从真实约 `1.58s` 延迟压到亚秒级，并保持 D72 bit-exact；旧文档中的 `300-400ms` 目标来自错误的 `100MHz` app 换算，已不再作为有效里程碑。50ms/100ms 级目标需要更激进的结构性并行化，不能用当前事件模型直接保证。

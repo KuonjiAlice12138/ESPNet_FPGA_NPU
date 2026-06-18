@@ -1,47 +1,50 @@
 # ESPNet INT8 NPU 架构与 Demo 基线说明
 
-> 更新时间：2026-06-03  
-> Demo 建议基线：`platform_full100_0527` / `INT8-BOARD-20260527-FULL100-UPFULL-VAL`  
+> 更新时间：2026-06-15
+> Demo 建议基线：`platform_full100_0615` / `INT8-BOARD-20260615-P6J-TC100-VAL`
 > 说明：本文用于组会和 demo slides。性能时间统一按 A53 `CNTPCT_EL0` timestamp tick 换算，当前平台 `CNTFRQ_EL0 = 33,333,000 Hz`，不再使用旧的 `100MHz/10ns` app 换算口径。
 
 ## 1. 当前结论
 
 当前 INT8 NPU 已完成 ESPNet Encoder 的板端闭环：PS 端从 SD 卡读取输入和参数，PL 端执行 `MODE_INIT -> MODE_RUN`，NPU 输出 `512x1024` full-resolution 二分类 mask，再由主机离线统计 PA/mIoU。
 
-Demo 建议使用 `full100` 版本，而不是后续 `full125` 探索版。理由如下：
+Demo 建议使用最新 `P6J` timing-clean 版本，而不是早期 `full125` 探索版。理由如下：
 
 | 版本 | 定位 | 结果 |
 |---|---|---|
-| `platform_full100_0527` | full-resolution 功能/精度 demo 基线 | 100 MHz routed timing clean，500 张验证集输出完整，PA/mIoU 有效 |
+| `platform_full100_0615` | P6J timing-clean demo 基线 | 100 MHz routed timing clean，单图真实延迟约 `1003 ms`，500 张验证集输出完整，PA/mIoU 有效 |
+| `platform_full100_0527` | full-resolution 功能/精度旧基线 | 100 MHz routed timing clean，平均真实延迟约 `1254 ms` |
 | `platform_full125_0603` | 125 MHz timing-clean 探索 | 能跑通单图，但真实 `MODE_RUN` 延迟退化到 `1.748 s`，不适合作为 demo 性能线 |
 
-需要明确的是：`full100` 也不是实时 demo。它的价值是证明“模型量化 + NPU 片上推理 + full-resolution mask 输出 + 验证集精度评估”完整闭环，而不是证明实时推理。
+需要明确的是：`P6J` 也不是实时 demo。它的价值是证明“模型量化 + NPU 片上推理 + full-resolution mask 输出 + 验证集精度评估”完整闭环，并展示相对旧 `full100` 约 `20%` 的端到端延迟改善，而不是证明实时推理。
 
 ## 2. Demo 基线数据
 
-### 2.1 full100 板端闭环
+### 2.1 P6J 板端闭环
 
 | 项目 | 数据 |
 |---|---|
-| Platform | `platform_full100_0527` |
-| App tag | `INT8-BOARD-20260527-FULL100-UPFULL-VAL` |
+| Platform | `platform_full100_0615` |
+| App tag | `INT8-BOARD-20260615-P6J-TC100-VAL` |
 | PL clock | `100 MHz` |
 | 输出格式 | `512x1024` uint8 mask，`0=target, 1=background` |
 | 输出文件 | `O0000.BIN` 到 `O0499.BIN`，每个 `524288 bytes` |
-| Routed timing | WNS `+0.073 ns`，TNS `0` |
-| 资源 | LUT `73.35%`，FF `25.39%`，BRAM Tile `86.02%`，URAM `100%`，DSP `39.77%` |
+| Routed timing | WNS `+0.139 ns`，TNS `0` |
+| 资源 | CLB LUTs `56.72%`，CLB `91.79%`，BRAM Tile `97.58%`，URAM `100%`，DSP `35.74%` |
 
-旧 app 打印的 `avg_ms=417` 是错误换算；它实际记录的是 A53 timestamp tick。修正后：
+计时统一按 A53 timestamp tick 换算。P6J 单图测试结果：
 
 | 项目 | 数据 |
 |---|---:|
-| 平均单图 `MODE_RUN` | `41,788,175` A53 timer ticks |
+| 单图 `MODE_RUN` | `33,434,687` A53 timer ticks |
 | A53 timer 频率 | `33,333,000 Hz` |
-| 平均真实 wall-time | 约 `1.254 s` |
-| 等效 100 MHz PL cycles | 约 `125.37 M cycles` |
-| 500 张验证集总时间 | 约 `626.8 s` |
+| 单图真实 wall-time | 约 `1.003 s` |
+| 等效 100 MHz PL cycles | 约 `100.3 M cycles` |
+| 相对 `full100_0527` | 约 `20.0%` 延迟下降 |
 
-### 2.2 full100 精度
+旧 `full100_0527` 基线为 `41,788,175` A53 ticks，约 `1.254 s`，等效约 `125.37 M` 100MHz PL cycles。P6J 已压缩端到端周期，但距离 `100 ms` 级目标仍约 `10x`。
+
+### 2.2 P6J 精度
 
 板端 full-resolution mask 与软件侧 full-resolution baseline 对比：
 
@@ -50,8 +53,9 @@ Demo 建议使用 `full100` 版本，而不是后续 `full125` 探索版。理�
 | software fullres bilinear logits argmax | `0.97854548` | `0.86874892` |
 | software fullres nearest mask | `0.97718681` | `0.86281516` |
 | board fullres mask (`full100`) | `0.97800421` | `0.86356491` |
+| board fullres mask (`P6J`) | `0.97800421` | `0.86356491` |
 
-这个结果说明板端输出没有显著精度劣化。由于硬件输出是 uint8 mask，不再保留 full-resolution 两通道 logits，因此 demo 中建议强调“最终 mask 质量”和“验证集 PA/mIoU”，不要声称与 PyTorch float bilinear logits bit-exact。
+这个结果说明 P6J 板端输出没有显著精度劣化。由于硬件输出是 uint8 mask，不再保留 full-resolution 两通道 logits，因此 demo 中建议强调“最终 mask 质量”和“验证集 PA/mIoU”，不要声称与 PyTorch float bilinear logits bit-exact。
 
 ### 2.3 full125 反例
 
@@ -72,7 +76,7 @@ SD 输出 `MASK.BIN` 检查通过：大小 `524288 bytes`，仅包含 0/1 两类
 
 ```text
 SD Card
-  ├─ PARAM.BIN       UOP、tensor desc、qparam、weight
+  ├─ PARAM.BIN       tensor desc、qparam、weight、UOP count/header metadata
   ├─ INPUTQ.BIN      单图输入，或 I0000.BIN...I0499.BIN 验证集输入
   └─ MASK.BIN/Oxxxx  NPU 输出 full-resolution mask
 
@@ -88,7 +92,7 @@ PL NPU IP
   ├─ M_AXI gmem0: input frame
   ├─ M_AXI gmem1: output mask
   ├─ M_AXI gmem2: param blob
-  └─ 片上 feature/weight/qparam/uop buffer
+  └─ 片上 feature/weight/qparam buffer 与静态 ESPNet graph scheduler
 ```
 
 顶层 IP 为 `espnet_encoder_int8_core`。正常运行流程只需要一次 `MODE_INIT` 加载参数，然后对每张图执行一次 `MODE_RUN`。
@@ -101,46 +105,50 @@ PL NPU IP
 | `mode` | `MODE_INIT` 或 `MODE_RUN` |
 | `uop_count` | 整网 UOP 数量，当前为 75 |
 
-## 4. 模块边界
+## 4. 顶层硬件模块
 
-当前 HLS 代码按功能模块划分如下。这里的模块基本对应 `src/*.cpp`，但卷积 post-process 和 row writeback 保留在顶层文件内，以避免 HLS dataflow feedback 和 process merging 风险。
+当前设计不再按早期 `if_dec.cpp` 取指译码器来组织顶层控制，而是采用“静态 ESPNet graph scheduler + 统一 UOP 描述格式”的实现。UOP 仍作为内部算子描述结构保留，但整网 75 个算子的顺序、shape、tensor id 和 param id 已固化在 HLS 顶层调度逻辑中；`PARAM.BIN` 主要提供权重、量化参数、tensor metadata 和一致性校验信息。
 
-| 文件 | 功能 |
-|---|---|
-| `int8_core.cpp` | 顶层控制、UOP 顺序调度、Conv/Add/Affine/Store 执行入口、卷积 row buffer、producer-store fusion |
-| `param_dma.cpp` | 解析 `PARAM.BIN`，加载 UOP、tensor desc、qparam 和 weight buffer |
-| `if_dec.cpp` | UOP fetch/decode 与基本合法性检查 |
-| `frame_dma.cpp` | 输入 frame load；输出阶段调用 full-resolution upsample store |
-| `memory.cpp` | 片上 feature memory bank 映射、packed tile read/write、aligned row write |
-| `win_gen.cpp` | 卷积 activation window 生成 |
-| `sa_core.cpp` | `TM=32/TK=32` INT8 MAC 阵列，输出 INT32 psum |
-| `avgpool_unit.cpp` | C3 3x3 stride2 avgpool 和 pool requant |
-| `concat_unit.cpp` | STORE/CONCAT channel slice copy |
-| `upsample_unit.cpp` | `64x128x2` logits 到 `512x1024` mask 的 bilinear upsample + argmax |
+| 架构模块 | 主要职责 | 当前源码承载 |
+|---|---|---|
+| AXI/Control Shell | AXI-Lite 控制寄存器、三路 M_AXI 端口、`MODE_INIT/MODE_RUN` 分发 | `int8_core.cpp` |
+| Parameter Manager | 解析 `PARAM.BIN`，加载 tensor desc、weight、conv/add/affine/pool qparam | `param_dma.cpp` |
+| Static Graph Scheduler | 固化 ESPNet Encoder 的 75 条 UOP 等价调度，完成 opcode 分派和 conv-store fusion | `int8_core.cpp` |
+| Frame DMA | 输入图像从 DDR 进入片上 feature buffer，输出 mask 写回 DDR | `frame_dma.cpp` |
+| On-Chip Feature Memory | feature map BRAM/URAM 存储、packed word 读写、bank/region 映射 | `memory.cpp` |
+| Scratch Manager | tensor id 到全局/局部 scratch 区域的解析，控制中间特征生命周期 | `scratch_mgr.cpp` |
+| Convolution Engine | window 生成、weight stream、INT8 MAC 阵列、psum 后处理和行写回 | `win_gen.cpp`、`sa_core.cpp`、`conv_store.cpp`、`int8_core.cpp` |
+| Non-Conv Operators | Pool、Add、Affine、Store/Concat 等非卷积算子 | `avgpool_unit.cpp`、`concat_unit.cpp`、`int8_core.cpp` |
+| Full-Resolution Output | `64x128x2` logits 上采样并 argmax，输出 `512x1024` mask | `upsample_unit.cpp` |
+
+早期 `if_dec.cpp` 的逻辑已被拆分和静态化：UOP 构造/选择进入 `StaticUop<ID>` 和 `build_p6_static_uop()`，opcode 分派进入 `run_p6_dispatch_uop()`，整网循环进入 `run_p6_static_graph()`。因此汇报时不建议再把 `IF/Decode Unit` 画成独立硬件模块。
 
 已废弃的历史路径：
 
 | 历史项 | 当前状态 |
 |---|---|
 | 独立 `ppu.cpp` | 已移除；功能拆入 conv post-process、Add/Affine/Pool/Store |
+| 独立 `if_dec.cpp` | 已移除；动态取指/译码被静态 graph scheduler 替代 |
 | pair2/dual path | 曾上板验证，但端到端退化，不作为 demo 主线 |
 | profiling/debug 端口 | 只用于定位，不作为 demo 依赖 |
 
 ## 5. UOP 调度
 
-硬件不是把整网展开成固定 RTL pipeline，而是顺序解释执行 `PARAM.BIN` 中的 UOP 序列。
+当前硬件不是动态解释 `PARAM.BIN` 中的 UOP 序列，而是使用编译期固化的 ESPNet Encoder 静态调度表。UOP 仍是统一的内部算子描述格式，用来承载 opcode、输入/输出 tensor、shape、kernel/stride/dilation、param id、channel offset 等字段；顶层按 UOP id 顺序生成描述并分派到对应算子单元。
 
 ```text
 MODE_INIT:
   param_dma_init(gmem_param)
-  instruction_fetch_decode(gmem_param, uop_count)
+  validate PARAM.BIN header / uop_count
+  load tensor desc / qparam / weight into on-chip buffers
 
 MODE_RUN:
   frame_dma_load(gmem_frame_in)
-  for each uop:
-      execute LOAD / CONV / POOL / ADD / AFFINE / STORE / END
-  frame_dma_store(gmem_frame_out)
-      -> upsample_logits_bilinear_argmax_store()
+  for static uop_id = 1..72:
+      build static UOP descriptor
+      dispatch to CONV / POOL / ADD / AFFINE / STORE
+      apply graph-level fusion when enabled
+  final CONV/UPSAMPLE path writes full-resolution mask
 ```
 
 当前 UOP 规模：
@@ -205,11 +213,12 @@ for each output row:
 
 1. 任务场景：目标-背景二分类分割，输入 `512x1024`，输出 full-resolution mask。
 2. 模型侧：ESPNet Encoder 经过硬件约束 INT8 量化，导出 `PARAM.BIN` 和 INT8 输入。
-3. 硬件侧：PS 只负责 SD/DDR 和寄存器控制，PL NPU 执行 75 条 UOP。
+3. 硬件侧：PS 只负责 SD/DDR 和寄存器控制，PL NPU 按静态 graph scheduler 执行与 75 条 UOP 对齐的算子序列。
 4. 输出侧：NPU 直接输出 `512x1024` mask，不需要 PS 做上采样。
-5. 正确性：500 张验证集输出完整，PA `0.9780`，mIoU `0.8636`。
+5. 正确性：P6J 版 500 张验证集输出完整，PA `0.9780`，mIoU `0.8636`。
 6. 工程闭环：100 MHz routed timing clean，资源接近上限但实现可用。
-7. 局限：真实平均延迟约 `1.254 s/image`，当前不具备实时 demo 性能。
+7. 性能：P6J 单图真实延迟约 `1.003 s/image`，比旧 full100 基线约快 `20%`。
+8. 局限：当前仍不具备实时 demo 性能。
 
 不建议继续使用以下表述：
 
@@ -244,12 +253,11 @@ for each output row:
 |---|---|
 | 1 | 任务目标：ESPNet INT8 FPGA NPU full-resolution 分割输出 |
 | 2 | PS/PL/SD/DDR 顶层系统 |
-| 3 | `PARAM.BIN`、UOP 序列、`MODE_INIT/MODE_RUN` |
-| 4 | HLS 模块边界与 `.cpp` 文件对应关系 |
+| 3 | `PARAM.BIN`、静态 graph scheduler、`MODE_INIT/MODE_RUN` |
+| 4 | 顶层硬件模块与源码承载关系 |
 | 5 | 片上 feature memory 与 256-bit packed word |
 | 6 | Conv row-level stream datapath |
 | 7 | `TM=32/TK=32`、K tile 和小通道利用率问题 |
 | 8 | Full-resolution upsample + argmax 输出 |
 | 9 | full100 demo 数据：timing clean、PA/mIoU、真实延迟 |
-| 10 | 局限与后续：降分辨率 demo profile 或架构级并行化 |
-
+| 10 | 局限与后续：继续做架构级并行化、减少 memory pass，而不是只调 Vivado strategy |

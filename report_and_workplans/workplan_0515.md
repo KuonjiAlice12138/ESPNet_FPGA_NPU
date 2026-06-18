@@ -16,16 +16,16 @@
 
 | 指标 | 数值 |
 |---|---:|
-| full cycles | `51,120,885` |
-| full latency @100MHz | `511 ms` |
+| full A53 timer ticks | `51,120,885` |
+| 修正后真实延迟 | 约 `1534 ms` |
 | window read ops | `5,204,224` |
 | window words | `2,760,704` |
 | weight words | `468,992` |
 | psum words | `9,601,024` |
 | RMW ops | `1,212,416` |
-| model cycles | `14,048,832` |
+| model event cycles | `14,048,832` |
 
-相比 `PROFWG1` 的 `526 ms`，P2A 实测降低到 `511 ms`，说明当前优化方向有收益，但增幅有限，后续必须继续针对 window generation、post/output drain 和写回路径做结构性收敛。
+相比 `PROFWG1` 的真实约 `1578 ms`，P2A 实测约 `1534 ms`，说明当前优化方向有收益但增幅有限。旧 app 输出的 `511 ms` 是把 A53 timer tick 误按 `100MHz` 换算得到的无效延迟口径。
 
 ## 2. 今日 HLS 修改
 
@@ -60,6 +60,6 @@
 2. 在 Vitis 中重新 build platform 和 app，确认 app 指向最新 platform，避免缓存引用旧 BSP。
 3. 上板运行单次 full `MODE_RUN`，记录 cycles、profiling/prof2 counters，并保存 `D72OUT.BIN`。
 4. 离线比对 `D72OUT.BIN` 与 HLS reference，要求 bit-exact 后再记录性能数据。
-5. 若最新版延迟明显低于 `511 ms`，继续沿当前路径优化；若收益很小，下一轮重点转向 `emit_window_row_3x3_fast` 和 post/writeback 的周期级瓶颈。
+5. 若最新版真实延迟明显低于 P2A 的约 `1534 ms`，继续沿当前路径优化；若收益很小，下一轮重点转向 `emit_window_row_3x3_fast` 和 post/writeback 的周期级瓶颈。
 
-短期目标仍是先稳定压到 `300-400 ms` 区间并保持 bit-exact；50ms 目标需要后续更激进的并行化或任务级重构，不能只依赖当前局部优化。
+短期目标改为先从约 `1.53s` 压到亚秒级并保持 bit-exact；旧的 `300-400 ms` 区间来自错误 timer 口径，不再作为有效目标。50ms/100ms 级目标需要后续更激进的并行化或任务级重构，不能只依赖当前局部优化。

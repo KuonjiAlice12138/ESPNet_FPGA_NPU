@@ -50,13 +50,12 @@
 
 ```text
 samples=500
-total_cycles=20894087956
-total_ms=208940
-avg_cycles=41788175
-avg_ms=417
-min_ms=417
-max_ms=417
+total_ticks=20894087956
+avg_ticks=41788175
+old_app_avg_ms=417  // 旧 app 错按 100MHz/10ns 换算，已作废
 ```
+
+修正口径：这些计数来自 A53 `CNTPCT_EL0` timer，频率约 `33.333MHz`。因此 500 张总真实时间约 `626.8s`，平均单图真实延迟约 `1254ms`。
 
 SD 卡输出检查：
 
@@ -94,7 +93,7 @@ SD 卡输出检查：
 
 1. full-resolution 输出链路已经闭合：NPU 可直接输出 `512x1024` 二分类 mask，并完成 500 张验证集上板评估。
 2. `platform_full100_0527` 是当前 full-resolution 功能验收平台，时序 clean，但频率只有 `100 MHz`。
-3. 端到端推理时间从此前低分辨率 mask 输出约 `399 ms` 增加到约 `417 ms`，新增 full-resolution upsample 和更大 output DMA 写回带来约 `18 ms` 级开销。
+3. 端到端推理时间从此前低分辨率 mask 输出真实约 `1198 ms` 增加到 full-resolution 输出真实约 `1254 ms`，新增 full-resolution upsample 和更大 output DMA 写回带来约 `56 ms` 级开销。旧文档中的 `399 ms -> 417 ms` 是错误的 `100MHz` timer 换算。
 4. 当前性能瓶颈仍主要在原 NPU 主数据流和 `s_uram/window/memory` 布线，不在 upsample 算法本身。
 5. URAM 已满，后续优化不能依赖新增大规模片上 buffer。
 
@@ -110,7 +109,7 @@ SD 卡输出检查：
 后续计划：
 
 1. 先用当前补丁跑 HLS synthesis，重点审查 `upsample_logits_bilinear_argmax_store`、`frame_dma_store`、top LUT/BRAM/URAM、estimated clock 和 audit warning。
-2. 若综合健康，推进一版 `P5A-UPFULL-CYC` 实现，上板确认 full-val 平均延迟是否低于 `417 ms`。
+2. 若综合健康，推进一版 `P5A-UPFULL-CYC` 实现，上板确认 full-val 平均真实延迟是否低于 `1254 ms`。
 3. 150 MHz 不能直接硬冲：当前 100 MHz routed WNS 只有 `+0.073 ns`，最差路径仍集中在 `s_uram/window/memory`，route delay 占比接近 90% 以上。下一步频率收敛应先做到 `125 MHz timing-clean`，再评估 `150 MHz`。
 4. 频率优化重点不在 upsample，而在 `s_uram` 访问路径、`window_generator_row -> URAM ADDR` 路径、`s_bram -> ADD/STORE tile` 路径和 DSP pipeline warning。
 5. 周期优化重点继续放在不复制主数据流的局部优化：upsample 行复用、non-conv 固定 shape 专用路径、轻量 uop fusion、window path 固定 shape 分支。

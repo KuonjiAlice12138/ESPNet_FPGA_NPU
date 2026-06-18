@@ -7,13 +7,13 @@
 | 项目 | 结果 |
 |---|---|
 | 当前最新版本 | `INT8-BOARD-20260518-P2E-WINPACK-PROFV3` |
-| full `MODE_RUN` | `39,941,854 cycles = 399 ms` |
-| 相比 P2D `407 ms` | 减少 `794,139 cycles`，约 `7.94 ms / 1.95%` |
-| 相比 P2B `468 ms` | 减少 `6,951,569 cycles`，约 `69.5 ms / 14.8%` |
-| 相比 PROF01 `817 ms` | 约 `51.2%` 总体降幅 |
+| full `MODE_RUN` | `39,941,854` A53 timer ticks，真实约 `1198 ms` |
+| 相比 P2D | 减少 `794,139` ticks，约 `23.8 ms / 1.95%` |
+| 相比 P2B | 减少 `6,951,569` ticks，约 `208.5 ms / 14.8%` |
+| 相比 PROF01 | 约 `51.2%` 总体降幅，真实延迟从约 `2454 ms` 降到约 `1198 ms` |
 | 输出正确性 | `D72OUT.BIN` 与 HLS reference bit-exact，`0 / 16384` mismatch |
 
-P2E 可以作为当前新的上板性能基线。相比 P2D，本轮收益较小，但它把剩余 RMW read 完全清零，说明输出写回路径已经基本收敛到当前数据布局下的较优状态。
+P2E 可以作为当前新的上板性能基线。相比 P2D，本轮收益较小，但它把剩余 RMW read 完全清零，说明输出写回路径已经基本收敛到当前数据布局下的较优状态。旧文档中的 `399 ms` 是错误地按 `100MHz` 换算 A53 timer tick 得到的旧口径。
 
 ## 2. Profiling 对比
 
@@ -43,7 +43,7 @@ P2E 的主要结构性收益仍来自写回路径：`rmw_reads=0`，`direct_word
 | `write_cyc` | `347,136` | `0.87%` |
 | `row_region_cyc` | `7,104,512` | `17.79%` |
 
-P2E 的 `model_cycles = 7.46M`，但实测为 `39.94M cycles`，仍有约 `32.48M cycles` residual。也就是说，当前显式计数器解释了方向性收益，但还不能解释大部分真实延迟。后续不能再只围绕单个算子局部循环盲改，必须把 row-level 调度、memory back-pressure 和函数边界控制开销纳入模型。
+P2E 的 `model_cycles = 7.46M`，但板端计时为 `39.94M` A53 timer ticks，仍有约 `32.48M` tick residual。也就是说，当前显式计数器解释了方向性收益，但还不能解释大部分真实延迟。后续不能再只围绕单个算子局部循环盲改，必须把 row-level 调度、memory back-pressure 和函数边界控制开销纳入模型。
 
 ## 4. 当前判断
 
@@ -58,7 +58,7 @@ P2E 的 `model_cycles = 7.46M`，但实测为 `39.94M cycles`，仍有约 `32.48
 
 ## 5. 下一步计划
 
-1. 保留 P2E 作为当前 bit-exact 上板基线，记录 `399 ms`。
+1. 保留 P2E 作为当前 bit-exact 上板基线，记录 `39,941,854` A53 timer ticks，真实约 `1198 ms`。
 2. 做 profiling v4：增加每层/每 row 的实际 cycle 计数，而不仅是全网累计阶段估计。
 3. 在 HLS 中定位 row-region 外的额外等待来源，重点检查 `execute_conv_stream_datapath` 外层循环、store 后同步、uop 调度和 on-chip memory 访问仲裁。
 4. 继续优化 window path，但必须以 `win_read/win_cyc/row_region_cyc` 的上板下降作为验收标准。
