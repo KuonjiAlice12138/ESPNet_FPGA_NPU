@@ -9,12 +9,11 @@ bool on_chip_memory_read_packed_contiguous(const tensor_desc_t& desc,
                                            u16_t c_begin,
                                            u8_t valid_bytes,
                                            act_vec_t& packed);
-bool on_chip_memory_write_packed_tile(const tensor_desc_t& desc,
-                                      u16_t h,
-                                      u16_t w,
-                                      u16_t c_begin,
-                                      u8_t valid_c,
-                                      act_vec_t packed);
+bool on_chip_memory_write_fmbuf_abs_word(u8_t bank_id,
+                                         u32_t byte_offset,
+                                         act_vec_t packed);
+bool on_chip_memory_write_pool2_abs_word(u32_t byte_offset,
+                                         act_vec_t packed);
 
 static i32_t round_div9(i32_t x) {
 #pragma HLS INLINE
@@ -46,6 +45,16 @@ static void set_packed_i8(act_vec_t& word, int lane, i8_t value) {
     word.range(lane * 8 + 7, lane * 8) = static_cast<u8_t>(value);
 }
 
+static bool write_aligned_abs_word_narrow(u8_t dst_bank,
+                                          u32_t byte_offset,
+                                          act_vec_t word) {
+#pragma HLS INLINE off
+#pragma HLS PIPELINE off
+    return (dst_bank.to_uint() == static_cast<unsigned>(BANK_BRAM_SCR1))
+               ? on_chip_memory_write_pool2_abs_word(byte_offset, word)
+               : on_chip_memory_write_fmbuf_abs_word(dst_bank, byte_offset, word);
+}
+
 static bool pool_shape_supported(const tensor_desc_t& src,
                                  const tensor_desc_t& dst,
                                  const pool_q_t& qparam) {
@@ -62,13 +71,43 @@ static bool pool_shape_supported(const tensor_desc_t& src,
            dst.w.to_uint() == expect_w;
 }
 
-static bool avgpool_pixel_c3_generic(const tensor_desc_t& src,
-                                     const tensor_desc_t& dst,
-                                     const pool_q_t& qparam,
-                                     u16_t oh,
-                                     u16_t ow) {
+static u16_t pool_desc_phys_c(const tensor_desc_t& desc) {
+#pragma HLS INLINE
+    return (desc.reserved0.to_uint() == 0U) ? desc.c : desc.reserved0;
+}
+
+static u32_t pool_row_base(const tensor_desc_t& desc, u16_t h) {
+#pragma HLS INLINE
+    return desc.base_offset +
+           static_cast<u32_t>(h) * static_cast<u32_t>(desc.w) *
+               static_cast<u32_t>(pool_desc_phys_c(desc)) +
+           static_cast<u32_t>(desc.reserved1);
+}
+
+static void quantize_c3_avg_pixel(const i32_t sum[3],
+                                  const pool_q_t& qparam,
+                                  act_vec_t& out_packed) {
+#pragma HLS INLINE
+#pragma HLS ARRAY_PARTITION variable=sum complete dim=1
+    out_packed = 0;
+    for (int c = 0; c < 3; ++c) {
+#pragma HLS UNROLL
+        set_packed_i8(out_packed, c, requant_pool_avg(round_div9(sum[c]), qparam));
+    }
+}
+
+template <int DST_BYTE, int SRC_BYTE, int COUNT_BYTES>
+static void copy_c3_segment(act_vec_t& dst, const act_vec_t& src) {
+#pragma HLS INLINE
+    dst.range(DST_BYTE * 8 + COUNT_BYTES * 8 - 1, DST_BYTE * 8) =
+        src.range(SRC_BYTE * 8 + COUNT_BYTES * 8 - 1, SRC_BYTE * 8);
+}
+
+static bool avgpool_pixel_c3_generic_sum(const tensor_desc_t& src,
+                                         u16_t oh,
+                                         u16_t ow,
+                                         i32_t sum[3]) {
 #pragma HLS INLINE off
-    i32_t sum[3];
 #pragma HLS ARRAY_PARTITION variable=sum complete dim=1
 
     for (int c = 0; c < 3; ++c) {
@@ -93,12 +132,7 @@ static bool avgpool_pixel_c3_generic(const tensor_desc_t& src,
         }
     }
 
-    act_vec_t out_packed = 0;
-    for (int c = 0; c < 3; ++c) {
-#pragma HLS UNROLL
-        set_packed_i8(out_packed, c, requant_pool_avg(round_div9(sum[c]), qparam));
-    }
-    return on_chip_memory_write_packed_tile(dst, oh, ow, 0, static_cast<u8_t>(3), out_packed);
+    return true;
 }
 
 static bool read_c3_fast_rows(const tensor_desc_t& src,
@@ -108,6 +142,7 @@ static bool read_c3_fast_rows(const tensor_desc_t& src,
                               act_vec_t& row1,
                               act_vec_t& row2) {
 #pragma HLS INLINE off
+#pragma HLS PIPELINE off
     if (!on_chip_memory_read_packed_contiguous(
             src, base_h + 0, base_w, 0, static_cast<u8_t>(9), row0)) {
         return false;
@@ -128,6 +163,7 @@ static void sum_c3_fast_rows(act_vec_t row0,
                              act_vec_t row2,
                              i32_t sum[3]) {
 #pragma HLS INLINE off
+#pragma HLS PIPELINE off
 #pragma HLS ARRAY_PARTITION variable=sum complete dim=1
     i32_t row_sum0[3];
     i32_t row_sum1[3];
@@ -155,33 +191,17 @@ static void sum_c3_fast_rows(act_vec_t row0,
     }
 }
 
-static bool write_c3_avg_pixel(const tensor_desc_t& dst,
-                               const pool_q_t& qparam,
-                               u16_t oh,
-                               u16_t ow,
-                               const i32_t sum[3]) {
+static bool avgpool_pixel_c3_inner_fast_sum(const tensor_desc_t& src,
+                                            u16_t oh,
+                                            u16_t ow,
+                                            i32_t sum[3]) {
 #pragma HLS INLINE off
-#pragma HLS ARRAY_PARTITION variable=sum complete dim=1
-    act_vec_t out_packed = 0;
-    for (int c = 0; c < 3; ++c) {
-#pragma HLS UNROLL
-        set_packed_i8(out_packed, c, requant_pool_avg(round_div9(sum[c]), qparam));
-    }
-    return on_chip_memory_write_packed_tile(dst, oh, ow, 0, static_cast<u8_t>(3), out_packed);
-}
-
-static bool avgpool_pixel_c3_inner_fast(const tensor_desc_t& src,
-                                        const tensor_desc_t& dst,
-                                        const pool_q_t& qparam,
-                                        u16_t oh,
-                                        u16_t ow) {
-#pragma HLS INLINE off
+#pragma HLS PIPELINE off
     const i32_t base_h = static_cast<i32_t>(oh) * 2 - 1;
     const i32_t base_w = static_cast<i32_t>(ow) * 2 - 1;
     act_vec_t row0 = 0;
     act_vec_t row1 = 0;
     act_vec_t row2 = 0;
-    i32_t sum[3];
 #pragma HLS ARRAY_PARTITION variable=sum complete dim=1
 
     if (!read_c3_fast_rows(src, base_h, base_w, row0, row1, row2)) {
@@ -189,7 +209,171 @@ static bool avgpool_pixel_c3_inner_fast(const tensor_desc_t& src,
     }
 
     sum_c3_fast_rows(row0, row1, row2, sum);
-    return write_c3_avg_pixel(dst, qparam, oh, ow, sum);
+    return true;
+}
+
+static bool avgpool_pixel_c3_generic_pack(const tensor_desc_t& src,
+                                          const pool_q_t& qparam,
+                                          int oh_i,
+                                          int ow_i,
+                                          act_vec_t& out_packed) {
+#pragma HLS INLINE off
+#pragma HLS PIPELINE off
+    i32_t sum[3];
+#pragma HLS ARRAY_PARTITION variable=sum complete dim=1
+
+    const u16_t oh = static_cast<u16_t>(oh_i);
+    const u16_t ow = static_cast<u16_t>(ow_i);
+
+    if (!avgpool_pixel_c3_generic_sum(src, oh, ow, sum)) {
+        return false;
+    }
+
+    quantize_c3_avg_pixel(sum, qparam, out_packed);
+    return true;
+}
+
+static bool avgpool_pixel_c3_inner_fast_pack(const tensor_desc_t& src,
+                                             const pool_q_t& qparam,
+                                             int oh_i,
+                                             int ow_i,
+                                             act_vec_t& out_packed) {
+#pragma HLS INLINE off
+#pragma HLS PIPELINE off
+    i32_t sum[3];
+#pragma HLS ARRAY_PARTITION variable=sum complete dim=1
+
+    if (!avgpool_pixel_c3_inner_fast_sum(src,
+                                         static_cast<u16_t>(oh_i),
+                                         static_cast<u16_t>(ow_i),
+                                         sum)) {
+        return false;
+    }
+
+    quantize_c3_avg_pixel(sum, qparam, out_packed);
+    return true;
+}
+
+static bool write_c3_group32(u8_t dst_bank,
+                             u32_t word_offset,
+                             const act_vec_t pixels[32]) {
+#pragma HLS INLINE
+    act_vec_t w0 = 0;
+    copy_c3_segment<0, 0, 3>(w0, pixels[0]);
+    copy_c3_segment<3, 0, 3>(w0, pixels[1]);
+    copy_c3_segment<6, 0, 3>(w0, pixels[2]);
+    copy_c3_segment<9, 0, 3>(w0, pixels[3]);
+    copy_c3_segment<12, 0, 3>(w0, pixels[4]);
+    copy_c3_segment<15, 0, 3>(w0, pixels[5]);
+    copy_c3_segment<18, 0, 3>(w0, pixels[6]);
+    copy_c3_segment<21, 0, 3>(w0, pixels[7]);
+    copy_c3_segment<24, 0, 3>(w0, pixels[8]);
+    copy_c3_segment<27, 0, 3>(w0, pixels[9]);
+    copy_c3_segment<30, 0, 2>(w0, pixels[10]);
+
+    act_vec_t w1 = 0;
+    copy_c3_segment<0, 2, 1>(w1, pixels[10]);
+    copy_c3_segment<1, 0, 3>(w1, pixels[11]);
+    copy_c3_segment<4, 0, 3>(w1, pixels[12]);
+    copy_c3_segment<7, 0, 3>(w1, pixels[13]);
+    copy_c3_segment<10, 0, 3>(w1, pixels[14]);
+    copy_c3_segment<13, 0, 3>(w1, pixels[15]);
+    copy_c3_segment<16, 0, 3>(w1, pixels[16]);
+    copy_c3_segment<19, 0, 3>(w1, pixels[17]);
+    copy_c3_segment<22, 0, 3>(w1, pixels[18]);
+    copy_c3_segment<25, 0, 3>(w1, pixels[19]);
+    copy_c3_segment<28, 0, 3>(w1, pixels[20]);
+    copy_c3_segment<31, 0, 1>(w1, pixels[21]);
+
+    act_vec_t w2 = 0;
+    copy_c3_segment<0, 1, 2>(w2, pixels[21]);
+    copy_c3_segment<2, 0, 3>(w2, pixels[22]);
+    copy_c3_segment<5, 0, 3>(w2, pixels[23]);
+    copy_c3_segment<8, 0, 3>(w2, pixels[24]);
+    copy_c3_segment<11, 0, 3>(w2, pixels[25]);
+    copy_c3_segment<14, 0, 3>(w2, pixels[26]);
+    copy_c3_segment<17, 0, 3>(w2, pixels[27]);
+    copy_c3_segment<20, 0, 3>(w2, pixels[28]);
+    copy_c3_segment<23, 0, 3>(w2, pixels[29]);
+    copy_c3_segment<26, 0, 3>(w2, pixels[30]);
+    copy_c3_segment<29, 0, 3>(w2, pixels[31]);
+
+    if (!write_aligned_abs_word_narrow(dst_bank, word_offset, w0)) {
+        return false;
+    }
+    if (!write_aligned_abs_word_narrow(dst_bank, word_offset + static_cast<u32_t>(32), w1)) {
+        return false;
+    }
+    return write_aligned_abs_word_narrow(dst_bank, word_offset + static_cast<u32_t>(64), w2);
+}
+
+static bool avgpool_c3_group32_generic_pack_write(const tensor_desc_t& src,
+                                                  const tensor_desc_t& dst,
+                                                  const pool_q_t& qparam,
+                                                  int oh_i,
+                                                  int ow_start,
+                                                  u32_t word_offset) {
+#pragma HLS INLINE off
+    act_vec_t pixels[32];
+#pragma HLS ARRAY_PARTITION variable=pixels complete dim=1
+
+    for (int pix = 0; pix < 32; ++pix) {
+#pragma HLS PIPELINE off
+        act_vec_t out_packed = 0;
+        if (!avgpool_pixel_c3_generic_pack(src, qparam, oh_i, ow_start + pix, out_packed)) {
+            return false;
+        }
+        pixels[pix] = out_packed;
+    }
+
+    return write_c3_group32(dst.bank_id, word_offset, pixels);
+}
+
+static bool avgpool_c3_group32_first_col_pack_write(const tensor_desc_t& src,
+                                                    const tensor_desc_t& dst,
+                                                    const pool_q_t& qparam,
+                                                    int oh_i,
+                                                    u32_t word_offset) {
+#pragma HLS INLINE off
+    act_vec_t pixels[32];
+#pragma HLS ARRAY_PARTITION variable=pixels complete dim=1
+
+    if (!avgpool_pixel_c3_generic_pack(src, qparam, oh_i, 0, pixels[0])) {
+        return false;
+    }
+
+    for (int pix = 1; pix < 32; ++pix) {
+#pragma HLS PIPELINE II=24
+        act_vec_t out_packed = 0;
+        if (!avgpool_pixel_c3_inner_fast_pack(src, qparam, oh_i, pix, out_packed)) {
+            return false;
+        }
+        pixels[pix] = out_packed;
+    }
+
+    return write_c3_group32(dst.bank_id, word_offset, pixels);
+}
+
+static bool avgpool_c3_group32_inner_fast_pack_write(const tensor_desc_t& src,
+                                                     const tensor_desc_t& dst,
+                                                     const pool_q_t& qparam,
+                                                     int oh_i,
+                                                     int ow_start,
+                                                     u32_t word_offset) {
+#pragma HLS INLINE off
+    act_vec_t pixels[32];
+#pragma HLS ARRAY_PARTITION variable=pixels complete dim=1
+
+    for (int pix = 0; pix < 32; ++pix) {
+#pragma HLS PIPELINE II=24
+        act_vec_t out_packed = 0;
+        if (!avgpool_pixel_c3_inner_fast_pack(src, qparam, oh_i, ow_start + pix, out_packed)) {
+            return false;
+        }
+        pixels[pix] = out_packed;
+    }
+
+    return write_c3_group32(dst.bank_id, word_offset, pixels);
 }
 
 static bool avgpool_unit_c3_fast(const tensor_desc_t& src,
@@ -198,51 +382,68 @@ static bool avgpool_unit_c3_fast(const tensor_desc_t& src,
 #pragma HLS INLINE off
     const int out_h_i = static_cast<int>(dst.h.to_uint());
     const int out_w_i = static_cast<int>(dst.w.to_uint());
-    const int src_h_i = static_cast<int>(src.h.to_uint());
-    const int src_w_i = static_cast<int>(src.w.to_uint());
-    int fast_h_end = (src_h_i >= 2) ? ((src_h_i - 2) / 2 + 1) : 0;
-    int fast_w_end = (src_w_i >= 2) ? ((src_w_i - 2) / 2 + 1) : 0;
-    if (fast_h_end > out_h_i) {
-        fast_h_end = out_h_i;
+    const u16_t dst_phys_c = pool_desc_phys_c(dst);
+    if (dst_phys_c.to_uint() != 3U) {
+        return false;
     }
-    if (fast_w_end > out_w_i) {
-        fast_w_end = out_w_i;
+    if (((out_w_i * 3) & (AXI_WORD_BYTES - 1)) != 0) {
+        return false;
     }
 
-    for (int oh_i = 0; oh_i < MAX_FM_H; ++oh_i) {
+    if (out_h_i <= 0 || out_w_i <= 0) {
+        return true;
+    }
+
+    const u16_t top_oh = static_cast<u16_t>(0);
+    const u32_t top_row_base = pool_row_base(dst, top_oh);
+    for (int group = 0; group < MAX_FM_W / 32; ++group) {
+#pragma HLS PIPELINE off
+        const int ow_start = group * 32;
+        if (ow_start >= out_w_i) {
+            break;
+        }
+        const u32_t word_offset =
+            top_row_base + static_cast<u32_t>(group) * static_cast<u32_t>(96);
+        if (!avgpool_c3_group32_generic_pack_write(src,
+                                                   dst,
+                                                   qparam,
+                                                   0,
+                                                   ow_start,
+                                                   word_offset)) {
+            return false;
+        }
+    }
+
+    for (int oh_i = 1; oh_i < MAX_FM_H; ++oh_i) {
+#pragma HLS PIPELINE off
         if (oh_i >= out_h_i) {
             break;
         }
         const u16_t oh = static_cast<u16_t>(oh_i);
-        if (oh_i == 0 || oh_i >= fast_h_end) {
-            for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
-                if (ow_i >= out_w_i) {
-                    break;
-                }
-                if (!avgpool_pixel_c3_generic(src, dst, qparam, oh, static_cast<u16_t>(ow_i))) {
-                    return false;
-                }
-            }
-            continue;
-        }
+        const u32_t row_base = pool_row_base(dst, oh);
 
-        if (!avgpool_pixel_c3_generic(src, dst, qparam, oh, static_cast<u16_t>(0))) {
+        if (!avgpool_c3_group32_first_col_pack_write(src,
+                                                     dst,
+                                                     qparam,
+                                                     oh_i,
+                                                     row_base)) {
             return false;
         }
-        for (int ow_i = 1; ow_i < MAX_FM_W; ++ow_i) {
-#pragma HLS PIPELINE II=1
-            if (ow_i >= fast_w_end) {
+
+        for (int group = 1; group < MAX_FM_W / 32; ++group) {
+#pragma HLS PIPELINE off
+            const int ow_start = group * 32;
+            if (ow_start >= out_w_i) {
                 break;
             }
-            if (!avgpool_pixel_c3_inner_fast(src, dst, qparam, oh, static_cast<u16_t>(ow_i))) {
-                return false;
-            }
-        }
-        for (int ow_i = fast_w_end; ow_i < MAX_FM_W; ++ow_i) {
-            if (ow_i >= out_w_i) {
-                break;
-            }
-            if (!avgpool_pixel_c3_generic(src, dst, qparam, oh, static_cast<u16_t>(ow_i))) {
+            const u32_t word_offset =
+                row_base + static_cast<u32_t>(group) * static_cast<u32_t>(96);
+            if (!avgpool_c3_group32_inner_fast_pack_write(src,
+                                                          dst,
+                                                          qparam,
+                                                          oh_i,
+                                                          ow_start,
+                                                          word_offset)) {
                 return false;
             }
         }

@@ -8,7 +8,8 @@ bool param_dma_get_tensor_desc(u8_t tensor_id, tensor_desc_t& desc);
 static tensor_desc_t s_scratch_desc[4];
 static bool s_scratch_valid[4] = {false, false, false, false};
 static tensor_desc_t s_global_alias_desc[MAX_TENSOR_DESC_COUNT];
-static bool s_global_alias_valid[MAX_TENSOR_DESC_COUNT];
+static u64_t s_global_alias_epoch_tag[MAX_TENSOR_DESC_COUNT];
+static u64_t s_global_alias_epoch = 1;
 static unsigned s_scratch_region = 0;
 static u32_t s_scratch_base = 0;
 static u32_t s_scratch_slot_bytes = 0;
@@ -33,7 +34,7 @@ static bool global_tensor_desc(u8_t tensor_id, tensor_desc_t& desc) {
   }
   const unsigned tid = tensor_id.to_uint();
   if (tid < static_cast<unsigned>(MAX_TENSOR_DESC_COUNT) &&
-      s_global_alias_valid[tid]) {
+      s_global_alias_epoch_tag[tid] == s_global_alias_epoch) {
     desc = s_global_alias_desc[tid];
     return true;
   }
@@ -66,16 +67,14 @@ static void invalidate_scratch() {
   for (int i = 0; i < 4; ++i) {
 #pragma HLS UNROLL
     s_scratch_valid[i] = false;
-    s_scratch_desc[i] = tensor_desc_t();
   }
 }
 
-static void invalidate_global_aliases() {
-#pragma HLS INLINE off
-  for (int i = 0; i < MAX_TENSOR_DESC_COUNT; ++i) {
-#pragma HLS PIPELINE II=1
-    s_global_alias_valid[i] = false;
-    s_global_alias_desc[i] = tensor_desc_t();
+static void reset_global_alias_epoch() {
+#pragma HLS INLINE
+  s_global_alias_epoch = s_global_alias_epoch + static_cast<u64_t>(1);
+  if (s_global_alias_epoch == static_cast<u64_t>(0)) {
+    s_global_alias_epoch = static_cast<u64_t>(1);
   }
 }
 
@@ -89,7 +88,7 @@ void reset_scratch_state() {
   s_scratch_channel_slot = 0;
   s_scratch_channel_view = false;
   invalidate_scratch();
-  invalidate_global_aliases();
+  reset_global_alias_epoch();
 }
 
 static void set_scratch_region(unsigned region) {
@@ -411,7 +410,7 @@ bool resolve_tensor_write(u8_t tensor_id, u16_t h, u16_t w, u16_t c, tensor_desc
   if (tensor_is_global(tensor_id)) {
     const unsigned tid = tensor_id.to_uint();
     if (tid < static_cast<unsigned>(MAX_TENSOR_DESC_COUNT)) {
-      s_global_alias_valid[tid] = false;
+      s_global_alias_epoch_tag[tid] = 0;
     }
     return global_tensor_desc(tensor_id, desc);
   }
@@ -454,7 +453,7 @@ bool alias_global_tensor_to_slice(u8_t tensor_id,
     return false;
   }
   s_global_alias_desc[tid] = alias;
-  s_global_alias_valid[tid] = true;
+  s_global_alias_epoch_tag[tid] = s_global_alias_epoch;
   return true;
 }
 

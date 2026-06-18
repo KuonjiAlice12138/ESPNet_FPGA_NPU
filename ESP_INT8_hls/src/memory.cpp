@@ -549,30 +549,100 @@ bool on_chip_memory_write_packed_tile(const tensor_desc_t& desc,
     return write_packed_cross_word(desc.bank_id, word0_offset, byte0, lane_count, packed);
 }
 
-bool on_chip_memory_write_aligned_row_word(const tensor_desc_t& desc,
-                                           u16_t h,
-                                           u32_t row_byte_offset,
-                                           axi_vec_t packed) {
+bool on_chip_memory_write_aligned_full_tile(const tensor_desc_t& desc,
+                                            u16_t h,
+                                            u16_t w,
+                                            u16_t c_begin,
+                                            axi_vec_t packed) {
 #pragma HLS INLINE off
 #pragma HLS PIPELINE off
-    if (h >= desc.h) {
+    if (h >= desc.h || w >= desc.w ||
+        c_begin.to_uint() + static_cast<unsigned>(AXI_WORD_BYTES) > desc.c.to_uint()) {
         return false;
     }
 
-    const u16_t phys_c = desc_phys_c(desc);
-    const u32_t row_bytes = static_cast<u32_t>(desc.w) * static_cast<u32_t>(phys_c);
-    if ((row_byte_offset.to_uint() & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U ||
-        row_byte_offset + static_cast<u32_t>(AXI_WORD_BYTES) > row_bytes) {
-        return false;
-    }
-
-    const u32_t start_offset =
-        desc.base_offset + tensor_elem_offset(desc, h, static_cast<u16_t>(0), static_cast<u16_t>(0)) +
-        row_byte_offset;
+    const u32_t start_offset = desc.base_offset + tensor_elem_offset(desc, h, w, c_begin);
     if ((start_offset.to_uint() & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U) {
         return false;
     }
     return write_bank_word(desc.bank_id, start_offset, packed);
+}
+
+bool on_chip_memory_write_fmbuf_abs_word(u8_t bank_id,
+                                         u32_t byte_offset,
+                                         axi_vec_t packed) {
+#pragma HLS INLINE off
+#pragma HLS PIPELINE off
+    if ((byte_offset.to_uint() & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U) {
+        return false;
+    }
+
+    u32_t phys_addr = byte_offset;
+    switch (static_cast<unsigned>(bank_id.to_uint())) {
+        case BANK_FMEM0:
+        case BANK_FMEM1:
+        case BANK_FMEM2:
+            phys_addr = byte_offset;
+            break;
+        case BANK_BRAM_SCR0:
+            phys_addr = static_cast<u32_t>(FMBUF_POOL_TMP_BASE) + byte_offset;
+            break;
+        default:
+            return false;
+    }
+    return write_phys_word(phys_addr, packed);
+}
+
+bool on_chip_memory_read_fmbuf_abs_word(u8_t bank_id,
+                                        u32_t byte_offset,
+                                        axi_vec_t& packed) {
+#pragma HLS INLINE off
+#pragma HLS PIPELINE off
+    if ((byte_offset.to_uint() & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U) {
+        packed = 0;
+        return false;
+    }
+
+    u32_t phys_addr = byte_offset;
+    switch (static_cast<unsigned>(bank_id.to_uint())) {
+        case BANK_FMEM0:
+        case BANK_FMEM1:
+        case BANK_FMEM2:
+            phys_addr = byte_offset;
+            break;
+        case BANK_BRAM_SCR0:
+            phys_addr = static_cast<u32_t>(FMBUF_POOL_TMP_BASE) + byte_offset;
+            break;
+        default:
+            packed = 0;
+            return false;
+    }
+    return read_phys_word(phys_addr, packed);
+}
+
+bool on_chip_memory_write_pool2_abs_word(u32_t byte_offset,
+                                         axi_vec_t packed) {
+#pragma HLS INLINE off
+#pragma HLS PIPELINE off
+    const unsigned idx = byte_offset.to_uint();
+    if ((idx & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U ||
+        idx + AXI_WORD_BYTES > static_cast<unsigned>(BRAM_SCR1_BYTES)) {
+        return false;
+    }
+    return write_pool2_bram_word(static_cast<u32_t>(idx >> 5), packed);
+}
+
+bool on_chip_memory_read_pool2_abs_word(u32_t byte_offset,
+                                        axi_vec_t& packed) {
+#pragma HLS INLINE off
+#pragma HLS PIPELINE off
+    const unsigned idx = byte_offset.to_uint();
+    if ((idx & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U ||
+        idx + AXI_WORD_BYTES > static_cast<unsigned>(BRAM_SCR1_BYTES)) {
+        packed = 0;
+        return false;
+    }
+    return read_pool2_bram_word(static_cast<u32_t>(idx >> 5), packed);
 }
 
 bool on_chip_memory_write_axi_word(u8_t tensor_id, u32_t word_offset, axi_vec_t value) {

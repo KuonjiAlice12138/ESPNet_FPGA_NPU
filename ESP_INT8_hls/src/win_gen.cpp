@@ -23,6 +23,38 @@ bool on_chip_memory_read_aligned_full_tile(const tensor_desc_t& desc,
                                            u16_t c_begin,
                                            act_vec_t& packed);
 
+static act_vec_t read_tile_or_zero(const tensor_desc_t& desc,
+                                   i32_t h,
+                                   i32_t w,
+                                   u16_t c_begin,
+                                   u8_t valid_c) {
+#pragma HLS INLINE
+    act_vec_t packed = 0;
+    const bool ok = on_chip_memory_read_packed_tile(desc, h, w, c_begin, valid_c, packed);
+    return ok ? packed : act_vec_t(0);
+}
+
+static act_vec_t read_contiguous_or_zero(const tensor_desc_t& desc,
+                                         i32_t h,
+                                         i32_t w,
+                                         u16_t c_begin,
+                                         u8_t valid_bytes) {
+#pragma HLS INLINE
+    act_vec_t packed = 0;
+    const bool ok = on_chip_memory_read_packed_contiguous(desc, h, w, c_begin, valid_bytes, packed);
+    return ok ? packed : act_vec_t(0);
+}
+
+static act_vec_t read_aligned_or_zero(const tensor_desc_t& desc,
+                                      i32_t h,
+                                      i32_t w,
+                                      u16_t c_begin) {
+#pragma HLS INLINE
+    act_vec_t packed = 0;
+    const bool ok = on_chip_memory_read_aligned_full_tile(desc, h, w, c_begin, packed);
+    return ok ? packed : act_vec_t(0);
+}
+
 static u16_t ceil_div_u16(u16_t a, u16_t b) {
 #pragma HLS INLINE
     return static_cast<u16_t>((a + b - 1) / b);
@@ -132,12 +164,8 @@ static void load_first_layer_3x3_col(const tensor_desc_t& src_desc,
     for (int kh = 0; kh < 3; ++kh) {
 #pragma HLS UNROLL
         const i32_t ih = base_h + static_cast<i32_t>(kh);
-        on_chip_memory_read_packed_tile(src_desc,
-                                        ih,
-                                        iw,
-                                        0,
-                                        static_cast<u8_t>(3),
-                                        spatial_word[kh * 3 + col]);
+        spatial_word[kh * 3 + col] =
+            read_tile_or_zero(src_desc, ih, iw, static_cast<u16_t>(0), static_cast<u8_t>(3));
     }
 }
 
@@ -162,12 +190,9 @@ static void emit_first_layer_c3_row_segment_word(const tensor_desc_t& src_desc,
     act_vec_t row0 = 0;
     act_vec_t row1 = 0;
     act_vec_t row2 = 0;
-    on_chip_memory_read_packed_contiguous(
-        src_desc, base_h + 0, base_w, 0, static_cast<u8_t>(9), row0);
-    on_chip_memory_read_packed_contiguous(
-        src_desc, base_h + 1, base_w, 0, static_cast<u8_t>(9), row1);
-    on_chip_memory_read_packed_contiguous(
-        src_desc, base_h + 2, base_w, 0, static_cast<u8_t>(9), row2);
+    row0 = read_contiguous_or_zero(src_desc, base_h + 0, base_w, static_cast<u16_t>(0), static_cast<u8_t>(9));
+    row1 = read_contiguous_or_zero(src_desc, base_h + 1, base_w, static_cast<u16_t>(0), static_cast<u8_t>(9));
+    row2 = read_contiguous_or_zero(src_desc, base_h + 2, base_w, static_cast<u16_t>(0), static_cast<u8_t>(9));
 
     act_vec_t word = 0;
     copy_const_segment<0, 0, 9>(word, row0);
@@ -212,12 +237,9 @@ static void emit_first_layer_c3_pair_words(const tensor_desc_t& src_desc,
     act_vec_t row0 = 0;
     act_vec_t row1 = 0;
     act_vec_t row2 = 0;
-    on_chip_memory_read_packed_contiguous(
-        src_desc, base_h + 0, base_w, 0, static_cast<u8_t>(15), row0);
-    on_chip_memory_read_packed_contiguous(
-        src_desc, base_h + 1, base_w, 0, static_cast<u8_t>(15), row1);
-    on_chip_memory_read_packed_contiguous(
-        src_desc, base_h + 2, base_w, 0, static_cast<u8_t>(15), row2);
+    row0 = read_contiguous_or_zero(src_desc, base_h + 0, base_w, static_cast<u16_t>(0), static_cast<u8_t>(15));
+    row1 = read_contiguous_or_zero(src_desc, base_h + 1, base_w, static_cast<u16_t>(0), static_cast<u8_t>(15));
+    row2 = read_contiguous_or_zero(src_desc, base_h + 2, base_w, static_cast<u16_t>(0), static_cast<u8_t>(15));
     split_first_layer_c3_pair_row(row0, 0, spatial0, spatial1);
     split_first_layer_c3_pair_row(row1, 1, spatial0, spatial1);
     split_first_layer_c3_pair_row(row2, 2, spatial0, spatial1);
@@ -260,40 +282,42 @@ static void emit_smallc_c12_words(const act_vec_t spatial_word[9],
     act_stream.write(w3);
 }
 
-static void emit_smallc_c19_words(const act_vec_t spatial_word[9],
-                                  hls::stream<act_vec_t>& act_stream) {
-#pragma HLS INLINE
-    act_vec_t w0 = 0;
-    copy_const_segment<0, 0, 19>(w0, spatial_word[0]);
-    copy_const_segment<19, 0, 13>(w0, spatial_word[1]);
-    act_stream.write(w0);
+static void emit_smallc_c19_words_staged(const act_vec_t spatial_word[9],
+                                         hls::stream<act_vec_t>& act_stream) {
+#pragma HLS INLINE off
+    act_vec_t staged[6];
+#pragma HLS ARRAY_PARTITION variable=staged complete dim=1
 
-    act_vec_t w1 = 0;
-    copy_const_segment<0, 13, 6>(w1, spatial_word[1]);
-    copy_const_segment<6, 0, 19>(w1, spatial_word[2]);
-    copy_const_segment<25, 0, 7>(w1, spatial_word[3]);
-    act_stream.write(w1);
+    staged[0] = 0;
+    copy_const_segment<0, 0, 19>(staged[0], spatial_word[0]);
+    copy_const_segment<19, 0, 13>(staged[0], spatial_word[1]);
 
-    act_vec_t w2 = 0;
-    copy_const_segment<0, 7, 12>(w2, spatial_word[3]);
-    copy_const_segment<12, 0, 19>(w2, spatial_word[4]);
-    copy_const_segment<31, 0, 1>(w2, spatial_word[5]);
-    act_stream.write(w2);
+    staged[1] = 0;
+    copy_const_segment<0, 13, 6>(staged[1], spatial_word[1]);
+    copy_const_segment<6, 0, 19>(staged[1], spatial_word[2]);
+    copy_const_segment<25, 0, 7>(staged[1], spatial_word[3]);
 
-    act_vec_t w3 = 0;
-    copy_const_segment<0, 1, 18>(w3, spatial_word[5]);
-    copy_const_segment<18, 0, 14>(w3, spatial_word[6]);
-    act_stream.write(w3);
+    staged[2] = 0;
+    copy_const_segment<0, 7, 12>(staged[2], spatial_word[3]);
+    copy_const_segment<12, 0, 19>(staged[2], spatial_word[4]);
+    copy_const_segment<31, 0, 1>(staged[2], spatial_word[5]);
 
-    act_vec_t w4 = 0;
-    copy_const_segment<0, 14, 5>(w4, spatial_word[6]);
-    copy_const_segment<5, 0, 19>(w4, spatial_word[7]);
-    copy_const_segment<24, 0, 8>(w4, spatial_word[8]);
-    act_stream.write(w4);
+    staged[3] = 0;
+    copy_const_segment<0, 1, 18>(staged[3], spatial_word[5]);
+    copy_const_segment<18, 0, 14>(staged[3], spatial_word[6]);
 
-    act_vec_t w5 = 0;
-    copy_const_segment<0, 8, 11>(w5, spatial_word[8]);
-    act_stream.write(w5);
+    staged[4] = 0;
+    copy_const_segment<0, 14, 5>(staged[4], spatial_word[6]);
+    copy_const_segment<5, 0, 19>(staged[4], spatial_word[7]);
+    copy_const_segment<24, 0, 8>(staged[4], spatial_word[8]);
+
+    staged[5] = 0;
+    copy_const_segment<0, 8, 11>(staged[5], spatial_word[8]);
+
+    for (int i = 0; i < 6; ++i) {
+#pragma HLS PIPELINE off
+        act_stream.write(staged[i]);
+    }
 }
 
 static void emit_smallc_c25_words(const act_vec_t spatial_word[9],
@@ -391,6 +415,7 @@ static void emit_first_layer_3x3_window_row(const tensor_desc_t& src_desc,
 
     int ow_i = 1;
     for (; ow_i + 1 < MAX_FM_W; ow_i += 2) {
+#pragma HLS PIPELINE off
         if (ow_i + 1 >= inner_end) {
             break;
         }
@@ -399,6 +424,7 @@ static void emit_first_layer_3x3_window_row(const tensor_desc_t& src_desc,
     }
 
     for (; ow_i < MAX_FM_W; ++ow_i) {
+#pragma HLS PIPELINE off
         if (ow_i >= inner_end) {
             break;
         }
@@ -444,18 +470,14 @@ static void emit_window_row_3x3_smallc_fast(const tensor_desc_t& src_desc,
             const int kw = sp - kh * 3;
             const i32_t ih = base_h + static_cast<i32_t>(kh * static_cast<int>(dilation.to_uint()));
             const i32_t iw = base_w + static_cast<i32_t>(kw * static_cast<int>(dilation.to_uint()));
-            on_chip_memory_read_packed_tile(src_desc,
-                                            ih,
-                                            iw,
-                                            0,
-                                            static_cast<u8_t>(cfg.in_c.to_uint()),
-                                            spatial_word[sp]);
+            spatial_word[sp] = read_tile_or_zero(
+                src_desc, ih, iw, static_cast<u16_t>(0), static_cast<u8_t>(cfg.in_c.to_uint()));
         }
 
         if (in_c_i == 12) {
             emit_smallc_c12_words(spatial_word, act_stream);
         } else if (in_c_i == 19) {
-            emit_smallc_c19_words(spatial_word, act_stream);
+            emit_smallc_c19_words_staged(spatial_word, act_stream);
         } else if (in_c_i == 25) {
             emit_smallc_c25_words(spatial_word, act_stream);
         } else {
@@ -474,12 +496,8 @@ static void load_smallc_spatial_col(const tensor_desc_t& src_desc,
     for (int kh = 0; kh < 3; ++kh) {
 #pragma HLS UNROLL
         const i32_t ih = base_h + static_cast<i32_t>(kh);
-        on_chip_memory_read_packed_tile(src_desc,
-                                        ih,
-                                        iw,
-                                        0,
-                                        static_cast<u8_t>(cfg.in_c.to_uint()),
-                                        spatial_word[kh * 3 + col]);
+        spatial_word[kh * 3 + col] =
+            read_tile_or_zero(src_desc, ih, iw, static_cast<u16_t>(0), static_cast<u8_t>(cfg.in_c.to_uint()));
     }
 }
 
@@ -491,10 +509,8 @@ static void load_smallc_c19_row_segment(const tensor_desc_t& src_desc,
 #pragma HLS INLINE
     act_vec_t seg0 = 0;
     act_vec_t seg1 = 0;
-    on_chip_memory_read_packed_contiguous(
-        src_desc, ih, base_w, 0, static_cast<u8_t>(32), seg0);
-    on_chip_memory_read_packed_contiguous(
-        src_desc, ih, base_w + 1, static_cast<u16_t>(13), static_cast<u8_t>(25), seg1);
+    seg0 = read_contiguous_or_zero(src_desc, ih, base_w, static_cast<u16_t>(0), static_cast<u8_t>(32));
+    seg1 = read_contiguous_or_zero(src_desc, ih, base_w + 1, static_cast<u16_t>(13), static_cast<u8_t>(25));
 
     act_vec_t px0 = 0;
     act_vec_t px1 = 0;
@@ -546,12 +562,9 @@ static void load_smallc_c19_pair_row_segment(const tensor_desc_t& src_desc,
     act_vec_t seg0 = 0;
     act_vec_t seg1 = 0;
     act_vec_t seg2 = 0;
-    on_chip_memory_read_packed_contiguous(
-        src_desc, ih, base_w, 0, static_cast<u8_t>(32), seg0);
-    on_chip_memory_read_packed_contiguous(
-        src_desc, ih, base_w + 1, static_cast<u16_t>(13), static_cast<u8_t>(32), seg1);
-    on_chip_memory_read_packed_contiguous(
-        src_desc, ih, base_w + 3, static_cast<u16_t>(7), static_cast<u8_t>(31), seg2);
+    seg0 = read_contiguous_or_zero(src_desc, ih, base_w, static_cast<u16_t>(0), static_cast<u8_t>(32));
+    seg1 = read_contiguous_or_zero(src_desc, ih, base_w + 1, static_cast<u16_t>(13), static_cast<u8_t>(32));
+    seg2 = read_contiguous_or_zero(src_desc, ih, base_w + 3, static_cast<u16_t>(7), static_cast<u8_t>(31));
     split_smallc_c19_pair_row(seg0, seg1, seg2, row, spatial0, spatial1);
 }
 
@@ -579,7 +592,7 @@ static void emit_window_row_3x3_c19_stride2_single(const tensor_desc_t& src_desc
         load_smallc_spatial_col(src_desc, cfg, base_h, base_w + 2, 2, spatial_word);
     }
 
-    emit_smallc_c19_words(spatial_word, act_stream);
+    emit_smallc_c19_words_staged(spatial_word, act_stream);
 }
 
 static void emit_window_row_3x3_c19_stride2_fast(const tensor_desc_t& src_desc,
@@ -615,8 +628,8 @@ static void emit_window_row_3x3_c19_stride2_fast(const tensor_desc_t& src_desc,
             load_smallc_c19_pair_row_segment(src_desc, base_h + 0, base_w, 0, spatial0, spatial1);
             load_smallc_c19_pair_row_segment(src_desc, base_h + 1, base_w, 1, spatial0, spatial1);
             load_smallc_c19_pair_row_segment(src_desc, base_h + 2, base_w, 2, spatial0, spatial1);
-            emit_smallc_c19_words(spatial0, act_stream);
-            emit_smallc_c19_words(spatial1, act_stream);
+            emit_smallc_c19_words_staged(spatial0, act_stream);
+            emit_smallc_c19_words_staged(spatial1, act_stream);
         } else {
             emit_window_row_3x3_c19_stride2_single(src_desc, act_stream, cfg, base_h, base_w);
             emit_window_row_3x3_c19_stride2_single(src_desc,
@@ -669,7 +682,7 @@ static void emit_window_row_3x3_smallc_stride1_reuse(const tensor_desc_t& src_de
         if (in_c_i == 12) {
             emit_smallc_c12_words(spatial_word, act_stream);
         } else if (in_c_i == 19) {
-            emit_smallc_c19_words(spatial_word, act_stream);
+            emit_smallc_c19_words_staged(spatial_word, act_stream);
         } else if (in_c_i == 25) {
             emit_smallc_c25_words(spatial_word, act_stream);
         } else {
@@ -692,78 +705,7 @@ static void read_3x3_spatial_segment_packed(const tensor_desc_t& src_desc,
     const int kw = spatial_idx - kh * 3;
     const i32_t ih = base_h + static_cast<i32_t>(kh * static_cast<int>(dilation.to_uint()));
     const i32_t iw = base_w + static_cast<i32_t>(kw * static_cast<int>(dilation.to_uint()));
-    on_chip_memory_read_packed_tile(src_desc,
-                                    ih,
-                                    iw,
-                                    static_cast<u16_t>(cin),
-                                    static_cast<u8_t>(count),
-                                    packed);
-}
-
-static void emit_window_row_3x3_fast(const tensor_desc_t& src_desc,
-                                      hls::stream<act_vec_t>& act_stream,
-                                      const conv_cfg_t& cfg,
-                                      u16_t out_row,
-                                      u16_t out_w) {
-#pragma HLS INLINE off
-    const u16_t stride = effective_stride(cfg);
-    const u16_t dilation = effective_dilation(cfg);
-    const u16_t k_total = static_cast<u16_t>(cfg.in_c * static_cast<u16_t>(9));
-    const u16_t k_tiles = ceil_div_u16(k_total, TK);
-    const int out_w_i = static_cast<int>(out_w.to_uint());
-    const int k_tiles_i = static_cast<int>(k_tiles.to_uint());
-    const int in_c_i = static_cast<int>(cfg.in_c.to_uint());
-    const int k_total_i = static_cast<int>(k_total.to_uint());
-    const i32_t pad = static_cast<i32_t>(dilation.to_uint());
-    const i32_t base_h = static_cast<i32_t>(out_row.to_uint() * stride.to_uint()) - pad;
-
-    for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
-        if (ow_i >= out_w_i) break;
-        const i32_t base_w = static_cast<i32_t>(ow_i * static_cast<int>(stride.to_uint())) - pad;
-
-        int emitted_k = 0;
-        int spatial_idx = 0;
-        int cin_idx = 0;
-        for (int kt = 0; kt < MAX_K_TILE_COUNT; ++kt) {
-#pragma HLS PIPELINE II=20
-            if (kt >= k_tiles_i) break;
-            act_vec_t word = 0;
-            int lane_offset = 0;
-            int lanes_left = TK;
-
-            for (int segment = 0; segment < 2; ++segment) {
-                if (lanes_left <= 0 || emitted_k >= k_total_i) break;
-                int count = in_c_i - cin_idx;
-                if (count > lanes_left) {
-                    count = lanes_left;
-                }
-                if (count > (k_total_i - emitted_k)) {
-                    count = k_total_i - emitted_k;
-                }
-
-                act_vec_t segment_word = 0;
-                read_3x3_spatial_segment_packed(src_desc,
-                                                cfg,
-                                                base_h,
-                                                base_w,
-                                                spatial_idx,
-                                                cin_idx,
-                                                count,
-                                                segment_word);
-                insert_packed_segment(word, lane_offset, count, segment_word);
-
-                lane_offset += count;
-                lanes_left -= count;
-                emitted_k += count;
-                cin_idx += count;
-                if (cin_idx >= in_c_i) {
-                    cin_idx = 0;
-                    ++spatial_idx;
-                }
-            }
-            act_stream.write(word);
-        }
-    }
+    packed = read_tile_or_zero(src_desc, ih, iw, static_cast<u16_t>(cin), static_cast<u8_t>(count));
 }
 
 static void emit_window_row_3x3_c131_stride2_fast(const tensor_desc_t& src_desc,
@@ -828,37 +770,6 @@ static void emit_window_row_3x3_c131_stride2_fast(const tensor_desc_t& src_desc,
     }
 }
 
-static void emit_window_row_1x1_fast(const tensor_desc_t& src_desc,
-                                      hls::stream<act_vec_t>& act_stream,
-                                      const conv_cfg_t& cfg,
-                                      u16_t out_row,
-                                      u16_t out_w) {
-#pragma HLS INLINE off
-    const u16_t stride = (cfg.stride == 0) ? static_cast<u16_t>(1) : static_cast<u16_t>(cfg.stride);
-    const u16_t k_total = cfg.in_c;
-    const u16_t k_tiles = ceil_div_u16(k_total, TK);
-    const int out_w_i = static_cast<int>(out_w.to_uint());
-    const int k_tiles_i = static_cast<int>(k_tiles.to_uint());
-    const i32_t ih = static_cast<i32_t>(out_row * stride);
-
-    for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
-        if (ow_i >= out_w_i) break;
-        const i32_t iw = static_cast<i32_t>(ow_i * stride);
-        for (int kt = 0; kt < MAX_K_TILE_COUNT; ++kt) {
-#pragma HLS PIPELINE II=10
-            if (kt >= k_tiles_i) break;
-            const u16_t c_begin = static_cast<u16_t>(kt * TK);
-            const u16_t remaining = static_cast<u16_t>(cfg.in_c.to_uint() - c_begin.to_uint());
-            const u8_t lanes = (remaining > static_cast<u16_t>(TK))
-                                   ? static_cast<u8_t>(TK)
-                                   : static_cast<u8_t>(remaining);
-            act_vec_t word = 0;
-            on_chip_memory_read_packed_tile(src_desc, ih, iw, c_begin, lanes, word);
-            act_stream.write(word);
-        }
-    }
-}
-
 static void emit_window_row_1x1_aligned_full_fast(const tensor_desc_t& src_desc,
                                                   hls::stream<act_vec_t>& act_stream,
                                                   const conv_cfg_t& cfg,
@@ -877,12 +788,39 @@ static void emit_window_row_1x1_aligned_full_fast(const tensor_desc_t& src_desc,
         for (int kt = 0; kt < MAX_K_TILE_COUNT; ++kt) {
 #pragma HLS PIPELINE II=10
             if (kt >= k_tiles_i) break;
-            act_vec_t word = 0;
-            on_chip_memory_read_aligned_full_tile(src_desc,
-                                                  ih,
-                                                  iw,
-                                                  static_cast<u16_t>(kt * TK),
-                                                  word);
+            const act_vec_t word =
+                read_aligned_or_zero(src_desc, ih, iw, static_cast<u16_t>(kt * TK));
+            act_stream.write(word);
+        }
+    }
+}
+
+static void emit_window_row_1x1_packed_tile_path(const tensor_desc_t& src_desc,
+                                                 hls::stream<act_vec_t>& act_stream,
+                                                 const conv_cfg_t& cfg,
+                                                 u16_t out_row,
+                                                 u16_t out_w) {
+#pragma HLS INLINE off
+    const u16_t stride = effective_stride(cfg);
+    const u16_t k_tiles = ceil_div_u16(cfg.in_c, static_cast<u16_t>(TK));
+    const int out_w_i = static_cast<int>(out_w.to_uint());
+    const int k_tiles_i = static_cast<int>(k_tiles.to_uint());
+    const unsigned in_c_u = cfg.in_c.to_uint();
+    const i32_t ih = static_cast<i32_t>(out_row * stride);
+
+    for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
+        if (ow_i >= out_w_i) break;
+        const i32_t iw = static_cast<i32_t>(ow_i * stride);
+        for (int kt = 0; kt < MAX_K_TILE_COUNT; ++kt) {
+#pragma HLS PIPELINE II=10
+            if (kt >= k_tiles_i) break;
+            const unsigned c_begin_u = static_cast<unsigned>(kt) * static_cast<unsigned>(TK);
+            unsigned valid_u = in_c_u - c_begin_u;
+            if (valid_u > static_cast<unsigned>(TK)) {
+                valid_u = static_cast<unsigned>(TK);
+            }
+            const act_vec_t word =
+                read_tile_or_zero(src_desc, ih, iw, static_cast<u16_t>(c_begin_u), static_cast<u8_t>(valid_u));
             act_stream.write(word);
         }
     }
@@ -925,7 +863,8 @@ void window_generator_row(const tensor_desc_t& src_desc,
             emit_window_row_3x3_c131_stride2_fast(src_desc, act_stream, cfg, out_row, out_w);
             return;
         }
-        emit_window_row_3x3_fast(src_desc, act_stream, cfg, out_row, out_w);
+        // P6 only supports the fixed ESPNet encoder shapes. Unsupported shapes
+        // are intentionally not covered by the default performance path.
         return;
     }
 
@@ -936,7 +875,12 @@ void window_generator_row(const tensor_desc_t& src_desc,
         return;
     }
 
-    emit_window_row_1x1_fast(src_desc, act_stream, cfg, out_row, out_w);
+    if (kernel == 1) {
+        emit_window_row_1x1_packed_tile_path(src_desc, act_stream, cfg, out_row, out_w);
+        return;
+    }
+
+    return;
 }
 
 }  // namespace esp_int8

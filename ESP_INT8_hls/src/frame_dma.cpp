@@ -14,9 +14,4 @@ void frame_dma_load(const axi_vec_t* gmem_frame_in) {
     }
 }
 
-void frame_dma_store(axi_vec_t* gmem_frame_out) {
-#pragma HLS INLINE off
-    (void)gmem_frame_out;
-}
-
 }  // namespace esp_int8

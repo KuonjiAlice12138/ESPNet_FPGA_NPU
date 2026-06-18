@@ -14,7 +14,6 @@ static affine_qparam_t s_affine_qparam[MAX_AFFINE_PARAM_DESC_COUNT][8];
 static u8_t s_affine_qparam_count[MAX_AFFINE_PARAM_DESC_COUNT];
 static add_qparam_t s_add_qparam[MAX_ADD_PARAM_DESC_COUNT];
 static pool_qparam_t s_pool_qparam[MAX_POOL_PARAM_DESC_COUNT];
-static uop_t s_uop_table[MAX_UOP_COUNT];
 static u32_t s_weight_bytes = 0;
 
 static bool s_ready = false;
@@ -104,7 +103,7 @@ static error_code_t validate_header(const param_blob_header_t& header) {
     if (header.magic != PARAM_BLOB_MAGIC || header.version != PARAM_BLOB_VERSION) {
         return ERR_BAD_BLOB;
     }
-    if (header.uop_count > MAX_UOP_COUNT) {
+    if (header.uop_count.to_uint() != static_cast<unsigned>(UOP_COUNT_ENCODER)) {
         return ERR_UOP_DECODE;
     }
     if (header.tensor_desc_count > MAX_TENSOR_DESC_COUNT ||
@@ -245,33 +244,6 @@ static pool_qparam_t load_pool_qparam(const axi_vec_t* gmem_param, u32_t offset)
     return qparam;
 }
 
-static uop_t load_uop(const axi_vec_t* gmem_param, u32_t offset) {
-#pragma HLS INLINE
-    uop_t uop;
-    uop.opcode = read_u8(gmem_param, offset + 0);
-    uop.flags = read_u8(gmem_param, offset + 1);
-    uop.src0_tensor = read_u8(gmem_param, offset + 2);
-    uop.src1_tensor = read_u8(gmem_param, offset + 3);
-    uop.dst_tensor = read_u8(gmem_param, offset + 4);
-    uop.param_id = read_u8(gmem_param, offset + 5);
-    uop.act_type = read_u8(gmem_param, offset + 6);
-    uop.reserved0 = read_u8(gmem_param, offset + 7);
-    uop.in_h = read_u16_le(gmem_param, offset + 8);
-    uop.in_w = read_u16_le(gmem_param, offset + 10);
-    uop.in_c = read_u16_le(gmem_param, offset + 12);
-    uop.out_c = read_u16_le(gmem_param, offset + 14);
-    uop.kernel = read_u8(gmem_param, offset + 16);
-    uop.stride = read_u8(gmem_param, offset + 17);
-    uop.dilation = read_u8(gmem_param, offset + 18);
-    uop.padding = read_u8(gmem_param, offset + 19);
-    uop.c_offset = read_u16_le(gmem_param, offset + 20);
-    uop.valid_c = read_u16_le(gmem_param, offset + 22);
-    uop.qparam_id = read_u16_le(gmem_param, offset + 24);
-    uop.reserved1 = read_u16_le(gmem_param, offset + 26);
-    uop.reserved2 = read_u32_le(gmem_param, offset + 28);
-    return uop;
-}
-
 static bool load_weight_data(const axi_vec_t* gmem_param) {
 #pragma HLS INLINE
     if (s_header.conv_qparam_offset < s_header.weight_data_offset) {
@@ -399,13 +371,6 @@ void param_dma_init(const axi_vec_t* gmem_param) {
             s_pool_qparam[i] = load_pool_qparam(gmem_param, s_pool_desc[i].pool_offset);
         }
     }
-    for (int i = 0; i < MAX_UOP_COUNT; ++i) {
-#pragma HLS PIPELINE off
-        if (i < static_cast<int>(s_header.uop_count.to_uint())) {
-            s_uop_table[i] = load_uop(gmem_param, s_header.uop_offset + i * 32);
-        }
-    }
-
     s_ready = true;
 }
 
@@ -421,16 +386,6 @@ bool param_dma_get_tensor_desc(u8_t tensor_id, tensor_desc_t& desc) {
         return false;
     }
     desc = s_tensor_desc[idx];
-    return true;
-}
-
-bool param_dma_get_uop(u16_t uop_id, uop_t& uop) {
-#pragma HLS INLINE
-    const int idx = static_cast<int>(uop_id.to_uint());
-    if (!s_ready || idx < 0 || idx >= static_cast<int>(s_header.uop_count.to_uint())) {
-        return false;
-    }
-    uop = s_uop_table[idx];
     return true;
 }
 

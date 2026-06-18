@@ -84,7 +84,6 @@ constexpr int ADD_PARAM_DESC_COUNT = 14;
 constexpr int POOL_PARAM_DESC_COUNT = 3;
 
 constexpr int UOP_COUNT_ENCODER = 75;
-constexpr int MAX_UOP_COUNT = 128;
 
 constexpr int MAX_TENSOR_DESC_COUNT = 64;
 constexpr int MAX_CONV_PARAM_DESC_COUNT = 32;
