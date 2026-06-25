@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Lightweight structural checks for the P6-only HLS main path.
+"""Structural checks for the current P7/S4 schedule-executor HLS path.
 
-This script intentionally avoids parsing C++.  It catches the regression that
-caused repeated P6 attempts to fall back into the old 75-UOP dispatch path or
-to keep synthesis-heavy reset/dead fallback logic in the build.
+This is intentionally a lightweight source/config scanner. It is not a C++
+parser; it catches regressions where the top path silently falls back to the
+old PARAM-v1/UOP/WinGen implementation.
 """
 
 from __future__ import annotations
@@ -14,219 +14,231 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-INT8_CORE = ROOT / "ESP_INT8_hls" / "src" / "int8_core.cpp"
-CONFIG = ROOT / "ESP_INT8_hls" / "include" / "npu_config.hpp"
-WIN_GEN = ROOT / "ESP_INT8_hls" / "src" / "win_gen.cpp"
-SCRATCH_MGR = ROOT / "ESP_INT8_hls" / "src" / "scratch_mgr.cpp"
-PARAM_DMA = ROOT / "ESP_INT8_hls" / "src" / "param_dma.cpp"
-FRAME_DMA = ROOT / "ESP_INT8_hls" / "src" / "frame_dma.cpp"
-SA_CORE = ROOT / "ESP_INT8_hls" / "src" / "sa_core.cpp"
-AVGPOOL_UNIT = ROOT / "ESP_INT8_hls" / "src" / "avgpool_unit.cpp"
-CONV_STORE = ROOT / "ESP_INT8_hls" / "src" / "conv_store.cpp"
-CONCAT_UNIT = ROOT / "ESP_INT8_hls" / "src" / "concat_unit.cpp"
-MEMORY = ROOT / "ESP_INT8_hls" / "src" / "memory.cpp"
+HLS_DIR = ROOT / "ESP_INT8_hls"
+SRC_DIR = HLS_DIR / "src"
+INC_DIR = HLS_DIR / "include"
+TB_DIR = HLS_DIR / "tb"
+
+INT8_CORE = SRC_DIR / "int8_core.cpp"
+WIN_GEN = SRC_DIR / "win_gen.cpp"
+PARAM_DMA = SRC_DIR / "param_dma.cpp"
+CONV_STORE = SRC_DIR / "conv_store.cpp"
+MEMORY = SRC_DIR / "memory.cpp"
+CONFIG = INC_DIR / "npu_config.hpp"
+SCHEDULE = INC_DIR / "npu_schedule.hpp"
 
 
 def fail(msg: str) -> int:
-    print(f"[P6-CHECK] FAIL: {msg}")
+    print(f"[S4-CHECK] FAIL: {msg}")
     return 1
 
 
-def main() -> int:
-    core = INT8_CORE.read_text(encoding="utf-8")
-    config = CONFIG.read_text(encoding="utf-8")
-    win_gen = WIN_GEN.read_text(encoding="utf-8")
-    scratch_mgr = SCRATCH_MGR.read_text(encoding="utf-8")
-    param_dma = PARAM_DMA.read_text(encoding="utf-8")
-    frame_dma = FRAME_DMA.read_text(encoding="utf-8")
-    sa_core = SA_CORE.read_text(encoding="utf-8")
-    avgpool_unit = AVGPOOL_UNIT.read_text(encoding="utf-8")
-    conv_store = CONV_STORE.read_text(encoding="utf-8")
-    concat_unit = CONCAT_UNIT.read_text(encoding="utf-8")
-    memory = MEMORY.read_text(encoding="utf-8")
+def read(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
 
-    if "ESP_INT8_USE_P6_STATIC_PATH" in config or "ESP_INT8_USE_P6_STATIC_PATH" in core:
-        return fail("P6 is still behind a compile-time fallback switch")
-    if "run_p6_static_graph" not in core:
-        return fail("int8_core.cpp does not define run_p6_static_graph")
 
-    mode_run = re.search(
-        r"static\s+error_code_t\s+core_mode_run\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}",
-        core,
+def function_body(source: str, name: str) -> str | None:
+    match = re.search(
+        rf"static\s+[\w:<>]+\s+{name}\s*\([^)]*\)\s*\{{(?P<body>.*?)\n\}}",
+        source,
         flags=re.DOTALL,
     )
+    if match:
+        return match.group("body")
+    return None
+
+
+def check_configs() -> int:
+    for cfg_path in sorted(HLS_DIR.glob("hls_config*.cfg")):
+        cfg = read(cfg_path)
+        banned_refs = [
+            "syn.file=src/concat_unit.cpp",
+            "syn.file=src/if_dec.cpp",
+            "tb.file=tb/blob_file_tb.cpp",
+            "tb.file=tb/control_dma_tb.cpp",
+            "tb.file=tb/top_dispatch_tb.cpp",
+            "tb.file=tb/top_conv_dispatch_tb.cpp",
+            "tb.file=tb/top_pool_store_dispatch_tb.cpp",
+            "tb.file=tb/top_tb.cpp",
+        ]
+        for token in banned_refs:
+            if token in cfg:
+                return fail(f"{cfg_path.name} still references obsolete S4-excluded path: {token}")
+        for line in cfg.splitlines():
+            if line.startswith("syn.file=") or line.startswith("tb.file="):
+                rel = line.split("=", 1)[1].strip().removeprefix("./")
+                if not (HLS_DIR / rel).exists():
+                    return fail(f"{cfg_path.name} references missing file: {rel}")
+    return 0
+
+
+def main() -> int:
+    if check_configs() != 0:
+        return 1
+
+    core = read(INT8_CORE)
+    win_gen = read(WIN_GEN)
+    param_dma = read(PARAM_DMA)
+    conv_store = read(CONV_STORE)
+    memory = read(MEMORY)
+    avgpool = read(SRC_DIR / "avgpool_unit.cpp")
+    sa_core = read(SRC_DIR / "sa_core.cpp")
+    upsample = read(SRC_DIR / "upsample_unit.cpp")
+    config = read(CONFIG)
+    schedule = read(SCHEDULE)
+    tb_text = "\n".join(read(path) for path in TB_DIR.glob("*.cpp"))
+
+    required_tokens = [
+        (schedule, "struct conv_exec_desc_t", "missing conv_exec_desc_t"),
+        (schedule, "struct window_sched_desc_t", "missing window_sched_desc_t"),
+        (schedule, "struct row_consumer_desc_t", "missing row_consumer_desc_t"),
+        (schedule, "struct exec_plan_entry_t", "missing exec_plan_entry_t"),
+        (config, "PARAM_BLOB_VERSION_SCHED", "missing PARAM v3 version constant"),
+        (param_dma, "param_dma_get_packed_weight_vec", "missing packed weight getter"),
+        (param_dma, "param_dma_get_exec_entry", "missing exec-plan getter"),
+        (param_dma, "param_dma_get_row_consumer", "missing row-consumer getter"),
+        (win_gen, "scheduled_window_generator_row", "missing scheduled WinGen entry"),
+        (schedule, "enum store_layout_mode_t", "missing scheduled store layout enum"),
+        (conv_store, "STORE_LAYOUT_", "conv_store does not use scheduled store layout"),
+        (core, "run_scheduled_graph", "missing scheduled graph executor"),
+        (core, "run_scheduled_conv_op", "missing scheduled conv executor"),
+        (core, "param_dma_is_schedule_blob", "top path does not require schedule blob"),
+    ]
+    for haystack, token, msg in required_tokens:
+        if token not in haystack:
+            return fail(msg)
+
+    banned_source_tokens = [
+        "param_dma_get_weight_vec",
+        "param_dma_get_uop",
+        "if_dec_",
+        "static_espnet_scheduler",
+        "run_p6_static_graph",
+        "run_p6_dispatch_uop",
+        "run_p6_add_op",
+        "execute_static_uop_dispatch",
+        "execute_conv_uop",
+        "execute_add_uop",
+        "emit_smallc_generic",
+        "emit_smallc_c12",
+        "emit_smallc_c19",
+        "emit_smallc_c25",
+        "emit_window_row_",
+        "concat_writer(",
+        "PARAM_BLOB_VERSION =",
+        "get_static_tensor_desc",
+        "on_chip_memory_write_axi_word",
+        "ESP_INT8_CSIM_DUMP_LEVEL3_SPLIT",
+    ]
+    combined_hot = "\n".join([core, win_gen, param_dma, config, schedule, tb_text])
+    for token in banned_source_tokens:
+        if token in combined_hot:
+            return fail(f"obsolete S4-excluded token is still present: {token}")
+    if re.search(r"(?<!scheduled_)window_generator_row\s*\(", combined_hot):
+        return fail("obsolete cfg-based window_generator_row is still present")
+
+    if (SRC_DIR / "concat_unit.cpp").exists():
+        return fail("legacy concat_unit.cpp still exists in src; S4 must not expose concat_writer")
+
+    mode_run = function_body(core, "core_mode_run")
     if not mode_run:
         return fail("core_mode_run body not found")
+    if "run_scheduled_graph(gmem_frame_out)" not in mode_run:
+        return fail("core_mode_run does not call run_scheduled_graph")
+    if "param_dma_is_schedule_blob()" not in mode_run:
+        return fail("core_mode_run does not reject non-schedule PARAM blobs")
 
-    body = mode_run.group("body")
-    if "run_p6_static_graph" not in body:
-        return fail("core_mode_run does not call run_p6_static_graph")
-    if "static_espnet_scheduler" in body:
-        return fail("core_mode_run can still call the old static scheduler")
-
-    p6_func = re.search(
-        r"static\s+error_code_t\s+run_p6_static_graph\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}",
-        core,
+    win_entry = re.search(
+        r"void\s+scheduled_window_generator_row\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}",
+        win_gen,
         flags=re.DOTALL,
     )
-    if not p6_func:
-        return fail("run_p6_static_graph body not found")
-
-    p6_body = p6_func.group("body")
-    banned = [
-        "static_espnet_scheduler",
-        "execute_static_uop_dispatch",
-        "fetch_static_uop",
-        "param_dma_get_uop",
-        "execute_conv_uop",
-        "execute_pool_uop",
-        "execute_add_uop",
-        "execute_affine_uop",
-        "execute_store_uop",
+    if not win_entry:
+        return fail("scheduled_window_generator_row body not found")
+    win_body = win_entry.group("body")
+    if "sched.mode" not in win_body:
+        return fail("scheduled_window_generator_row must dispatch only by sched.window_mode")
+    shape_dispatch_patterns = [
+        r"cfg\.in_c\s*==",
+        r"conv_desc\.in_c\s*==",
+        r"cfg\.kernel\s*==",
+        r"conv_desc\.kernel\s*==",
+        r"cfg\.dilation\s*==",
+        r"conv_desc\.dilation\s*==",
     ]
-    for token in banned:
-        if token in core:
-            return fail(f"int8_core.cpp still contains legacy path token: {token}")
+    for pattern in shape_dispatch_patterns:
+        if re.search(pattern, win_body):
+            return fail("scheduled_window_generator_row still dispatches by runtime shape")
 
-    cloned_datapath_tokens = [
-        "P6OpRunner",
-        "run_p6_static_uop",
-        "run_p6_conv_store_pair<",
-        "#define P6_RUN",
-        "#define P6_RUN_PAIR",
-        "StaticUop<IDX>::opcode",
-    ]
-    for token in cloned_datapath_tokens:
-        if token in core:
-            return fail(f"int8_core.cpp can still clone datapaths through template dispatch: {token}")
+    if "ROW_CONSUMER_ADD_STORE" not in core or "ROW_CONSUMER_UPSAMPLE_OUT" not in core:
+        return fail("scheduled row consumer path does not cover add/store and final upsample output")
+    if "ROW_CONSUMER_ADD_AFFINE_STORE" in core and "return ERR_UNSUPPORTED_OPCODE" not in core:
+        return fail("ADD_AFFINE row-consumer mode must be explicit if not in current PARAM v3")
 
-    conv_call_sites = len(re.findall(r"\brun_p6_conv_op\s*\(", core))
-    if conv_call_sites != 2:
-        return fail(
-            "run_p6_conv_op must have exactly one shared call site "
-            f"(definition + dispatch call expected, found {conv_call_sites})"
-        )
+    fixed_builder = function_body(core, "build_legacy_uop_for_fixed_op")
+    if not fixed_builder:
+        return fail("fixed-op legacy builder body not found")
+    allowed_fixed_ids = {1, 3, 4, 5, 6, 20, 34, 35, 36, 37, 38, 39, 53, 67, 68, 69, 70, 71}
+    found_fixed_ids = {
+        int(match.group(1))
+        for match in re.finditer(r"ESP_INT8_BUILD_CASE\((\d+)U\)", fixed_builder)
+    }
+    extra_fixed_ids = sorted(found_fixed_ids - allowed_fixed_ids)
+    missing_fixed_ids = sorted(allowed_fixed_ids - found_fixed_ids)
+    if extra_fixed_ids:
+        return fail(f"fixed-op builder still exposes non-exec-plan legacy UOP cases: {extra_fixed_ids}")
+    if missing_fixed_ids:
+        return fail(f"fixed-op builder is missing required exec-plan fixed UOP cases: {missing_fixed_ids}")
 
-    required_shared_path = [
-        "build_p6_static_uop",
-        "run_p6_dispatch_uop",
-        "run_p6_static_graph",
-    ]
-    for token in required_shared_path:
-        if token not in core:
-            return fail(f"missing P6 shared-scheduler component: {token}")
+    if not re.search(r"store_conv_output_row\s*\([^)]*store_layout", conv_store, flags=re.DOTALL):
+        return fail("store_conv_output_row is not driven by scheduled store_layout")
+    store_fn = re.search(
+        r"bool\s+store_conv_output_row\s*\([^)]*\)\s*\{(?P<body>.*?)\n\}",
+        conv_store,
+        flags=re.DOTALL,
+    )
+    if not store_fn:
+        return fail("store_conv_output_row body not found")
+    store_body = store_fn.group("body")
+    for token in ("on_chip_memory_write_packed_tile", "write_packed_cross_word"):
+        if token in store_body:
+            return fail(f"scheduled store hot path calls generic writer: {token}")
+    if "dst.c.to_uint() == cfg.out_c.to_uint()" in store_body or re.search(r"\bcompact_row\s*=", store_body):
+        return fail("store_conv_output_row still infers layout from runtime tensor shape")
+    for token in ("on_chip_memory_write_packed_tile", "write_packed_cross_word", "write_packed_one_word"):
+        if token in memory:
+            return fail(f"unused PARAM-v1 packed write primitive still exists in memory.cpp: {token}")
 
-    if "#pragma HLS STREAM variable=act_stream depth=64" not in core:
-        return fail("act_stream must keep depth=64 to avoid 32-word FIFO burst-margin risk")
+    risky_enum_cast = re.compile(
+        r"static_cast<\s*(?:u8_t|u16_t|u32_t)\s*>\(\s*"
+        r"(?:BANK_|TID_|LS_|UOP_|ACT_|ERR_|POST_|ROW_CONSUMER_|STORE_LAYOUT_|EXEC_)[A-Za-z0-9_]*\s*\)"
+    )
+    for path in sorted(SRC_DIR.glob("*.cpp")) + sorted(INC_DIR.glob("*.hpp")):
+        source = read(path)
+        match = risky_enum_cast.search(source)
+        if match:
+            return fail(
+                f"ambiguous enum-to-ap_uint static_cast in {path.relative_to(ROOT)}: {match.group(0)}"
+            )
 
-    fifo_bindings = [
-        "#pragma HLS BIND_STORAGE variable=act_stream type=fifo impl=bram",
-        "#pragma HLS BIND_STORAGE variable=wgt_stream type=fifo impl=bram",
-        "#pragma HLS BIND_STORAGE variable=psum_stream type=fifo impl=bram",
-    ]
-    for token in fifo_bindings:
-        if token not in core:
-            return fail(f"wide dataflow FIFO is not BRAM-backed: {token}")
+    if "avgpool_c3_group32_first_col_pack_write" in avgpool:
+        return fail("avgpool first-column special caller can trigger generic-pack function cloning")
+    if avgpool.count("avgpool_pixel_c3_generic_pack(") > 2:
+        return fail("avgpool generic pixel pack has multiple call sites and may be cloned by HLS")
+    if "compute_k_valid_lanes" not in sa_core:
+        return fail("SA core must precompute K-valid lanes before the 32-lane MAC fanout")
+    if "const u16_t k_idx = static_cast<u16_t>(kt * TK + tk)" in sa_core:
+        return fail("SA core still computes K-tail compare inside every TM lane")
+    if "load_conv_qparam_wordwise" not in param_dma or "load_affine_qparam_wordwise" not in param_dma:
+        return fail("PARAM qparam loaders must use word-wise AXI reads to avoid INIT II pressure")
+    if "qparam.bias[i] = read_i32_le" in param_dma or "qparam.mult[i] = read_i32_le" in param_dma:
+        return fail("conv qparam loader still issues per-field AXI reads")
+    if "qparam.mul[i] = read_i32_le" in param_dma or "qparam.bias[i] = read_i32_le" in param_dma:
+        return fail("affine qparam loader still issues per-field AXI reads")
+    if upsample.count("emit_fullres_rows(") > 2:
+        return fail("upsample emits fullres rows through multiple specialized call sites")
 
-    if "ESP_INT8_USE_P6_STATIC_PATH" in win_gen:
-        return fail("window_generator_row still has old P6/non-P6 fallback switch")
-    if "emit_window_row_3x3_c19_stride2_fast" not in win_gen:
-        return fail("P6 window path lost C19 stride-2 fast path")
-    if "emit_window_row_3x3_c131_stride2_fast" not in win_gen:
-        return fail("P6 window path lost C131 stride-2 fast path")
-    for token in ["emit_window_row_3x3_fast", "emit_window_row_1x1_fast"]:
-        if token in win_gen:
-            return fail(f"win_gen.cpp still contains generic fallback: {token}")
-
-    if "static void invalidate_global_aliases()" in scratch_mgr:
-        return fail("scratch_mgr still has loop-style global alias invalidation")
-    if "s_global_alias_desc[i] = tensor_desc_t();" in scratch_mgr:
-        return fail("scratch_mgr clears tensor_desc_t array in a loop")
-    if re.search(r"invalidate_global_aliases[\s\S]*?#pragma\s+HLS\s+PIPELINE\s+II=1", scratch_mgr):
-        return fail("global alias invalidation still forces a pipelined reset loop")
-
-    for token in ["s_uop_table", "load_uop(", "param_dma_get_uop("]:
-        if token in param_dma:
-            return fail(f"param_dma.cpp still contains old UOP table logic: {token}")
-    if "frame_dma_store(" in frame_dma:
-        return fail("frame_dma.cpp still contains unused frame_dma_store")
-
-    if "weight_buf[MAX_SA_K_TILES][TM][TK]" in sa_core:
-        return fail("sa_core.cpp still uses fully-partitioned 3D i8 weight_buf")
-    if "#pragma HLS ARRAY_PARTITION variable=weight_buf complete dim=3" in sa_core:
-        return fail("sa_core.cpp still partitions weight_buf into TK-wide tiny memories")
-    if "#pragma HLS BIND_STORAGE variable=weight_buf type=ram_1p impl=bram" not in sa_core:
-        return fail("sa_core.cpp must keep SA weight_buf BRAM-backed; LUTRAM/SRL worsened routing")
-    if "impl=lutram" in sa_core:
-        return fail("sa_core.cpp still maps SA internals to LUTRAM")
-    if "impl=srl" in sa_core:
-        return fail("sa_core.cpp still maps internal SA FIFOs to SRL")
-    for token in [
-        "wgt_stream_g0",
-        "wgt_stream_g1",
-        "act_stream_g0",
-        "act_stream_g1",
-        "psum_stream_g0",
-        "psum_stream_g1",
-        "broadcast_act_stream",
-        "split_weight_stream",
-        "systolic_array_core_row_group",
-    ]:
-        if token in sa_core:
-            return fail(f"sa_core.cpp still contains group-local stream/control fanout path: {token}")
-    if "#pragma HLS DATAFLOW" in sa_core:
-        return fail("sa_core.cpp must not create nested SA dataflow; top row-region dataflow is sufficient")
-    for token in ["SA_SEGMENT_TM", "mac_tile_segment", "mac_tile_all_lanes"]:
-        if token not in sa_core:
-            return fail(f"sa_core.cpp lost physical MAC segmentation component: {token}")
-
-    if "write_c3_avg_pixel" in avgpool_unit:
-        return fail("avgpool_unit.cpp still contains pixel-level C3 writeback")
-    if "avgpool_c3_group32_inner_fast_pack_write" not in avgpool_unit:
-        return fail("avgpool_unit.cpp lost fixed-layout C3 group writer")
-    if "append_c3_pixel_word" in avgpool_unit:
-        return fail("avgpool_unit.cpp still uses dynamic C3 append packing")
-    if "on_chip_memory_write_c3_packed" in avgpool_unit + memory:
-        return fail("C3 avgpool write still depends on descriptor-based C3 writer")
-    if "on_chip_memory_write_c3_abs" in avgpool_unit + memory:
-        return fail("C3 avgpool write still uses byte-level RMW writer")
-    if "write_aligned_abs_word_narrow" not in avgpool_unit:
-        return fail("C3 avgpool write must use narrow bank-local absolute-word writer")
-    if "on_chip_memory_write_fmbuf_abs_word" not in avgpool_unit + conv_store + memory:
-        return fail("hot-path aligned writes must expose fmbuf-only absolute-word writer")
-    if "on_chip_memory_write_pool2_abs_word" not in avgpool_unit + conv_store + memory:
-        return fail("hot-path aligned writes must expose pool2-only absolute-word writer")
-    if "on_chip_memory_write_aligned_row_word" in conv_store + memory:
-        return fail("compact row store still depends on descriptor-based aligned row writer")
-    if "write_compact_row_word" not in conv_store:
-        return fail("compact row store lost its narrow row-word writer")
-    if "on_chip_memory_write_packed_tile(dst" in conv_store:
-        return fail("conv_store fallback still calls descriptor-based packed writer in the hot module")
-    if "on_chip_memory_write_packed_tile(" in core:
-        return fail("P6 core add/affine path still calls descriptor-based packed writer")
-    if "on_chip_memory_write_packed_tile(" in concat_unit:
-        return fail("P6 concat/store path still calls descriptor-based packed writer")
-    if "write_packed_cross_word(" not in memory:
-        return fail("memory fallback writer is missing; low-frequency unaligned paths still need coverage")
-    if ("write_packed_cross_word(" in conv_store or
-            "write_packed_cross_word(" in avgpool_unit or
-            "write_packed_cross_word(" in core or
-            "write_packed_cross_word(" in concat_unit):
-        return fail("P6 hot writer modules must not call cross-word fallback directly")
-    if "on_chip_memory_write_aligned_full_tile" not in memory or "on_chip_memory_write_aligned_full_tile" not in core:
-        return fail("P6 add/affine full-tile write must keep aligned full-tile memory fast path")
-    if "can_use_aligned_full_tile" not in core:
-        return fail("aligned full-tile path must be guarded by descriptor/channel alignment")
-    if "p6_write_tensor_slice_narrow" not in core:
-        return fail("P6 add/affine tail writes must use narrow bank-local RMW")
-    if "concat_write_slice_narrow" not in concat_unit:
-        return fail("P6 concat/store tail writes must use narrow bank-local RMW")
-    if "emit_smallc_c19_words(" in win_gen:
-        return fail("C19 window path still has direct stream-write emitter instead of staged emitter")
-    if "emit_smallc_c19_words_staged" not in win_gen:
-        return fail("C19 window path lost staged stream emitter")
-
-    print("[P6-CHECK] PASS: P6-only path has no legacy scheduler/fallback dead logic")
+    print("[S4-CHECK] PASS: schedule-executor path has no obsolete top-callable P6/PARAM-v1/old-WinGen logic")
     return 0
 
 

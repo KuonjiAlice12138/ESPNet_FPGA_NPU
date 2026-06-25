@@ -11,8 +11,10 @@ This script matches the PERF125-UPFULL output contract:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pickle
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -58,6 +60,65 @@ def build_fullres_val_dataset(espnet_dir: Path, cached_data_file: Path):
     return myDataLoader.MyDataset(data["valIm"], data["valAnnot"], transform=val_tf)
 
 
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def validate_eval_contract(output_pattern: str, allow_reference_mask_eval: bool = False) -> None:
+    if output_pattern == "M%04d.BIN" and not allow_reference_mask_eval:
+        raise ValueError(
+            "M%04d.BIN is the low-res reference mask pattern, not board output. "
+            "Use O%04d.BIN or pass --allow-reference-mask-eval explicitly."
+        )
+    if output_pattern != "O%04d.BIN" and not allow_reference_mask_eval:
+        raise ValueError(
+            f"Unexpected board output pattern '{output_pattern}'. "
+            "The P7 full-res board contract uses O%04d.BIN by default."
+        )
+
+
+def validate_output_set(
+    output_dir: Path,
+    pattern: str,
+    start: int,
+    limit: int,
+    expected_bytes: int = MASK_BYTES,
+) -> dict[str, Any]:
+    missing: list[str] = []
+    wrong_size: list[dict[str, Any]] = []
+    present: list[str] = []
+    for index in range(start, start + limit):
+        path = output_dir / (pattern % index)
+        if not path.exists():
+            missing.append(str(path))
+            continue
+        size = path.stat().st_size
+        if size != expected_bytes:
+            wrong_size.append({"file": str(path), "bytes": size, "expected_bytes": expected_bytes})
+            continue
+        present.append(str(path))
+    return {"missing": missing, "wrong_size": wrong_size, "present": present}
+
+
+def parse_timing_log(path: Path | None) -> dict[str, Any]:
+    if path is None or not path.exists():
+        return {"samples": None, "total_ticks": None, "avg_ms": None}
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    samples = None
+    total_ticks = None
+    avg_ms = None
+    m = re.search(r"samples=(\d+)\s+total_cycles=(\d+).*?avg_ms=(\d+)", text, re.S)
+    if m:
+        samples = int(m.group(1))
+        total_ticks = int(m.group(2))
+        avg_ms = int(m.group(3))
+    return {"samples": samples, "total_ticks": total_ticks, "avg_ms": avg_ms}
+
+
 def load_mask(path: Path) -> np.ndarray:
     data = np.fromfile(path, dtype=np.uint8)
     if data.size != MASK_BYTES:
@@ -73,16 +134,30 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     dataset = build_fullres_val_dataset(Path(args.espnet_dir), Path(args.cached_data_file))
     metric = iouEval(args.classes)
     missing: list[str] = []
+    wrong_size: list[dict[str, Any]] = []
     processed = 0
 
     limit = args.limit if args.limit > 0 else len(dataset)
+    limit = min(limit, len(dataset) - args.start_index)
+    validate_eval_contract(args.output_pattern, args.allow_reference_mask_eval)
+    output_set = validate_output_set(output_dir, args.output_pattern, args.start_index, limit)
+    missing = output_set["missing"]
+    wrong_size = output_set["wrong_size"]
+    if (missing or wrong_size) and not args.allow_missing:
+        raise FileNotFoundError(
+            f"board output set incomplete: missing={len(missing)} wrong_size={len(wrong_size)}"
+        )
+
     for index in range(args.start_index, min(args.start_index + limit, len(dataset))):
         out_path = output_dir / (args.output_pattern % index)
         if not out_path.exists():
-            missing.append(str(out_path))
             if args.allow_missing:
                 continue
             raise FileNotFoundError(out_path)
+        if out_path.stat().st_size != MASK_BYTES:
+            if args.allow_missing:
+                continue
+            raise ValueError(f"{out_path} has {out_path.stat().st_size} bytes, expected {MASK_BYTES}")
 
         _inputs, target, _name = dataset[index]
         target = remap_target(target.unsqueeze(0)).squeeze(0)
@@ -99,12 +174,31 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 f"mIoU={metrics['mIoU']:.8f}"
             )
 
+    sd_manifest = None
+    if args.sd_manifest:
+        sd_manifest = json.loads(Path(args.sd_manifest).read_text(encoding="utf-8"))
+    param_audit = None
+    if args.param_audit:
+        param_audit = json.loads(Path(args.param_audit).read_text(encoding="utf-8"))
+
     return {
         "output_dir": str(output_dir),
         "output_pattern": args.output_pattern,
         "start_index": args.start_index,
+        "num_expected": limit,
         "processed": processed,
         "missing": missing,
+        "wrong_size": wrong_size,
+        "param_blob_sha256": (
+            sd_manifest.get("param_blob", {}).get("sha256") if isinstance(sd_manifest, dict) else None
+        ),
+        "param_version": (
+            sd_manifest.get("param_blob", {}).get("version") if isinstance(sd_manifest, dict) else None
+        ),
+        "param_audit_format": (
+            param_audit.get("format") if isinstance(param_audit, dict) else None
+        ),
+        "timing": parse_timing_log(Path(args.timing_log) if args.timing_log else None),
         "metrics": metric_dict(metric),
     }
 
@@ -121,6 +215,10 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--progress-every", type=int, default=25)
     parser.add_argument("--allow-missing", action="store_true")
+    parser.add_argument("--allow-reference-mask-eval", action="store_true")
+    parser.add_argument("--sd-manifest", default="")
+    parser.add_argument("--param-audit", default="")
+    parser.add_argument("--timing-log", default="")
     args = parser.parse_args()
 
     result = evaluate(args)

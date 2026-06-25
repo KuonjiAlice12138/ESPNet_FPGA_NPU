@@ -5,8 +5,8 @@ set "ESPNET_DIR=D:\ESPNet"
 set "ESPINT8_DIR=D:\ESP_INT8"
 set "PYTHON=%ESPNET_DIR%\.venv\Scripts\python.exe"
 
-set "ARTIFACT_DIR=%ESPINT8_DIR%\quantized_artifacts_hw_constrained_qat_3ep"
-set "HW_DIR=%ESPINT8_DIR%\hw_artifacts\hw_constrained_qat_3ep_single"
+set "ARTIFACT_DIR=%ESPINT8_DIR%\quantized_artifacts_hw_constrained_qat_p7_hwconv_0623"
+set "HW_DIR=%ESPINT8_DIR%\hw_artifacts\sched_v3_single_p7_hwconv_0623"
 
 set "QAT_EPOCHS=3"
 set "QAT_LR=1e-4"
@@ -32,7 +32,7 @@ if "%CLEAN_OUTPUT%"=="1" (
 set "PYTHONDONTWRITEBYTECODE=1"
 
 echo [1/4] Running hardware-constrained QAT export...
-"%PYTHON%" "%ESPNET_DIR%\export_quantized_artifacts.py" ^
+"%PYTHON%" "%ESPINT8_DIR%\tools\export_quantized_artifacts.py" ^
   --output_dir "%ARTIFACT_DIR%" ^
   --qat ^
   --fake_quant_eval ^
@@ -47,7 +47,9 @@ echo [2/4] Exporting hardware blob and single-sample bit-compare data...
 "%PYTHON%" "%ESPINT8_DIR%\tools\export_int8_hw_blob.py" ^
   --artifact-dir "%ARTIFACT_DIR%" ^
   --out-dir "%HW_DIR%" ^
-  --strict-zp
+  --param-version 3 ^
+  --strict-zp ^
+  --strict-schedule
 if errorlevel 1 goto fail
 
 if "%RUN_EVAL%"=="1" (

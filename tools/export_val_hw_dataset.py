@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import shutil
@@ -41,6 +42,57 @@ TARGET_SHAPE = (64, 128)
 INPUT_BYTES = 512 * 1024 * 3
 OUTPUT_BYTES = 64 * 128 * 2
 TARGET_BYTES = 64 * 128
+PARAM_BLOB_MAGIC = 0x544E4945
+PARAM_BLOB_VERSION_SCHED = 3
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_param_header_words(path: Path) -> tuple[int, ...]:
+    data = path.read_bytes()[:128]
+    if len(data) < 128:
+        raise ValueError(f"PARAM blob too short: {path}")
+    import struct
+
+    return struct.unpack("<32I", data)
+
+
+def check_param_blob_for_sd(param_path: Path, allow_param_v1: bool = False) -> dict[str, Any]:
+    header = read_param_header_words(param_path)
+    magic, version = header[0], header[1]
+    if magic != PARAM_BLOB_MAGIC:
+        raise ValueError(f"bad PARAM magic in {param_path}: 0x{magic:08x}")
+    if version != PARAM_BLOB_VERSION_SCHED and not allow_param_v1:
+        raise ValueError(
+            f"{param_path} is PARAM version {version}; P7 SD export requires v3 "
+            "unless --allow-param-v1 is set."
+        )
+    return {
+        "file": "PARAM.BIN",
+        "source": str(param_path),
+        "version": int(version),
+        "bytes": param_path.stat().st_size,
+        "sha256": sha256_file(param_path),
+    }
+
+
+def clean_board_outputs(out_dir: Path) -> int:
+    removed = 0
+    for path in out_dir.glob("O*.BIN"):
+        if path.is_file():
+            path.unlink()
+            removed += 1
+    mask = out_dir / "MASK.BIN"
+    if mask.exists():
+        mask.unlink()
+        removed += 1
+    return removed
 
 
 def quantize_activation_tensor(tensor: torch.Tensor, observer: Any) -> torch.Tensor:
@@ -142,17 +194,46 @@ def compare_file_bytes(left: Path, right: Path) -> dict[str, Any]:
     }
 
 
+def load_scale_table(path: Path) -> dict[str, tuple[float, int]]:
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    return {str(row["name"]): (float(row["scale"]), int(row["zero_point"])) for row in rows}
+
+
+def assert_observer_matches_scale_table(observer: Any, table: dict[str, tuple[float, int]], name: str) -> None:
+    if name not in table:
+        raise KeyError(f"scale_table.json does not contain '{name}'")
+    scale = observer.scale.detach().cpu()
+    zero_point = observer.zero_point.detach().cpu().to(torch.int32)
+    if scale.numel() != 1 or zero_point.numel() != 1:
+        raise ValueError(f"{name}: only per-tensor observer is supported")
+    got = (float(scale.item()), int(zero_point.item()))
+    expected = table[name]
+    if abs(got[0] - expected[0]) > max(1e-8, abs(expected[0]) * 1e-5) or got[1] != expected[1]:
+        raise ValueError(
+            f"{name} observer qparams {got} do not match hardware scale_table {expected}; "
+            "rerun export_quantized_artifacts.py and export_int8_hw_blob.py."
+        )
+
+
 def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
     out_dir = Path(args.out_dir)
     if args.clean and out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    stale_removed = clean_board_outputs(out_dir) if args.clean_board_outputs else 0
 
+    param_info = None
+    copied_audit = None
     if args.copy_param:
         param_src = Path(args.param_src)
         if not param_src.exists():
             raise FileNotFoundError(f"param blob not found: {param_src}")
+        param_info = check_param_blob_for_sd(param_src, allow_param_v1=args.allow_param_v1)
         shutil.copy2(param_src, out_dir / "PARAM.BIN")
+        audit_src = Path(args.param_audit) if args.param_audit else param_src.parent / "param_audit.json"
+        if audit_src.exists():
+            shutil.copy2(audit_src, out_dir / "param_audit.json")
+            copied_audit = "param_audit.json"
 
     add_espnet(Path(args.espnet_dir))
     use_cuda = bool(args.cuda and torch.cuda.is_available() and not args.cpu)
@@ -168,6 +249,12 @@ def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
 
     input_observer = model.quant.activation_post_process
     classifier_observer = get_nested_module(model, "classifier").activation_post_process
+    scale_table_path = Path(args.scale_table) if args.scale_table else Path(args.single_hw_dir) / "scale_table.json"
+    if not scale_table_path.exists():
+        raise FileNotFoundError(f"scale_table.json not found: {scale_table_path}")
+    scale_table = load_scale_table(scale_table_path)
+    assert_observer_matches_scale_table(input_observer, scale_table, "quant")
+    assert_observer_matches_scale_table(classifier_observer, scale_table, "classifier")
 
     csv_path = out_dir / "VALMAN.CSV"
     rows: list[dict[str, Any]] = []
@@ -232,6 +319,10 @@ def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
                 ref_nhwc.tofile(out_dir / ref_name)
                 target.tofile(out_dir / target_name)
                 mask.tofile(out_dir / mask_name)
+                input_path = out_dir / input_name
+                ref_path = out_dir / ref_name
+                target_path = out_dir / target_name
+                mask_path = out_dir / mask_name
 
                 if args.write_npy:
                     np.save(out_dir / input_name.replace(".BIN", ".npy"), input_nhwc)
@@ -248,11 +339,16 @@ def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
                         "ref": ref_name,
                         "target": target_name,
                         "mask": mask_name,
+                        "board_output": short_bin("O", idx),
                         "image": str(image_name),
                         "input_bytes": INPUT_BYTES,
                         "ref_bytes": OUTPUT_BYTES,
                         "target_bytes": TARGET_BYTES,
                         "mask_bytes": TARGET_BYTES,
+                        "input_sha256": sha256_file(input_path),
+                        "ref_sha256": sha256_file(ref_path),
+                        "target_sha256": sha256_file(target_path),
+                        "mask_sha256": sha256_file(mask_path),
                     }
                 )
                 exported += 1
@@ -269,18 +365,23 @@ def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "ref",
             "target",
             "mask",
+            "board_output",
             "image",
             "input_bytes",
             "ref_bytes",
             "target_bytes",
             "mask_bytes",
+            "input_sha256",
+            "target_sha256",
+            "ref_sha256",
+            "mask_sha256",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
     manifest = {
-        "format": "ESP_INT8_VAL_HW_DATASET_V1",
+        "format": "ESP_INT8_VAL_HW_DATASET_V2",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "espnet_dir": str(args.espnet_dir),
         "artifact_dir": str(args.artifact_dir),
@@ -290,6 +391,23 @@ def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
         "num_val_total": total,
         "batch_size": args.batch_size,
         "device": str(device),
+        "param_blob": (
+            {
+                **param_info,
+                "audit_file": copied_audit,
+            }
+            if param_info
+            else None
+        ),
+        "board_contract": {
+            "input": "NHWC int8 signed, 512x1024x3, I%04d.BIN",
+            "output": "full-res uint8 mask, 512x1024, O%04d.BIN",
+            "target": "low-res uint8 target, 64x128, T%04d.BIN",
+            "reference_logit": "low-res NHWC int8 logits, 64x128x2, R%04d.BIN",
+            "reference_mask": "low-res uint8 mask, 64x128, M%04d.BIN",
+        },
+        "stale_output_cleaned": bool(args.clean_board_outputs),
+        "stale_output_removed": stale_removed,
         "files": {
             "param": "PARAM.BIN" if args.copy_param else None,
             "manifest_csv": "VALMAN.CSV",
@@ -297,6 +415,8 @@ def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "reference_logit_pattern": "R%04d.BIN",
             "target_pattern": "T%04d.BIN",
             "reference_mask_pattern": "M%04d.BIN",
+            "board_output_pattern": "O%04d.BIN",
+            "filehash_csv": "FILEHASH.CSV",
         },
         "shapes": {
             "input_nhwc": [1, 512, 1024, 3],
@@ -328,6 +448,26 @@ def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
         json.dumps(manifest, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    (out_dir / "SDMANIFEST.JSON").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    with (out_dir / "FILEHASH.CSV").open("w", newline="", encoding="utf-8") as f:
+        fieldnames = ["file", "bytes", "sha256", "role"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        if args.copy_param:
+            writer.writerow({
+                "file": "PARAM.BIN",
+                "bytes": (out_dir / "PARAM.BIN").stat().st_size,
+                "sha256": sha256_file(out_dir / "PARAM.BIN"),
+                "role": "param",
+            })
+        for row in rows:
+            writer.writerow({"file": row["input"], "bytes": row["input_bytes"], "sha256": row["input_sha256"], "role": "input"})
+            writer.writerow({"file": row["target"], "bytes": row["target_bytes"], "sha256": row["target_sha256"], "role": "target"})
+            writer.writerow({"file": row["ref"], "bytes": row["ref_bytes"], "sha256": row["ref_sha256"], "role": "reference_logit"})
+            writer.writerow({"file": row["mask"], "bytes": row["mask_bytes"], "sha256": row["mask_sha256"], "role": "reference_mask"})
     return manifest
 
 
@@ -345,16 +485,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cached-data-file", default=r"D:\ESPNet\city.p")
     parser.add_argument(
         "--param-src",
-        default=r"D:\ESP_INT8\hw_artifacts\hw_constrained_qat_3ep_single\param_blob.bin",
+        default=r"D:\ESP_INT8\hw_artifacts\sched_v3_single\PARAM.BIN",
     )
     parser.add_argument(
         "--single-hw-dir",
-        default=r"D:\ESP_INT8\hw_artifacts\hw_constrained_qat_3ep_single",
+        default=r"D:\ESP_INT8\hw_artifacts\sched_v3_single",
     )
     parser.add_argument(
         "--out-dir",
-        default=r"D:\ESP_INT8\hw_artifacts\hw_constrained_qat_3ep_val",
+        default=r"D:\ESP_INT8\hw_artifacts\sched_v3_val",
     )
+    parser.add_argument("--param-audit", default="")
+    parser.add_argument("--scale-table", default="")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--scale-in", type=int, default=8)
@@ -371,14 +513,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cpu", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--clean", action="store_true")
+    parser.add_argument("--clean-board-outputs", action="store_true")
     parser.add_argument("--write-npy", action="store_true")
     parser.add_argument("--no-copy-param", dest="copy_param", action="store_false")
+    parser.add_argument("--allow-param-v1", action="store_true")
     parser.add_argument("--check-single", action="store_true")
     parser.set_defaults(copy_param=True)
     args = parser.parse_args()
 
-    for name in ("espnet_dir", "artifact_dir", "model_path", "cached_data_file", "param_src", "single_hw_dir", "out_dir"):
-        setattr(args, name, str(Path(getattr(args, name)).resolve()))
+    for name in (
+        "espnet_dir",
+        "artifact_dir",
+        "model_path",
+        "cached_data_file",
+        "param_src",
+        "single_hw_dir",
+        "out_dir",
+        "param_audit",
+        "scale_table",
+    ):
+        value = getattr(args, name)
+        if value:
+            setattr(args, name, str(Path(value).resolve()))
     return args
 
 

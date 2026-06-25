@@ -116,10 +116,10 @@ def evaluate(args) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--espnet-dir", default=r"D:\ESPNet")
-    parser.add_argument("--artifact-dir", default=r"D:\ESP_INT8\quantized_artifacts_hw_constrained_qat_3ep")
+    parser.add_argument("--artifact-dir", default=r"D:\ESP_INT8\quantized_artifacts_hw_constrained_qat_p7_hwconv_0623")
     parser.add_argument("--model-path", default=r"D:\ESPNet\results_vehicle(model_flattened)_enc__enc_1_1\model_64.pth")
     parser.add_argument("--cached-data-file", default=r"D:\ESPNet\city.p")
-    parser.add_argument("--out-json", default=r"D:\ESP_INT8\hw_artifacts\hw_constrained_qat_3ep_single\int8_baseline_metrics.json")
+    parser.add_argument("--out-json", default=r"D:\ESP_INT8\hw_artifacts\sched_v3_single_p7_hwconv_0623\int8_baseline_metrics.json")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--scale-in", type=int, default=8)

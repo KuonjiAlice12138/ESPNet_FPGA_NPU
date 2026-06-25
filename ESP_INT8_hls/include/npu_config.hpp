@@ -5,7 +5,7 @@
 namespace esp_int8 {
 
 constexpr std::uint32_t PARAM_BLOB_MAGIC = 0x544E4945U;  // "EINT" in little-endian word view.
-constexpr std::uint32_t PARAM_BLOB_VERSION = 0x00010000U;
+constexpr std::uint32_t PARAM_BLOB_VERSION_SCHED = 3U;
 
 constexpr int AXI_WORD_BITS = 256;
 constexpr int AXI_WORD_BYTES = AXI_WORD_BITS / 8;
@@ -20,7 +20,11 @@ constexpr int MAX_FM_W = 1024;
 constexpr int MAX_FM_C = 256;
 constexpr int MAX_KERNEL_ELEMS = 9;
 constexpr int MAX_C_TILE_COUNT = (MAX_FM_C + TM - 1) / TM;
-constexpr int MAX_K_TILE_COUNT = (MAX_FM_C * MAX_KERNEL_ELEMS + TK - 1) / TK;
+
+// Schedule-executor build: keep this at 40, not the general 3x3*C256 bound.
+// Current ESPNet encoder max K-tile count is ceil(3*3*131/32)=37; C256 1x1 is 8.
+// Raising this silently expands window_sched_desc_t and breaks the v3 blob contract.
+constexpr int MAX_K_TILE_COUNT = 40;
 
 constexpr int INPUT_FRAME_H = 512;
 constexpr int INPUT_FRAME_W = 1024;
@@ -91,8 +95,26 @@ constexpr int MAX_AFFINE_PARAM_DESC_COUNT = 16;
 constexpr int MAX_ADD_PARAM_DESC_COUNT = 16;
 constexpr int MAX_POOL_PARAM_DESC_COUNT = 8;
 
+// v3 schedule section upper bounds. Keep these tight; if exporter exceeds them,
+// fix the schedule generator instead of expanding HLS arrays.
+constexpr int MAX_CONV_EXEC_DESC_COUNT = 32;
+constexpr int MAX_WINDOW_SCHED_COUNT = 16;
+constexpr int MAX_WINDOW_PACK_CMD_COUNT = 256;
+constexpr int MAX_ROW_CONSUMER_DESC_COUNT = 64;
+constexpr int MAX_EXEC_PLAN_COUNT = 96;
+constexpr int MAX_PACK_CMDS_PER_KT = 9;
+
+constexpr int WINDOW_PACK_CMD_BLOB_BYTES = 8;
+constexpr int WINDOW_SCHED_DESC_BLOB_BYTES = 96;
+constexpr int CONV_EXEC_DESC_BLOB_BYTES = 36;
+constexpr int ROW_CONSUMER_DESC_BLOB_BYTES = 16;
+constexpr int EXEC_PLAN_ENTRY_BLOB_BYTES = 4;
+
 constexpr int SECTION_ALIGNMENT_BYTES = 64;
 
+static_assert(MAX_K_TILE_COUNT == 40, "v3 WINDOW_SCHED_DESC_BLOB_BYTES assumes 40 K tiles");
+static_assert(WINDOW_SCHED_DESC_BLOB_BYTES == 12 + (MAX_K_TILE_COUNT + 1) * 2 + 2,
+              "window_sched_desc_t blob size mismatch");
 static_assert(FMBUF_L2_SCRATCH_BASE + 4 * FMBUF_L2_SCRATCH_SLOT_BYTES <= FMBUF_BYTES,
               "Level2 scratch must fit in FMBUF");
 static_assert(FMBUF_L30_BASE + 64 * 128 * 128 <= FMBUF_L30_SCRATCH_C1_BASE,

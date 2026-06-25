@@ -1,4 +1,5 @@
 #include "../include/npu_config.hpp"
+#include "../include/npu_schedule.hpp"
 #include "../include/npu_types.hpp"
 
 namespace esp_int8 {
@@ -521,51 +522,34 @@ static bool store_c16_into_c19_row(const tensor_desc_t& dst,
 }
 
 bool store_conv_output_row(const tensor_desc_t& dst,
-                                  u16_t out_row,
-                                  u16_t c_offset,
-                                  const conv_cfg_t& cfg,
-                                  act_vec_t row_buf[MAX_FM_W]) {
+                           u16_t out_row,
+                           u16_t c_offset,
+                           u16_t store_layout,
+                           const conv_cfg_t& cfg,
+                           act_vec_t row_buf[MAX_FM_W]) {
 #pragma HLS INLINE off
   const u16_t stride = conv_effective_stride(cfg);
   const u16_t out_w = conv_out_dim(cfg.in_w, stride);
   const int out_w_i = static_cast<int>(out_w.to_uint());
   const u8_t valid_c = static_cast<u8_t>(cfg.out_c.to_uint());
+  const unsigned layout = store_layout.to_uint();
   bool ok = true;
 
-  const bool compact_row =
-      c_offset.to_uint() == 0U &&
-      core_desc_phys_c(dst).to_uint() == dst.c.to_uint() &&
-      dst.c.to_uint() == cfg.out_c.to_uint();
-  if (compact_row && cfg.out_c.to_uint() == 12U &&
-      (out_w_i & 7) == 0) {
-    return store_compact_c12_row(dst, out_row, out_w_i, row_buf);
-  }
-  if (compact_row && cfg.out_c.to_uint() == 16U &&
-      (out_w_i & 1) == 0) {
-    return store_compact_c16_row(dst, out_row, out_w_i, row_buf);
-  }
-  if (compact_row && cfg.out_c.to_uint() == 25U &&
-      (out_w_i & 31) == 0) {
-    return store_compact_c25_row(dst, out_row, out_w_i, row_buf);
-  }
-  if (compact_row && cfg.out_c.to_uint() == 28U &&
-      (out_w_i & 7) == 0) {
-    return store_compact_c28_row(dst, out_row, out_w_i, row_buf);
-  }
-  if (compact_row && cfg.out_c.to_uint() == 2U &&
-      (out_w_i & 15) == 0) {
-    return store_compact_c2_row(dst, out_row, out_w_i, row_buf);
-  }
-  if (c_offset.to_uint() == 0U &&
-      cfg.out_c.to_uint() == 16U &&
-      dst.c.to_uint() == 19U &&
-      core_desc_phys_c(dst).to_uint() == 19U &&
-      (out_w_i & 31) == 0) {
-    return store_c16_into_c19_row(dst, out_row, out_w_i, row_buf);
-  }
-
-  if (valid_c.to_uint() != static_cast<unsigned>(AXI_WORD_BYTES) ||
-      (core_desc_phys_c(dst).to_uint() & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U) {
+  switch (layout) {
+    case static_cast<unsigned>(STORE_LAYOUT_COMPACT_C12):
+      return store_compact_c12_row(dst, out_row, out_w_i, row_buf);
+    case static_cast<unsigned>(STORE_LAYOUT_COMPACT_C16):
+      return store_compact_c16_row(dst, out_row, out_w_i, row_buf);
+    case static_cast<unsigned>(STORE_LAYOUT_COMPACT_C25):
+      return store_compact_c25_row(dst, out_row, out_w_i, row_buf);
+    case static_cast<unsigned>(STORE_LAYOUT_COMPACT_C28):
+      return store_compact_c28_row(dst, out_row, out_w_i, row_buf);
+    case static_cast<unsigned>(STORE_LAYOUT_COMPACT_C2):
+      return store_compact_c2_row(dst, out_row, out_w_i, row_buf);
+    case static_cast<unsigned>(STORE_LAYOUT_C16_INTO_C19):
+      return store_c16_into_c19_row(dst, out_row, out_w_i, row_buf);
+    case static_cast<unsigned>(STORE_LAYOUT_NARROW_FIXED):
+    case static_cast<unsigned>(STORE_LAYOUT_COLD_RMW_FALLBACK): {
     const u32_t row_base = compact_row_base(dst, out_row);
     const u32_t channel_offset = static_cast<u32_t>(c_offset);
     const u32_t phys_c = static_cast<u32_t>(core_desc_phys_c(dst));
@@ -581,19 +565,23 @@ bool store_conv_output_row(const tensor_desc_t& dst,
     }
     return ok;
   }
-
-  const u32_t row_base = compact_row_base(dst, out_row);
-  const u32_t channel_offset = static_cast<u32_t>(c_offset);
-  const u32_t phys_c = static_cast<u32_t>(core_desc_phys_c(dst));
-  for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
+    case static_cast<unsigned>(STORE_LAYOUT_ALIGNED_TILE_COPY): {
+      const u32_t row_base = compact_row_base(dst, out_row);
+      const u32_t channel_offset = static_cast<u32_t>(c_offset);
+      const u32_t phys_c = static_cast<u32_t>(core_desc_phys_c(dst));
+      for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
 #pragma HLS PIPELINE off
-    if (ow_i >= out_w_i) {
-      break;
+        if (ow_i >= out_w_i) {
+          break;
+        }
+        const u32_t byte_offset = static_cast<u32_t>(ow_i) * phys_c + channel_offset;
+        write_compact_row_word(dst.bank_id, row_base, byte_offset, row_buf[ow_i], ok);
+      }
+      return ok;
     }
-    const u32_t byte_offset = static_cast<u32_t>(ow_i) * phys_c + channel_offset;
-    write_compact_row_word(dst.bank_id, row_base, byte_offset, row_buf[ow_i], ok);
+    default:
+      return false;
   }
-  return ok;
 }
 
 

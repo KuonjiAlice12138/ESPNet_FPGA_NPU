@@ -2,15 +2,25 @@
 
 #include "../include/npu_config.hpp"
 #include "../include/npu_q.hpp"
+#include "../include/npu_schedule.hpp"
 #include "../include/npu_uop.hpp"
+
+#ifndef __SYNTHESIS__
+#include <fstream>
+#endif
 
 namespace esp_int8 {
 
 void param_dma_init(const axi_vec_t* gmem_param);
 bool param_dma_ready();
+bool param_dma_is_schedule_blob();
 bool param_dma_get_pool_qparam(u8_t param_id, pool_q_t& qparam);
 bool param_dma_get_conv_qparam(u8_t param_id, conv_q_t& qparam);
-bool param_dma_get_weight_vec(u8_t param_id, u16_t oc, u16_t kt, const conv_cfg_t& cfg, wgt_vec_t& word);
+bool param_dma_get_conv_exec_desc(u8_t id, conv_exec_desc_t& desc);
+bool param_dma_get_window_sched(u8_t id, window_sched_desc_t& desc);
+bool param_dma_get_row_consumer(u8_t id, row_consumer_desc_t& desc);
+bool param_dma_get_exec_entry(u8_t pc, exec_plan_entry_t& entry);
+bool param_dma_get_packed_weight_vec(const conv_exec_desc_t& desc, u16_t tm, u16_t kt, wgt_vec_t& word);
 bool param_dma_get_affine_qparam(u8_t param_id, u8_t block_id, aff_q_t& qparam);
 bool param_dma_get_add_qparam(u8_t param_id, add_q_t& qparam);
 void frame_dma_load(const axi_vec_t* gmem_frame_in);
@@ -18,10 +28,6 @@ bool avgpool_unit_checked(const tensor_desc_t& src,
                           const tensor_desc_t& dst,
                           const pool_q_t& qparam,
                           i8_t* fmbuf_base);
-bool concat_writer(const tensor_desc_t& src,
-                   const tensor_desc_t& dst,
-                   u16_t c_offset,
-                   u16_t valid_c);
 bool on_chip_memory_read_packed_tile(const tensor_desc_t& desc,
                                      i32_t h,
                                      i32_t w,
@@ -48,10 +54,11 @@ bool on_chip_memory_read_pool2_abs_word(u32_t byte_offset,
                                         axi_vec_t& packed);
 bool on_chip_memory_write_pool2_abs_word(u32_t byte_offset,
                                          axi_vec_t packed);
-void window_generator_row(const tensor_desc_t& src_desc,
-                          hls::stream<act_vec_t>& act_stream,
-                          const conv_cfg_t& cfg,
-                          u16_t out_row);
+void scheduled_window_generator_row(const tensor_desc_t& src_desc,
+                                    const conv_exec_desc_t& conv_desc,
+                                    const window_sched_desc_t& sched,
+                                    hls::stream<act_vec_t>& act_stream,
+                                    u16_t out_row);
 void systolic_array_core_row(hls::stream<act_vec_t>& act_stream,
                              hls::stream<wgt_vec_t>& wgt_stream,
                              hls::stream<psum_vec_t>& psum_stream,
@@ -59,6 +66,7 @@ void systolic_array_core_row(hls::stream<act_vec_t>& act_stream,
 bool store_conv_output_row(const tensor_desc_t& dst,
                            u16_t out_row,
                            u16_t c_offset,
+                           u16_t store_layout,
                            const conv_cfg_t& cfg,
                            act_vec_t row_buf[MAX_FM_W]);
 void reset_scratch_state();
@@ -84,6 +92,7 @@ static bool s_param_ready = false;
 #ifndef __SYNTHESIS__
 static unsigned s_csim_last_uop = 0;
 static error_code_t s_csim_last_error = ERR_NONE;
+static bool s_csim_tensor_dumped = false;
 
 unsigned csim_last_uop() {
   return s_csim_last_uop;
@@ -257,34 +266,55 @@ static bool alias_tensor_to_slice(u8_t tensor_id,
   return false;
 }
 
-static conv_cfg_t conv_cfg_from_uop(const uop_t& uop) {
+static conv_cfg_t conv_cfg_from_exec_desc(const conv_exec_desc_t& desc) {
 #pragma HLS INLINE
   conv_cfg_t cfg;
-  cfg.in_h = uop.in_h;
-  cfg.in_w = uop.in_w;
-  cfg.in_c = uop.in_c;
-  cfg.out_c = uop.out_c;
-  cfg.kernel = (uop.kernel.to_uint() == 1U) ? ap_uint<2>(1) : ap_uint<2>(3);
-  cfg.stride = (uop.stride.to_uint() == 0U) ? ap_uint<2>(1) : ap_uint<2>(uop.stride);
-  cfg.dilation = (uop.dilation.to_uint() == 0U) ? ap_uint<5>(1) : ap_uint<5>(uop.dilation);
-  cfg.bias_en = uop_has_bias(uop) ? ap_uint<1>(1) : ap_uint<1>(0);
+  cfg.in_h = desc.in_h;
+  cfg.in_w = desc.in_w;
+  cfg.in_c = desc.in_c;
+  cfg.out_c = desc.out_c;
+  cfg.kernel = (desc.kernel.to_uint() == 1U) ? ap_uint<2>(1) : ap_uint<2>(3);
+  cfg.stride = (desc.stride.to_uint() == 0U) ? ap_uint<2>(1) : ap_uint<2>(desc.stride);
+  cfg.dilation = (desc.dilation.to_uint() == 0U) ? ap_uint<5>(1) : ap_uint<5>(desc.dilation);
+  cfg.bias_en = (((desc.flags.to_uint() >> static_cast<unsigned>(UOP_FLAG_BIAS_EN)) & 0x1U) != 0U)
+                    ? ap_uint<1>(1)
+                    : ap_uint<1>(0);
   return cfg;
+}
+
+static u8_t conv_act_type_from_flags(u16_t flags) {
+#pragma HLS INLINE
+  return (((flags.to_uint() >> static_cast<unsigned>(UOP_FLAG_RELU_EN)) & 0x1U) != 0U)
+             ? static_cast<u8_t>(static_cast<unsigned>(ACT_RELU))
+             : static_cast<u8_t>(static_cast<unsigned>(ACT_NONE));
+}
+
+static void make_conv_uop_from_exec_desc(const conv_exec_desc_t& desc, uop_t& uop) {
+#pragma HLS INLINE
+  uop = uop_t();
+  uop.opcode = static_cast<u8_t>(static_cast<unsigned>(UOP_CONV));
+  uop.flags = static_cast<u8_t>(desc.flags.to_uint() & 0xffU);
+  uop.src0_tensor = desc.src_tensor;
+  uop.src1_tensor = static_cast<u8_t>(static_cast<unsigned>(TID_INVALID));
+  uop.dst_tensor = desc.dst_tensor;
+  uop.param_id = desc.param_id;
+  uop.act_type = conv_act_type_from_flags(desc.flags);
+  uop.in_h = desc.in_h;
+  uop.in_w = desc.in_w;
+  uop.in_c = desc.in_c;
+  uop.out_c = desc.out_c;
+  uop.kernel = desc.kernel;
+  uop.stride = desc.stride;
+  uop.dilation = desc.dilation;
+  uop.padding = desc.padding;
+  uop.c_offset = desc.dst_c_offset;
+  uop.valid_c = desc.valid_c;
+  uop.qparam_id = desc.qparam_id;
 }
 
 static u16_t conv_effective_stride(const conv_cfg_t& cfg) {
 #pragma HLS INLINE
   return (cfg.stride == 0) ? static_cast<u16_t>(1) : static_cast<u16_t>(cfg.stride);
-}
-
-static u16_t conv_effective_kernel(const conv_cfg_t& cfg) {
-#pragma HLS INLINE
-  return (cfg.kernel == 1) ? static_cast<u16_t>(1) : static_cast<u16_t>(3);
-}
-
-static u16_t conv_kernel_flat(const conv_cfg_t& cfg) {
-#pragma HLS INLINE
-  const u16_t kernel = conv_effective_kernel(cfg);
-  return static_cast<u16_t>(cfg.in_c * kernel * kernel);
 }
 
 static void set_act_vec_i8_dynamic(act_vec_t& word, int lane, i8_t value) {
@@ -323,7 +353,7 @@ static void feed_cached_weights(hls::stream<wgt_vec_t>& wgt_stream,
 static void post_process_row_to_buffer(hls::stream<psum_vec_t>& psum_stream,
                                         act_vec_t row_buf[MAX_FM_W],
                                         const conv_cfg_t& cfg,
-                                        const uop_t& uop,
+                                        u8_t act_type,
                                         const conv_q_t& qparam) {
 #pragma HLS INLINE off
   const u16_t stride = conv_effective_stride(cfg);
@@ -345,7 +375,7 @@ static void post_process_row_to_buffer(hls::stream<psum_vec_t>& psum_stream,
                                            qparam.bias[tm],
                                            qparam.mult[tm],
                                            qparam.shift[tm],
-                                           uop.act_type);
+                                           act_type);
         set_act_vec_i8_dynamic(packed, tm, out);
       }
     }
@@ -353,9 +383,22 @@ static void post_process_row_to_buffer(hls::stream<psum_vec_t>& psum_stream,
   }
 }
 
+static void generate_conv_window_row(const tensor_desc_t& src,
+                                     hls::stream<act_vec_t>& act_stream,
+                                     const conv_cfg_t& cfg,
+                                     const conv_exec_desc_t& conv_desc,
+                                     const window_sched_desc_t& sched,
+                                     u16_t out_row) {
+#pragma HLS INLINE off
+  (void)cfg;
+  scheduled_window_generator_row(src, conv_desc, sched, act_stream, out_row);
+}
+
 static void execute_conv_stream_row_region(const tensor_desc_t& src,
                                            const conv_cfg_t& cfg,
-                                           const uop_t& uop,
+                                           const conv_exec_desc_t& conv_desc,
+                                           const window_sched_desc_t& sched,
+                                           u8_t act_type,
                                            const conv_q_t& qparam,
                                            u16_t out_row,
                                            act_vec_t row_buf[MAX_FM_W],
@@ -373,19 +416,532 @@ static void execute_conv_stream_row_region(const tensor_desc_t& src,
 #pragma HLS BIND_STORAGE variable=wgt_stream type=fifo impl=bram
 #pragma HLS BIND_STORAGE variable=psum_stream type=fifo impl=bram
 #pragma HLS DATAFLOW
-  window_generator_row(src, act_stream, cfg, out_row);
+  generate_conv_window_row(src, act_stream, cfg, conv_desc, sched, out_row);
   feed_cached_weights(wgt_stream, cached_wgts, wgt_count);
   systolic_array_core_row(act_stream, wgt_stream, psum_stream, cfg);
-  post_process_row_to_buffer(psum_stream, row_buf, cfg, uop, qparam);
+  post_process_row_to_buffer(psum_stream, row_buf, cfg, act_type, qparam);
 }
+
+static void add_other_row_to_buffer(const tensor_desc_t& other,
+                                    u16_t out_row,
+                                    const conv_cfg_t& cfg,
+                                    u8_t valid_c,
+                                    const add_q_t& qparam,
+                                    act_vec_t row_buf[MAX_FM_W],
+                                    bool& ok) {
+#pragma HLS INLINE off
+  const u16_t stride = conv_effective_stride(cfg);
+  const u16_t out_w = conv_out_dim(cfg.in_w, stride);
+  const int out_w_i = static_cast<int>(out_w.to_uint());
+  for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
+#pragma HLS PIPELINE off
+    if (ow_i >= out_w_i) {
+      break;
+    }
+    act_vec_t other_word = 0;
+    if (!on_chip_memory_read_packed_tile(other,
+                                         static_cast<i32_t>(out_row),
+                                         static_cast<i32_t>(ow_i),
+                                         static_cast<u16_t>(0),
+                                         valid_c,
+                                         other_word)) {
+      ok = false;
+      return;
+    }
+    act_vec_t out_word = 0;
+    for (int lane = 0; lane < TM; ++lane) {
+#pragma HLS UNROLL
+      if (static_cast<unsigned>(lane) < valid_c.to_uint()) {
+        const i8_t a_value = get_act_vec_i8_dynamic(row_buf[ow_i], lane);
+        const i8_t b_value = get_act_vec_i8_dynamic(other_word, lane);
+        const i8_t out_value = add_i8(a_value, b_value, qparam);
+        set_act_vec_i8_dynamic(out_word, lane, out_value);
+      }
+    }
+    row_buf[ow_i] = out_word;
+  }
+}
+
+static bool store_consumer_row(const tensor_desc_t& dst,
+                               u16_t out_row,
+                               u16_t c_offset,
+                               u8_t valid_c,
+                               u16_t store_layout,
+                               const conv_cfg_t& cfg,
+                               act_vec_t row_buf[MAX_FM_W]) {
+#pragma HLS INLINE off
+  conv_cfg_t store_cfg = cfg;
+  store_cfg.out_c = static_cast<u16_t>(valid_c);
+  return store_conv_output_row(dst, out_row, c_offset, store_layout, store_cfg, row_buf);
+}
+
+#ifdef ESP_INT8_CSIM_DUMP_UPSAMPLE_INPUT
+static void csim_dump_upsample_input_row(axi_vec_t* gmem_frame_out,
+                                          u16_t out_row,
+                                          const act_vec_t row_buf[MAX_FM_W]) {
+  for (int ow_i = 0; ow_i < ENCODER_OUT_W; ++ow_i) {
+    const act_vec_t packed = row_buf[ow_i];
+    const unsigned base_byte =
+        (out_row.to_uint() * static_cast<unsigned>(ENCODER_OUT_W) +
+         static_cast<unsigned>(ow_i)) *
+        static_cast<unsigned>(ENCODER_OUT_C);
+    for (int lane = 0; lane < ENCODER_OUT_C; ++lane) {
+      const unsigned byte_idx = base_byte + static_cast<unsigned>(lane);
+      const unsigned word_idx = byte_idx / static_cast<unsigned>(AXI_WORD_BYTES);
+      const unsigned byte_lane = byte_idx % static_cast<unsigned>(AXI_WORD_BYTES);
+      axi_vec_t word = gmem_frame_out[word_idx];
+      word.range(byte_lane * 8 + 7, byte_lane * 8) =
+          packed.range(lane * 8 + 7, lane * 8);
+      gmem_frame_out[word_idx] = word;
+    }
+  }
+}
+#endif
+
+#if !defined(__SYNTHESIS__) && defined(ESP_INT8_CSIM_DUMP_LOWRES_LOGITS_SIDE)
+static unsigned s_csim_lowres_logits_rows = 0;
+
+static bool csim_dump_lowres_logits_row(u16_t out_row,
+                                        const act_vec_t row_buf[MAX_FM_W]) {
+  const unsigned row = out_row.to_uint();
+  const bool first_row = row == 0U || s_csim_lowres_logits_rows == 0U;
+  std::ofstream out("csim_u72_lowres_logits.bin",
+                    std::ios::binary | (first_row ? std::ios::trunc : std::ios::app));
+  if (!out) {
+    std::printf("[CSIM-DUMP] failed to open csim_u72_lowres_logits.bin\n");
+    return false;
+  }
+
+  std::uint8_t bytes[ENCODER_OUT_C];
+  for (unsigned ow = 0; ow < static_cast<unsigned>(ENCODER_OUT_W); ++ow) {
+    const act_vec_t packed = row_buf[ow];
+    for (unsigned lane = 0; lane < static_cast<unsigned>(ENCODER_OUT_C); ++lane) {
+      bytes[lane] = static_cast<std::uint8_t>(packed.range(lane * 8 + 7, lane * 8).to_uint());
+    }
+    out.write(reinterpret_cast<const char*>(bytes),
+              static_cast<std::streamsize>(ENCODER_OUT_C));
+  }
+
+  ++s_csim_lowres_logits_rows;
+  if (row == static_cast<unsigned>(ENCODER_OUT_H - 1)) {
+    std::printf("[CSIM-DUMP] wrote csim_u72_lowres_logits.bin rows=%u shape=%ux%ux%u bytes=%u\n",
+                s_csim_lowres_logits_rows,
+                static_cast<unsigned>(ENCODER_OUT_H),
+                static_cast<unsigned>(ENCODER_OUT_W),
+                static_cast<unsigned>(ENCODER_OUT_C),
+                static_cast<unsigned>(ENCODER_LOGITS_BYTES));
+  }
+  return true;
+}
+#endif
+
+static bool consume_conv_output_row(const row_consumer_desc_t& consumer,
+                                    const tensor_desc_t& dst,
+                                    const tensor_desc_t& add_other,
+                                    bool has_add_other,
+                                    const add_q_t& add_qparam,
+                                    const conv_cfg_t& cfg,
+                                    axi_vec_t* gmem_frame_out,
+                                    u16_t out_row,
+                                    act_vec_t row_buf[MAX_FM_W]) {
+#pragma HLS INLINE off
+  const unsigned mode = consumer.mode.to_uint();
+  const u8_t valid_c =
+      (consumer.valid_c.to_uint() == 0U)
+          ? static_cast<u8_t>(cfg.out_c.to_uint())
+          : static_cast<u8_t>(consumer.valid_c.to_uint());
+
+  if (mode == static_cast<unsigned>(ROW_CONSUMER_UPSAMPLE_OUT)) {
+#if !defined(__SYNTHESIS__) && defined(ESP_INT8_CSIM_DUMP_LOWRES_LOGITS_SIDE)
+    if (!csim_dump_lowres_logits_row(out_row, row_buf)) {
+      return false;
+    }
+#endif
+#ifdef ESP_INT8_CSIM_DUMP_UPSAMPLE_INPUT
+    csim_dump_upsample_input_row(gmem_frame_out, out_row, row_buf);
+#else
+    upsample_fused_consume_logits_row(gmem_frame_out, out_row, row_buf);
+#endif
+    return true;
+  }
+
+  bool ok = true;
+  if (mode == static_cast<unsigned>(ROW_CONSUMER_ADD_STORE) ||
+      mode == static_cast<unsigned>(ROW_CONSUMER_ADD_AFFINE_STORE)) {
+    if (!has_add_other) {
+      return false;
+    }
+    add_other_row_to_buffer(add_other, out_row, cfg, valid_c, add_qparam, row_buf, ok);
+    if (!ok) {
+      return false;
+    }
+  }
+
+  if (mode == static_cast<unsigned>(ROW_CONSUMER_NONE) ||
+      mode == static_cast<unsigned>(ROW_CONSUMER_STORE) ||
+      mode == static_cast<unsigned>(ROW_CONSUMER_ADD_STORE)) {
+    return store_consumer_row(dst,
+                              out_row,
+                              consumer.store_c_offset,
+                              valid_c,
+                              consumer.reserved0,
+                              cfg,
+                              row_buf);
+  }
+
+  return false;
+}
+
+#if !defined(__SYNTHESIS__) && \
+    (defined(ESP_INT8_CSIM_DUMP_DEBUG_SET) || \
+     defined(ESP_INT8_CSIM_DUMP_L2_SET) || \
+     (defined(ESP_INT8_CSIM_DUMP_AFTER_UOP) && defined(ESP_INT8_CSIM_DUMP_TENSOR_ID)))
+
+static std::uint8_t csim_act_byte(const act_vec_t& word, int lane) {
+  return static_cast<std::uint8_t>(word.range(lane * 8 + 7, lane * 8).to_uint());
+}
+
+static bool csim_dump_tensor_named(u8_t tensor_id,
+                                   const char* filename,
+                                   unsigned logical_uop) {
+  tensor_desc_t desc;
+  if (!resolve_tensor_read(tensor_id, desc)) {
+    std::printf("[CSIM-DUMP] failed to resolve tensor=%u at logical_uop=%u file=%s\n",
+                static_cast<unsigned>(tensor_id.to_uint()),
+                logical_uop,
+                filename);
+    return false;
+  }
+
+  std::ofstream out(filename, std::ios::binary);
+  if (!out) {
+    std::printf("[CSIM-DUMP] failed to open %s\n", filename);
+    return false;
+  }
+
+  const unsigned h_count = desc.h.to_uint();
+  const unsigned w_count = desc.w.to_uint();
+  const unsigned c_count = desc.c.to_uint();
+
+  std::uint8_t bytes[TM];
+  for (unsigned h = 0; h < h_count; ++h) {
+    for (unsigned w = 0; w < w_count; ++w) {
+      for (unsigned c = 0; c < c_count; c += static_cast<unsigned>(TM)) {
+        const unsigned remaining = c_count - c;
+        const unsigned lanes =
+            (remaining < static_cast<unsigned>(TM))
+                ? remaining
+                : static_cast<unsigned>(TM);
+
+        act_vec_t packed = 0;
+        if (!on_chip_memory_read_packed_tile(desc,
+                                             static_cast<i32_t>(h),
+                                             static_cast<i32_t>(w),
+                                             static_cast<u16_t>(c),
+                                             static_cast<u8_t>(lanes),
+                                             packed)) {
+          std::printf("[CSIM-DUMP] read failed tensor=%u h=%u w=%u c=%u file=%s\n",
+                      static_cast<unsigned>(tensor_id.to_uint()),
+                      h,
+                      w,
+                      c,
+                      filename);
+          return false;
+        }
+
+        for (unsigned lane = 0; lane < lanes; ++lane) {
+          bytes[lane] = csim_act_byte(packed, static_cast<int>(lane));
+        }
+        out.write(reinterpret_cast<const char*>(bytes),
+                  static_cast<std::streamsize>(lanes));
+      }
+    }
+  }
+
+  std::printf("[CSIM-DUMP] wrote %s tensor=%u after/pre uop=%u shape=%ux%ux%u bytes=%u\n",
+              filename,
+              static_cast<unsigned>(tensor_id.to_uint()),
+              logical_uop,
+              h_count,
+              w_count,
+              c_count,
+              h_count * w_count * c_count);
+  return true;
+}
+
+static bool s_dump_u40 = false;
+static bool s_dump_u53 = false;
+static bool s_dump_pre_u68 = false;
+static bool s_dump_u68 = false;
+static bool s_dump_u70 = false;
+static bool s_dump_u71 = false;
+static bool s_dump_u38 = false;
+static bool s_dump_u39 = false;
+static bool s_dump_l2_u19 = false;
+static bool s_dump_l2_u20 = false;
+static bool s_dump_l2_u21 = false;
+static bool s_dump_l2_u22 = false;
+static bool s_dump_l2_u25 = false;
+static bool s_dump_l2_u28 = false;
+static bool s_dump_l2_u31 = false;
+static bool s_dump_l2_u35 = false;
+
+static bool csim_dump_tensor_set_pre(unsigned logical_uop) {
+#ifdef ESP_INT8_CSIM_DUMP_DEBUG_SET
+  // U67 ADD + U68 AFFINE are fused as EXEC_ADD_AFFINE.
+  // Dump U67 inputs before executing the logical U68 entry.
+  if (logical_uop == 68U && !s_dump_pre_u68) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L3B0_CAT)),
+                                "csim_pre_u68_l3b0_cat.bin",
+                                logical_uop)) {
+      return false;
+    }
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L30_ACT)),
+                                "csim_pre_u68_l30_act.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_pre_u68 = true;
+  }
+#else
+  (void)logical_uop;
+#endif
+  return true;
+}
+
+static bool csim_dump_tensor_set_post(unsigned logical_uop) {
+#if defined(ESP_INT8_CSIM_DUMP_AFTER_UOP) && defined(ESP_INT8_CSIM_DUMP_TENSOR_ID)
+  static bool s_dump_generic = false;
+  if (!s_dump_generic &&
+      logical_uop == static_cast<unsigned>(ESP_INT8_CSIM_DUMP_AFTER_UOP)) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(ESP_INT8_CSIM_DUMP_TENSOR_ID),
+                                "csim_tensor_dump.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_generic = true;
+  }
+#endif
+
+#ifdef ESP_INT8_CSIM_DUMP_DEBUG_SET
+  if (logical_uop == 40U && !s_dump_u40) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(LS_C1)),
+                                "csim_u40_level3_0_c1.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_u40 = true;
+  }
+
+  if (logical_uop == 38U && !s_dump_u38) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_B2_CAT)),
+                                "csim_u38_b2_cat.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_u38 = true;
+  }
+
+  if (logical_uop == 39U && !s_dump_u39) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_B2_ACT)),
+                                "csim_u39_b2_bn.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_u39 = true;
+  }
+
+  if (logical_uop == 53U && !s_dump_u53) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L30_ACT)),
+                                "csim_u53_level3_0_bn.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_u53 = true;
+  }
+
+  if (logical_uop == 68U && !s_dump_u68) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L3B0_ACT)),
+                                "csim_u68_l3b0_act.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_u68 = true;
+  }
+
+  if (logical_uop == 70U && !s_dump_u70) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_B3_CAT)),
+                                "csim_u70_b3_cat.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_u70 = true;
+  }
+
+  if (logical_uop == 71U && !s_dump_u71) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_B3_ACT)),
+                                "csim_u71_b3_bn.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_u71 = true;
+  }
+#endif
+
+#ifdef ESP_INT8_CSIM_DUMP_L2_SET
+  if (logical_uop == 19U && !s_dump_l2_u19) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L20_CAT)),
+                                "csim_l2_u19_l20_cat.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_l2_u19 = true;
+  }
+  if (logical_uop == 20U && !s_dump_l2_u20) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L20_ACT)),
+                                "csim_l2_u20_l20_act.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_l2_u20 = true;
+  }
+  if (logical_uop == 21U && !s_dump_l2_u21) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(LS_C1)),
+                                "csim_l2_u21_l2b0_c1.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_l2_u21 = true;
+  }
+  if (logical_uop == 22U && !s_dump_l2_u22) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L2B0_CAT)),
+                                "csim_l2_u22_l2b0_cat.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_l2_u22 = true;
+  }
+  if (logical_uop == 25U && !s_dump_l2_u25) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L2B0_CAT)),
+                                "csim_l2_u25_l2b0_cat.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_l2_u25 = true;
+  }
+  if (logical_uop == 28U && !s_dump_l2_u28) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L2B0_CAT)),
+                                "csim_l2_u28_l2b0_cat.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_l2_u28 = true;
+  }
+  if (logical_uop == 31U && !s_dump_l2_u31) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L2B0_CAT)),
+                                "csim_l2_u31_l2b0_cat.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_l2_u31 = true;
+  }
+  if (logical_uop == 35U && !s_dump_l2_u35) {
+    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L2B0_ACT)),
+                                "csim_l2_u35_l2b0_act.bin",
+                                logical_uop)) {
+      return false;
+    }
+    s_dump_l2_u35 = true;
+  }
+#endif
+
+  return true;
+}
+
+#else
+
+static bool csim_dump_tensor_set_pre(unsigned) {
+#pragma HLS INLINE
+  return true;
+}
+
+static bool csim_dump_tensor_set_post(unsigned) {
+#pragma HLS INLINE
+  return true;
+}
+
+#endif
+
+#if !defined(__SYNTHESIS__) && defined(ESP_INT8_CSIM_DUMP_U40_PRESTORE)
+static unsigned s_csim_u40_prestore_rows = 0;
+
+static std::uint8_t csim_rowbuf_byte(const act_vec_t& word, int lane) {
+  return static_cast<std::uint8_t>(word.range(lane * 8 + 7, lane * 8).to_uint());
+}
+
+static bool csim_dump_u40_prestore_row(const conv_exec_desc_t& conv_desc,
+                                       u16_t out_row,
+                                       const conv_cfg_t& cfg,
+                                       const act_vec_t row_buf[MAX_FM_W]) {
+  const bool is_u40 =
+      conv_desc.param_id.to_uint() == 13U &&
+      conv_desc.dst_tensor.to_uint() == static_cast<unsigned>(LS_C1);
+  if (!is_u40) {
+    return true;
+  }
+
+  const unsigned row = out_row.to_uint();
+  const bool first_row = row == 0U || s_csim_u40_prestore_rows == 0U;
+  std::ofstream out("csim_u40_prestore_rowbuf.bin",
+                    std::ios::binary | (first_row ? std::ios::trunc : std::ios::app));
+  if (!out) {
+    std::printf("[CSIM-DUMP] failed to open csim_u40_prestore_rowbuf.bin\n");
+    return false;
+  }
+
+  const unsigned out_w = conv_out_dim(cfg.in_w, conv_effective_stride(cfg)).to_uint();
+  const unsigned out_c = cfg.out_c.to_uint();
+  std::uint8_t bytes[TM];
+  for (unsigned ow = 0; ow < out_w; ++ow) {
+    for (unsigned lane = 0; lane < out_c; ++lane) {
+      bytes[lane] = csim_rowbuf_byte(row_buf[ow], static_cast<int>(lane));
+    }
+    out.write(reinterpret_cast<const char*>(bytes),
+              static_cast<std::streamsize>(out_c));
+  }
+
+  ++s_csim_u40_prestore_rows;
+  if (row == conv_out_dim(cfg.in_h, conv_effective_stride(cfg)).to_uint() - 1U) {
+    std::printf("[CSIM-DUMP] wrote csim_u40_prestore_rowbuf.bin rows=%u shape=%ux%ux%u bytes=%u\n",
+                s_csim_u40_prestore_rows,
+                conv_out_dim(cfg.in_h, conv_effective_stride(cfg)).to_uint(),
+                out_w,
+                out_c,
+                conv_out_dim(cfg.in_h, conv_effective_stride(cfg)).to_uint() * out_w * out_c);
+  }
+  return true;
+}
+#else
+static bool csim_dump_u40_prestore_row(const conv_exec_desc_t&,
+                                       u16_t,
+                                       const conv_cfg_t&,
+                                       const act_vec_t[MAX_FM_W]) {
+#pragma HLS INLINE
+  return true;
+}
+#endif
 
 static void execute_conv_stream_datapath(const tensor_desc_t& src,
                                          const tensor_desc_t& dst,
+                                         const tensor_desc_t& add_other,
+                                         bool has_add_other,
                                          const conv_cfg_t& cfg,
-                                         const uop_t& uop,
+                                         const conv_exec_desc_t& conv_desc,
+                                         const window_sched_desc_t& sched,
+                                         const row_consumer_desc_t& consumer,
                                          const conv_q_t& qparam,
+                                         const add_q_t& add_qparam,
                                          axi_vec_t* gmem_frame_out,
-                                         bool emit_fullres_mask,
                                          bool& ok_out) {
 #pragma HLS INLINE off
   act_vec_t row_buf[MAX_FM_W];
@@ -393,8 +949,7 @@ static void execute_conv_stream_datapath(const tensor_desc_t& src,
 
   const u16_t stride = conv_effective_stride(cfg);
   const u16_t out_h = conv_out_dim(cfg.in_h, stride);
-  const u16_t k_total = conv_kernel_flat(cfg);
-  const u16_t k_tiles = ceil_div_u16(k_total, static_cast<u16_t>(TK));
+  const u16_t k_tiles = conv_desc.k_tiles;
   const int out_h_i = static_cast<int>(out_h.to_uint());
   const int k_tiles_i = static_cast<int>(k_tiles.to_uint());
   bool write_ok = true;
@@ -411,13 +966,13 @@ static void execute_conv_stream_datapath(const tensor_desc_t& src,
 #pragma HLS PIPELINE off
         const u16_t oc = static_cast<u16_t>(tm);
         wgt_vec_t word = 0;
-        param_dma_get_weight_vec(uop.param_id, oc, k_tile, cfg, word);
+        param_dma_get_packed_weight_vec(conv_desc, oc, k_tile, word);
         cached_wgts[wi++] = word;
       }
     }
   }
 
-  if (emit_fullres_mask) {
+  if (consumer.mode.to_uint() == static_cast<unsigned>(ROW_CONSUMER_UPSAMPLE_OUT)) {
     upsample_fused_begin();
   }
 
@@ -428,24 +983,33 @@ static void execute_conv_stream_datapath(const tensor_desc_t& src,
     const u16_t oh = static_cast<u16_t>(oh_i);
     execute_conv_stream_row_region(src,
                                    cfg,
-                                   uop,
+                                   conv_desc,
+                                   sched,
+                                   conv_act_type_from_flags(conv_desc.flags),
                                    qparam,
                                    oh,
                                    row_buf,
                                    cached_wgts,
                                    wgt_count);
-    if (emit_fullres_mask) {
-      upsample_fused_consume_logits_row(gmem_frame_out, oh, row_buf);
-    } else {
-      if (!store_conv_output_row(dst, oh, uop.c_offset, cfg, row_buf)) {
-        write_ok = false;
-      }
+    if (!csim_dump_u40_prestore_row(conv_desc, oh, cfg, row_buf)) {
+      write_ok = false;
+    }
+    if (!consume_conv_output_row(consumer,
+                                 dst,
+                                 add_other,
+                                 has_add_other,
+                                 add_qparam,
+                                 cfg,
+                                 gmem_frame_out,
+                                 oh,
+                                 row_buf)) {
+      write_ok = false;
     }
   }
   ok_out = write_ok;
 }
 
-static error_code_t run_p6_pool_op(const uop_t& uop) {
+static error_code_t run_scheduled_pool_op(const uop_t& uop) {
 #pragma HLS INLINE off
   tensor_desc_t src;
   tensor_desc_t dst;
@@ -468,34 +1032,67 @@ static error_code_t run_p6_pool_op(const uop_t& uop) {
   return ERR_NONE;
 }
 
-static error_code_t run_p6_conv_op(const uop_t& uop, axi_vec_t* gmem_frame_out) {
+static error_code_t run_scheduled_conv_op(u8_t desc_id, axi_vec_t* gmem_frame_out) {
 #pragma HLS INLINE off
+  conv_exec_desc_t conv_desc;
+  window_sched_desc_t sched;
+  row_consumer_desc_t consumer;
   tensor_desc_t src;
   tensor_desc_t dst;
+  tensor_desc_t add_other;
   conv_q_t qparam;
+  add_q_t add_qparam = add_q_t();
 #pragma HLS ARRAY_PARTITION variable=qparam.bias complete dim=1
 #pragma HLS ARRAY_PARTITION variable=qparam.mult complete dim=1
 #pragma HLS ARRAY_PARTITION variable=qparam.shift complete dim=1
-  const conv_cfg_t cfg = conv_cfg_from_uop(uop);
-  const u16_t stride = effective_stride(uop);
-  const u16_t out_h = conv_out_dim(uop.in_h, stride);
-  const u16_t out_w = conv_out_dim(uop.in_w, stride);
 
-  select_scratch_region(uop, out_h);
-  if (!resolve_tensor_read(uop.src0_tensor, src)) {
-    return ERR_TENSOR_DESC_RANGE;
-  }
-  if (!param_dma_get_conv_qparam(uop.param_id, qparam)) {
+  if (!param_dma_get_conv_exec_desc(desc_id, conv_desc) ||
+      !param_dma_get_window_sched(conv_desc.window_sched_id, sched) ||
+      !param_dma_get_row_consumer(conv_desc.row_consumer_id, consumer)) {
     return ERR_PARAM_DESC_RANGE;
   }
-  // The exporter emits wide tensors as multiple <=TM conv/store chunks. Keeping
-  // this contract avoids activation-stream rebroadcast and preserves one-pass
-  // producer/consumer matching in the stream datapath.
+
+  const conv_cfg_t cfg = conv_cfg_from_exec_desc(conv_desc);
+  const u16_t stride = conv_effective_stride(cfg);
+  const u16_t out_h = conv_out_dim(cfg.in_h, stride);
+  const u16_t out_w = conv_out_dim(cfg.in_w, stride);
+  uop_t conv_uop;
+  make_conv_uop_from_exec_desc(conv_desc, conv_uop);
+
+  select_scratch_region(conv_uop, out_h);
+  if (!resolve_tensor_read(conv_desc.src_tensor, src)) {
+    return ERR_TENSOR_DESC_RANGE;
+  }
+  if (!param_dma_get_conv_qparam(conv_desc.qparam_id, qparam)) {
+    return ERR_PARAM_DESC_RANGE;
+  }
+
   if (cfg.out_c.to_uint() > static_cast<unsigned>(TM)) {
     return ERR_UNSUPPORTED_OPCODE;
   }
 
-  const bool emit_fullres_mask = uop.dst_tensor.to_uint() == static_cast<unsigned>(TID_OUT);
+  const unsigned consumer_mode = consumer.mode.to_uint();
+  const bool emit_fullres_mask =
+      consumer_mode == static_cast<unsigned>(ROW_CONSUMER_UPSAMPLE_OUT);
+  if (consumer_mode == static_cast<unsigned>(ROW_CONSUMER_NONE)) {
+    consumer.store_dst_tensor = conv_desc.dst_tensor;
+    consumer.store_c_offset = conv_desc.dst_c_offset;
+    consumer.valid_c = conv_desc.valid_c;
+  }
+
+  bool has_add_other = false;
+  if (consumer_mode == static_cast<unsigned>(ROW_CONSUMER_ADD_STORE)) {
+    if (!resolve_tensor_read(consumer.add_other_tensor, add_other)) {
+      return ERR_TENSOR_DESC_RANGE;
+    }
+    if (!param_dma_get_add_qparam(consumer.add_qparam_id, add_qparam)) {
+      return ERR_PARAM_DESC_RANGE;
+    }
+    has_add_other = true;
+  } else if (consumer_mode == static_cast<unsigned>(ROW_CONSUMER_ADD_AFFINE_STORE)) {
+    return ERR_UNSUPPORTED_OPCODE;
+  }
+
   if (emit_fullres_mask) {
     if (cfg.out_c.to_uint() != static_cast<unsigned>(ENCODER_OUT_C) ||
         out_h.to_uint() != static_cast<unsigned>(ENCODER_OUT_H) ||
@@ -504,11 +1101,13 @@ static error_code_t run_p6_conv_op(const uop_t& uop, axi_vec_t* gmem_frame_out) 
     }
     dst = tensor_desc_t();
   } else {
-    if (!resolve_tensor_write(uop.dst_tensor, out_h, out_w, uop.out_c, dst)) {
+    const u16_t dst_required_c =
+        static_cast<u16_t>(consumer.store_c_offset + consumer.valid_c);
+    if (!resolve_tensor_write(consumer.store_dst_tensor, out_h, out_w, dst_required_c, dst)) {
       return ERR_TENSOR_DESC_RANGE;
     }
-    if (tensor_is_global(uop.dst_tensor) &&
-        dst.c.to_uint() < uop.c_offset.to_uint() + uop.out_c.to_uint()) {
+    if (tensor_is_global(consumer.store_dst_tensor) &&
+        dst.c.to_uint() < consumer.store_c_offset.to_uint() + consumer.valid_c.to_uint()) {
       return ERR_TENSOR_DESC_RANGE;
     }
   }
@@ -516,20 +1115,43 @@ static error_code_t run_p6_conv_op(const uop_t& uop, axi_vec_t* gmem_frame_out) 
   bool conv_ok = false;
   execute_conv_stream_datapath(src,
                                dst,
+                               add_other,
+                               has_add_other,
                                cfg,
-                               uop,
+                               conv_desc,
+                               sched,
+                               consumer,
                                qparam,
+                               add_qparam,
                                gmem_frame_out,
-                               emit_fullres_mask,
                                conv_ok);
   if (!conv_ok) {
     return ERR_BANK_OVERFLOW;
   }
 
+  if (!emit_fullres_mask) {
+    if (consumer_mode == static_cast<unsigned>(ROW_CONSUMER_STORE) &&
+        conv_desc.dst_tensor.to_uint() != static_cast<unsigned>(TID_INVALID) &&
+        conv_desc.dst_tensor.to_uint() != consumer.store_dst_tensor.to_uint() &&
+        !alias_tensor_to_slice(conv_desc.dst_tensor,
+                               dst,
+                               consumer.store_c_offset,
+                               consumer.valid_c)) {
+      return ERR_TENSOR_DESC_RANGE;
+    }
+    if (consumer.alias_tensor.to_uint() != static_cast<unsigned>(TID_INVALID) &&
+        !alias_tensor_to_slice(consumer.alias_tensor,
+                               dst,
+                               consumer.store_c_offset,
+                               consumer.valid_c)) {
+      return ERR_TENSOR_DESC_RANGE;
+    }
+  }
+
   return ERR_NONE;
 }
 
-static error_code_t run_p6_affine_op(const uop_t& uop) {
+static error_code_t run_scheduled_affine_op(const uop_t& uop) {
 #pragma HLS INLINE off
   tensor_desc_t src;
   tensor_desc_t dst;
@@ -617,33 +1239,42 @@ static error_code_t run_p6_affine_op(const uop_t& uop) {
   return ERR_NONE;
 }
 
-static error_code_t run_p6_add_op(const uop_t& uop) {
+static error_code_t run_scheduled_add_affine_op(const uop_t& add_uop,
+                                                const uop_t& affine_uop) {
 #pragma HLS INLINE off
-  tensor_desc_t src0;
-  tensor_desc_t src1;
+  tensor_desc_t src_a;
+  tensor_desc_t src_b;
   tensor_desc_t dst;
-  add_q_t qparam;
+  add_q_t add_qparam;
 
-  select_scratch_region(uop, uop.in_h);
-  if (!resolve_tensor_read(uop.src0_tensor, src0) ||
-      !resolve_tensor_read(uop.src1_tensor, src1) ||
-      !resolve_tensor_write(uop.dst_tensor, src0.h, src0.w, src0.c, dst)) {
+  if (add_uop.opcode.to_uint() != static_cast<unsigned>(UOP_ADD) ||
+      affine_uop.opcode.to_uint() != static_cast<unsigned>(UOP_AFFINE) ||
+      add_uop.dst_tensor.to_uint() != affine_uop.src0_tensor.to_uint()) {
+    return ERR_UOP_DECODE;
+  }
+
+  select_scratch_region(affine_uop, affine_uop.in_h);
+  if (!resolve_tensor_read(add_uop.src0_tensor, src_a) ||
+      !resolve_tensor_read(add_uop.src1_tensor, src_b) ||
+      !resolve_tensor_write(affine_uop.dst_tensor, src_a.h, src_a.w, src_a.c, dst)) {
     return ERR_TENSOR_DESC_RANGE;
   }
-  if (!same_tensor_shape(src0, src1) || !same_tensor_shape(src0, dst)) {
+  if (!same_tensor_shape(src_a, src_b) || !same_tensor_shape(src_a, dst)) {
     return ERR_TENSOR_DESC_RANGE;
   }
-  if (!param_dma_get_add_qparam(uop.param_id, qparam)) {
+  if (!param_dma_get_add_qparam(add_uop.param_id, add_qparam)) {
     return ERR_PARAM_DESC_RANGE;
   }
 
-  const u16_t valid_c = (uop.valid_c.to_uint() == 0U) ? src0.c : uop.valid_c;
-  if (valid_c.to_uint() > src0.c.to_uint()) {
+  const u16_t valid_c = (affine_uop.valid_c.to_uint() == 0U) ? src_a.c : affine_uop.valid_c;
+  if (valid_c.to_uint() > src_a.c.to_uint() ||
+      valid_c.to_uint() > src_b.c.to_uint() ||
+      valid_c.to_uint() > dst.c.to_uint()) {
     return ERR_TENSOR_DESC_RANGE;
   }
 
-  const int h_count = static_cast<int>(src0.h.to_uint());
-  const int w_count = static_cast<int>(src0.w.to_uint());
+  const int h_count = static_cast<int>(src_a.h.to_uint());
+  const int w_count = static_cast<int>(src_a.w.to_uint());
   const int c_blocks = static_cast<int>((valid_c.to_uint() + static_cast<unsigned>(TM) - 1U) /
                                         static_cast<unsigned>(TM));
 
@@ -665,52 +1296,64 @@ static error_code_t run_p6_add_op(const uop_t& uop) {
         const u16_t c = static_cast<u16_t>(c_blk * TM);
         const u16_t remaining = static_cast<u16_t>(valid_c - c);
         const u8_t lanes = tensor_lanes(remaining);
+        const u8_t block_id = static_cast<u8_t>(c.to_uint() / static_cast<unsigned>(TM));
+        aff_q_t aff_qparam;
         act_vec_t a_packed = 0;
         act_vec_t b_packed = 0;
         act_vec_t out_packed = 0;
-        const bool full_tile = is_full_tile_lanes(lanes);
-        const bool full_read_a = full_tile && can_use_aligned_full_tile(src0, c);
-        const bool full_read_b = full_tile && can_use_aligned_full_tile(src1, c);
-        const bool full_write = full_tile && can_use_aligned_full_tile(dst, c);
-        const bool read_a_ok = full_read_a
-                                   ? on_chip_memory_read_aligned_full_tile(src0,
-                                                                           static_cast<i32_t>(h),
-                                                                           static_cast<i32_t>(w),
-                                                                           c,
-                                                                           a_packed)
-                                   : on_chip_memory_read_packed_tile(src0,
-                                                                     static_cast<i32_t>(h),
-                                                                     static_cast<i32_t>(w),
-                                                                     c,
-                                                                     lanes,
-                                                                     a_packed);
-        const bool read_b_ok = full_read_b
-                                   ? on_chip_memory_read_aligned_full_tile(src1,
-                                                                           static_cast<i32_t>(h),
-                                                                           static_cast<i32_t>(w),
-                                                                           c,
-                                                                           b_packed)
-                                   : on_chip_memory_read_packed_tile(src1,
-                                                                     static_cast<i32_t>(h),
-                                                                     static_cast<i32_t>(w),
-                                                                     c,
-                                                                     lanes,
-                                                                     b_packed);
+        if (!param_dma_get_affine_qparam(affine_uop.param_id, block_id, aff_qparam)) {
+          return ERR_PARAM_DESC_RANGE;
+        }
+
+        const bool full_a = is_full_tile_lanes(lanes) && can_use_aligned_full_tile(src_a, c);
+        const bool full_b = is_full_tile_lanes(lanes) && can_use_aligned_full_tile(src_b, c);
+        const bool full_write = is_full_tile_lanes(lanes) && can_use_aligned_full_tile(dst, c);
+        const bool read_a_ok =
+            full_a ? on_chip_memory_read_aligned_full_tile(src_a,
+                                                           static_cast<i32_t>(h),
+                                                           static_cast<i32_t>(w),
+                                                           c,
+                                                           a_packed)
+                   : on_chip_memory_read_packed_tile(src_a,
+                                                     static_cast<i32_t>(h),
+                                                     static_cast<i32_t>(w),
+                                                     c,
+                                                     lanes,
+                                                     a_packed);
+        const bool read_b_ok =
+            full_b ? on_chip_memory_read_aligned_full_tile(src_b,
+                                                           static_cast<i32_t>(h),
+                                                           static_cast<i32_t>(w),
+                                                           c,
+                                                           b_packed)
+                   : on_chip_memory_read_packed_tile(src_b,
+                                                     static_cast<i32_t>(h),
+                                                     static_cast<i32_t>(w),
+                                                     c,
+                                                     lanes,
+                                                     b_packed);
         if (!read_a_ok || !read_b_ok) {
           return ERR_BANK_OVERFLOW;
         }
+
         for (int lane = 0; lane < TM; ++lane) {
 #pragma HLS UNROLL
           if (static_cast<unsigned>(lane) < lanes.to_uint()) {
             const i8_t a_value = get_act_vec_i8_dynamic(a_packed, lane);
             const i8_t b_value = get_act_vec_i8_dynamic(b_packed, lane);
-            const i8_t out_value = add_i8(a_value, b_value, qparam);
+            const i8_t added = add_i8(a_value, b_value, add_qparam);
+            const i8_t out_value = affine_i8_to_i8(added,
+                                                   aff_qparam.mul[lane],
+                                                   aff_qparam.bias[lane],
+                                                   aff_qparam.shift[lane],
+                                                   affine_uop.act_type);
             set_act_vec_i8_dynamic(out_packed, lane, out_value);
           }
         }
-        const bool write_ok = full_write
-                                  ? on_chip_memory_write_aligned_full_tile(dst, h, w, c, out_packed)
-                                  : p6_write_tensor_slice_narrow(dst, h, w, c, lanes, out_packed);
+
+        const bool write_ok =
+            full_write ? on_chip_memory_write_aligned_full_tile(dst, h, w, c, out_packed)
+                       : p6_write_tensor_slice_narrow(dst, h, w, c, lanes, out_packed);
         if (!write_ok) {
           return ERR_BANK_OVERFLOW;
         }
@@ -721,7 +1364,87 @@ static error_code_t run_p6_add_op(const uop_t& uop) {
   return ERR_NONE;
 }
 
-static error_code_t run_p6_store_op(const uop_t& uop) {
+static bool same_tensor_hw(const tensor_desc_t& a, const tensor_desc_t& b) {
+#pragma HLS INLINE
+  return a.h.to_uint() == b.h.to_uint() && a.w.to_uint() == b.w.to_uint();
+}
+
+static bool tensor_slice_already_in_place(const tensor_desc_t& src,
+                                          const tensor_desc_t& dst,
+                                          u16_t c_offset,
+                                          u16_t valid_c) {
+#pragma HLS INLINE
+  const unsigned dst_begin = dst.reserved1.to_uint() + c_offset.to_uint();
+  return src.bank_id.to_uint() == dst.bank_id.to_uint() &&
+         src.base_offset.to_uint() == dst.base_offset.to_uint() &&
+         same_tensor_hw(src, dst) &&
+         p6_desc_phys_c(src).to_uint() == p6_desc_phys_c(dst).to_uint() &&
+         src.reserved1.to_uint() == dst_begin &&
+         src.c.to_uint() >= valid_c.to_uint() &&
+         dst.c.to_uint() >= c_offset.to_uint() + valid_c.to_uint();
+}
+
+static bool copy_tensor_slice_fixed(const tensor_desc_t& src,
+                                    const tensor_desc_t& dst,
+                                    u16_t c_offset,
+                                    u16_t valid_c) {
+#pragma HLS INLINE off
+  if (!same_tensor_hw(src, dst) ||
+      valid_c.to_uint() == 0U ||
+      src.c.to_uint() < valid_c.to_uint() ||
+      dst.c.to_uint() < c_offset.to_uint() + valid_c.to_uint()) {
+    return false;
+  }
+  if (tensor_slice_already_in_place(src, dst, c_offset, valid_c)) {
+    return true;
+  }
+
+  const int h_count = static_cast<int>(dst.h.to_uint());
+  const int w_count = static_cast<int>(dst.w.to_uint());
+  const int c_blocks = static_cast<int>((valid_c.to_uint() + static_cast<unsigned>(TM) - 1U) /
+                                        static_cast<unsigned>(TM));
+  for (int h_i = 0; h_i < MAX_FM_H; ++h_i) {
+    if (h_i >= h_count) {
+      break;
+    }
+    const u16_t h = static_cast<u16_t>(h_i);
+    for (int w_i = 0; w_i < MAX_FM_W; ++w_i) {
+      if (w_i >= w_count) {
+        break;
+      }
+      const u16_t w = static_cast<u16_t>(w_i);
+      for (int c_blk = 0; c_blk < MAX_C_TILE_COUNT; ++c_blk) {
+#pragma HLS PIPELINE off
+        if (c_blk >= c_blocks) {
+          break;
+        }
+        const u16_t c = static_cast<u16_t>(c_blk * TM);
+        const u16_t remaining = static_cast<u16_t>(valid_c - c);
+        const u8_t lanes = tensor_lanes(remaining);
+        act_vec_t packed = 0;
+        if (!on_chip_memory_read_packed_tile(src,
+                                             static_cast<i32_t>(h),
+                                             static_cast<i32_t>(w),
+                                             c,
+                                             lanes,
+                                             packed)) {
+          return false;
+        }
+        if (!p6_write_tensor_slice_narrow(dst,
+                                          h,
+                                          w,
+                                          static_cast<u16_t>(c_offset + c),
+                                          lanes,
+                                          packed)) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+static error_code_t run_scheduled_store_op(const uop_t& uop) {
 #pragma HLS INLINE off
   tensor_desc_t src;
   tensor_desc_t dst;
@@ -737,7 +1460,7 @@ static error_code_t run_p6_store_op(const uop_t& uop) {
   }
 
   const u16_t valid_c = (uop.valid_c.to_uint() == 0U) ? src.c : uop.valid_c;
-  if (!concat_writer(src, dst, uop.c_offset, valid_c)) {
+  if (!copy_tensor_slice_fixed(src, dst, uop.c_offset, valid_c)) {
     return ERR_BANK_OVERFLOW;
   }
   return ERR_NONE;
@@ -788,7 +1511,10 @@ static void load_param_header(const axi_vec_t* gmem_param, param_blob_header_t& 
 
 static error_code_t validate_param_header(const param_blob_header_t& header) {
 #pragma HLS INLINE
-  if (header.magic != PARAM_BLOB_MAGIC || header.version != PARAM_BLOB_VERSION) {
+  if (header.magic != PARAM_BLOB_MAGIC) {
+    return ERR_BAD_BLOB;
+  }
+  if (header.version.to_uint() != PARAM_BLOB_VERSION_SCHED) {
     return ERR_BAD_BLOB;
   }
   if (header.uop_count.to_uint() != static_cast<unsigned>(UOP_COUNT_ENCODER)) {
@@ -798,7 +1524,7 @@ static error_code_t validate_param_header(const param_blob_header_t& header) {
       header.scale_desc_count > SCALE_DESC_COUNT_MAX) {
     return ERR_TENSOR_DESC_RANGE;
   }
-  if (header.conv_desc_count > MAX_CONV_PARAM_DESC_COUNT ||
+  if (header.conv_desc_count.to_uint() > MAX_CONV_EXEC_DESC_COUNT ||
       header.affine_desc_count > MAX_AFFINE_PARAM_DESC_COUNT ||
       header.add_desc_count > MAX_ADD_PARAM_DESC_COUNT ||
       header.pool_desc_count > MAX_POOL_PARAM_DESC_COUNT) {
@@ -806,16 +1532,19 @@ static error_code_t validate_param_header(const param_blob_header_t& header) {
   }
   if (!is_aligned_section_offset(header.tensor_desc_offset) ||
       !is_aligned_section_offset(header.scale_desc_offset) ||
-      !is_aligned_section_offset(header.conv_desc_offset) ||
-      !is_aligned_section_offset(header.affine_desc_offset) ||
-      !is_aligned_section_offset(header.add_desc_offset) ||
-      !is_aligned_section_offset(header.pool_desc_offset) ||
       !is_aligned_section_offset(header.uop_offset) ||
       !is_aligned_section_offset(header.weight_data_offset) ||
       !is_aligned_section_offset(header.conv_qparam_offset) ||
       !is_aligned_section_offset(header.affine_qparam_offset) ||
       !is_aligned_section_offset(header.add_qparam_offset) ||
       !is_aligned_section_offset(header.pool_qparam_offset)) {
+    return ERR_PARAM_DESC_RANGE;
+  }
+  if (!is_aligned_section_offset(header.reserved1[0]) ||
+      !is_aligned_section_offset(header.reserved1[1]) ||
+      !is_aligned_section_offset(header.reserved1[2]) ||
+      !is_aligned_section_offset(header.reserved1[3]) ||
+      !is_aligned_section_offset(header.reserved1[5])) {
     return ERR_PARAM_DESC_RANGE;
   }
 
@@ -826,6 +1555,9 @@ static void core_mode_init(const axi_vec_t* gmem_param) {
 #pragma HLS INLINE off
   reset_scratch_state();
   s_param_ready = false;
+#ifndef __SYNTHESIS__
+  s_csim_tensor_dumped = false;
+#endif
 
   load_param_header(gmem_param, s_param_header);
   const error_code_t err = validate_param_header(s_param_header);
@@ -972,88 +1704,31 @@ ESP_INT8_STATIC_UOP(74U, 15, 64, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 
 #undef ESP_INT8_STATIC_UOP
 
-static bool build_p6_static_uop(unsigned uop_id, uop_t& uop) {
+static bool build_legacy_uop_for_fixed_op(unsigned uop_id, uop_t& uop) {
 #pragma HLS INLINE off
   switch (uop_id) {
 #define ESP_INT8_BUILD_CASE(ID) \
     case ID:                    \
       StaticUop<ID>::make(uop); \
       return true
-    ESP_INT8_BUILD_CASE(0U);
     ESP_INT8_BUILD_CASE(1U);
-    ESP_INT8_BUILD_CASE(2U);
     ESP_INT8_BUILD_CASE(3U);
     ESP_INT8_BUILD_CASE(4U);
     ESP_INT8_BUILD_CASE(5U);
     ESP_INT8_BUILD_CASE(6U);
-    ESP_INT8_BUILD_CASE(7U);
-    ESP_INT8_BUILD_CASE(8U);
-    ESP_INT8_BUILD_CASE(9U);
-    ESP_INT8_BUILD_CASE(10U);
-    ESP_INT8_BUILD_CASE(11U);
-    ESP_INT8_BUILD_CASE(12U);
-    ESP_INT8_BUILD_CASE(13U);
-    ESP_INT8_BUILD_CASE(14U);
-    ESP_INT8_BUILD_CASE(15U);
-    ESP_INT8_BUILD_CASE(16U);
-    ESP_INT8_BUILD_CASE(17U);
-    ESP_INT8_BUILD_CASE(18U);
-    ESP_INT8_BUILD_CASE(19U);
     ESP_INT8_BUILD_CASE(20U);
-    ESP_INT8_BUILD_CASE(21U);
-    ESP_INT8_BUILD_CASE(22U);
-    ESP_INT8_BUILD_CASE(23U);
-    ESP_INT8_BUILD_CASE(24U);
-    ESP_INT8_BUILD_CASE(25U);
-    ESP_INT8_BUILD_CASE(26U);
-    ESP_INT8_BUILD_CASE(27U);
-    ESP_INT8_BUILD_CASE(28U);
-    ESP_INT8_BUILD_CASE(29U);
-    ESP_INT8_BUILD_CASE(30U);
-    ESP_INT8_BUILD_CASE(31U);
-    ESP_INT8_BUILD_CASE(32U);
-    ESP_INT8_BUILD_CASE(33U);
     ESP_INT8_BUILD_CASE(34U);
     ESP_INT8_BUILD_CASE(35U);
     ESP_INT8_BUILD_CASE(36U);
     ESP_INT8_BUILD_CASE(37U);
     ESP_INT8_BUILD_CASE(38U);
     ESP_INT8_BUILD_CASE(39U);
-    ESP_INT8_BUILD_CASE(40U);
-    ESP_INT8_BUILD_CASE(41U);
-    ESP_INT8_BUILD_CASE(42U);
-    ESP_INT8_BUILD_CASE(43U);
-    ESP_INT8_BUILD_CASE(44U);
-    ESP_INT8_BUILD_CASE(45U);
-    ESP_INT8_BUILD_CASE(46U);
-    ESP_INT8_BUILD_CASE(47U);
-    ESP_INT8_BUILD_CASE(48U);
-    ESP_INT8_BUILD_CASE(49U);
-    ESP_INT8_BUILD_CASE(50U);
-    ESP_INT8_BUILD_CASE(51U);
-    ESP_INT8_BUILD_CASE(52U);
     ESP_INT8_BUILD_CASE(53U);
-    ESP_INT8_BUILD_CASE(54U);
-    ESP_INT8_BUILD_CASE(55U);
-    ESP_INT8_BUILD_CASE(56U);
-    ESP_INT8_BUILD_CASE(57U);
-    ESP_INT8_BUILD_CASE(58U);
-    ESP_INT8_BUILD_CASE(59U);
-    ESP_INT8_BUILD_CASE(60U);
-    ESP_INT8_BUILD_CASE(61U);
-    ESP_INT8_BUILD_CASE(62U);
-    ESP_INT8_BUILD_CASE(63U);
-    ESP_INT8_BUILD_CASE(64U);
-    ESP_INT8_BUILD_CASE(65U);
-    ESP_INT8_BUILD_CASE(66U);
     ESP_INT8_BUILD_CASE(67U);
     ESP_INT8_BUILD_CASE(68U);
     ESP_INT8_BUILD_CASE(69U);
     ESP_INT8_BUILD_CASE(70U);
     ESP_INT8_BUILD_CASE(71U);
-    ESP_INT8_BUILD_CASE(72U);
-    ESP_INT8_BUILD_CASE(73U);
-    ESP_INT8_BUILD_CASE(74U);
 #undef ESP_INT8_BUILD_CASE
     default:
       uop = uop_t();
@@ -1061,7 +1736,7 @@ static bool build_p6_static_uop(unsigned uop_id, uop_t& uop) {
   }
 }
 
-static bool p6_csim_stop_before(unsigned uop_id) {
+static bool csim_stop_before_logical_uop(unsigned uop_id) {
 #pragma HLS INLINE
 #ifdef ESP_INT8_CSIM_MAX_UOP
   return uop_id > static_cast<unsigned>(ESP_INT8_CSIM_MAX_UOP);
@@ -1070,145 +1745,107 @@ static bool p6_csim_stop_before(unsigned uop_id) {
 #endif
 }
 
-static bool p6_is_fused_conv_store_start(unsigned uop_id) {
-#pragma HLS INLINE
-  return uop_id == 9U || uop_id == 23U || uop_id == 42U || uop_id == 56U;
-}
-
-static bool p6_store_of(const uop_t& store_uop, const uop_t& producer_uop) {
-#pragma HLS INLINE
-  return store_uop.opcode.to_uint() == static_cast<unsigned>(UOP_STORE) &&
-         store_uop.src0_tensor.to_uint() == producer_uop.dst_tensor.to_uint();
-}
-
-static error_code_t prepare_p6_conv_store_fusion(uop_t& conv_uop,
-                                                 const uop_t& store_uop,
-                                                 bool& alias_after_conv,
-                                                 u8_t& alias_tensor,
-                                                 tensor_desc_t& alias_dst) {
+static error_code_t run_scheduled_fixed_op(const exec_plan_entry_t& entry) {
 #pragma HLS INLINE off
-  if (!p6_store_of(store_uop, conv_uop)) {
+  uop_t uop;
+  if (!build_legacy_uop_for_fixed_op(entry.logical_uop_id.to_uint(), uop)) {
     return ERR_UOP_DECODE;
   }
-
-  alias_after_conv = false;
-  alias_tensor = conv_uop.dst_tensor;
-  if (store_uop.dst_tensor.to_uint() == static_cast<unsigned>(TID_INVALID)) {
-    return ERR_NONE;
-  }
-
-  const u16_t stride = effective_stride(conv_uop);
-  const u16_t out_h = conv_out_dim(conv_uop.in_h, stride);
-  const u16_t out_w = conv_out_dim(conv_uop.in_w, stride);
-  tensor_desc_t resolved_dst;
-  if (!resolve_tensor_write(store_uop.dst_tensor,
-                            out_h,
-                            out_w,
-                            static_cast<u16_t>(store_uop.out_c),
-                            resolved_dst)) {
-    return ERR_TENSOR_DESC_RANGE;
-  }
-  if (resolved_dst.c.to_uint() < store_uop.c_offset.to_uint() + conv_uop.out_c.to_uint()) {
-    return ERR_TENSOR_DESC_RANGE;
-  }
-
-  conv_uop.dst_tensor = store_uop.dst_tensor;
-  conv_uop.c_offset = store_uop.c_offset;
-  alias_dst = resolved_dst;
-  alias_after_conv = true;
-  return ERR_NONE;
-}
-
-static error_code_t run_p6_dispatch_uop(const uop_t& uop, axi_vec_t* gmem_frame_out) {
-#pragma HLS INLINE off
-  switch (uop.opcode.to_uint()) {
-    case UOP_NOP:
-    case UOP_LOAD_FM:
-    case UOP_END:
+  switch (entry.kind.to_uint()) {
+    case static_cast<unsigned>(EXEC_POOL):
+      if (uop.opcode.to_uint() != static_cast<unsigned>(UOP_POOL)) {
+        return ERR_UOP_DECODE;
+      }
+      return run_scheduled_pool_op(uop);
+    case static_cast<unsigned>(EXEC_AFFINE):
+      if (uop.opcode.to_uint() != static_cast<unsigned>(UOP_AFFINE)) {
+        return ERR_UOP_DECODE;
+      }
+      return run_scheduled_affine_op(uop);
+    case static_cast<unsigned>(EXEC_ADD_AFFINE): {
+      if (uop.opcode.to_uint() != static_cast<unsigned>(UOP_AFFINE) ||
+          entry.logical_uop_id.to_uint() == 0U) {
+        return ERR_UOP_DECODE;
+      }
+      uop_t add_uop;
+      if (!build_legacy_uop_for_fixed_op(entry.logical_uop_id.to_uint() - 1U, add_uop)) {
+        return ERR_UOP_DECODE;
+      }
+      return run_scheduled_add_affine_op(add_uop, uop);
+    }
+    case static_cast<unsigned>(EXEC_STORE):
+      if (uop.opcode.to_uint() != static_cast<unsigned>(UOP_STORE)) {
+        return ERR_UOP_DECODE;
+      }
+      return run_scheduled_store_op(uop);
+    case static_cast<unsigned>(EXEC_NOP):
       return ERR_NONE;
-    case UOP_POOL:
-      return run_p6_pool_op(uop);
-    case UOP_CONV:
-      return run_p6_conv_op(uop, gmem_frame_out);
-    case UOP_ADD:
-      return run_p6_add_op(uop);
-    case UOP_AFFINE:
-      return run_p6_affine_op(uop);
-    case UOP_STORE:
-      return run_p6_store_op(uop);
     default:
       return ERR_UNSUPPORTED_OPCODE;
   }
 }
 
-static error_code_t run_p6_static_graph(axi_vec_t* gmem_frame_out) {
+static error_code_t run_scheduled_graph(axi_vec_t* gmem_frame_out) {
 #pragma HLS INLINE off
-  // Fixed P6 schedule: UOP 1..6 stem, 7..39 level2, 40..71 level3,
-  // and UOP 72 classifier/full-resolution output. The loop keeps one call
-  // site for each operator datapath so HLS shares hardware instead of cloning
-  // it once per static UOP.
-  for (unsigned uop_id = 1U; uop_id <= 72U; ++uop_id) {
+  for (int pc = 0; pc < MAX_EXEC_PLAN_COUNT; ++pc) {
 #pragma HLS PIPELINE off
+    exec_plan_entry_t entry;
+    if (!param_dma_get_exec_entry(static_cast<u8_t>(pc), entry)) {
+      return ERR_UOP_DECODE;
+    }
+    const unsigned logical_uop = entry.logical_uop_id.to_uint();
 #ifndef __SYNTHESIS__
-    s_csim_last_uop = uop_id;
+    s_csim_last_uop = logical_uop;
 #endif
-    if (p6_csim_stop_before(uop_id)) {
+    if (csim_stop_before_logical_uop(logical_uop)) {
       return ERR_NONE;
     }
 
-    uop_t uop;
-    if (!build_p6_static_uop(uop_id, uop)) {
-      return ERR_UOP_DECODE;
+    const unsigned kind = entry.kind.to_uint();
+    if (kind == static_cast<unsigned>(EXEC_END)) {
+#ifndef __SYNTHESIS__
+      s_csim_last_error = ERR_NONE;
+#endif
+      return ERR_NONE;
     }
 
-    bool skip_next_uop = false;
-    bool alias_after_conv = false;
-    u8_t alias_tensor = static_cast<u8_t>(static_cast<unsigned>(TID_INVALID));
-    tensor_desc_t alias_dst;
-    if (p6_is_fused_conv_store_start(uop_id)) {
-      uop_t store_uop;
-      if (!build_p6_static_uop(uop_id + 1U, store_uop)) {
+    if (!csim_dump_tensor_set_pre(logical_uop)) {
 #ifndef __SYNTHESIS__
-        s_csim_last_error = ERR_UOP_DECODE;
+      s_csim_last_error = ERR_BANK_OVERFLOW;
 #endif
-        return ERR_UOP_DECODE;
-      }
-      const error_code_t prep_err = prepare_p6_conv_store_fusion(uop,
-                                                                 store_uop,
-                                                                 alias_after_conv,
-                                                                 alias_tensor,
-                                                                 alias_dst);
-      if (prep_err != ERR_NONE) {
-#ifndef __SYNTHESIS__
-        s_csim_last_error = prep_err;
-#endif
-        return prep_err;
-      }
-      skip_next_uop = true;
+      return ERR_BANK_OVERFLOW;
     }
 
-    const error_code_t err = run_p6_dispatch_uop(uop, gmem_frame_out);
+    error_code_t err = ERR_NONE;
+    if (kind == static_cast<unsigned>(EXEC_CONV)) {
+      err = run_scheduled_conv_op(entry.desc_id, gmem_frame_out);
+    } else if (kind == static_cast<unsigned>(EXEC_POOL) ||
+               kind == static_cast<unsigned>(EXEC_AFFINE) ||
+               kind == static_cast<unsigned>(EXEC_ADD_AFFINE) ||
+               kind == static_cast<unsigned>(EXEC_STORE) ||
+               kind == static_cast<unsigned>(EXEC_NOP)) {
+      err = run_scheduled_fixed_op(entry);
+    } else {
+      err = ERR_UNSUPPORTED_OPCODE;
+    }
+
     if (err != ERR_NONE) {
 #ifndef __SYNTHESIS__
       s_csim_last_error = err;
 #endif
       return err;
     }
-    if (alias_after_conv &&
-        !alias_tensor_to_slice(alias_tensor, alias_dst, uop.c_offset, uop.out_c)) {
+    if (!csim_dump_tensor_set_post(logical_uop)) {
 #ifndef __SYNTHESIS__
-      s_csim_last_error = ERR_TENSOR_DESC_RANGE;
+      s_csim_last_error = ERR_BANK_OVERFLOW;
 #endif
-      return ERR_TENSOR_DESC_RANGE;
-    }
-    if (skip_next_uop) {
-      ++uop_id;
+      return ERR_BANK_OVERFLOW;
     }
   }
 #ifndef __SYNTHESIS__
-  s_csim_last_error = ERR_NONE;
+  s_csim_last_error = ERR_UOP_DECODE;
 #endif
-  return ERR_NONE;
+  return ERR_UOP_DECODE;
 }
 
 static error_code_t core_mode_run(const axi_vec_t* gmem_frame_in,
@@ -1229,10 +1866,16 @@ static error_code_t core_mode_run(const axi_vec_t* gmem_frame_in,
 #endif
     return ERR_UOP_DECODE;
   }
+  if (!param_dma_is_schedule_blob()) {
+#ifndef __SYNTHESIS__
+    s_csim_last_error = ERR_BAD_BLOB;
+#endif
+    return ERR_BAD_BLOB;
+  }
 
   frame_dma_load(gmem_frame_in);
 
-  const error_code_t err = run_p6_static_graph(gmem_frame_out);
+  const error_code_t err = run_scheduled_graph(gmem_frame_out);
   if (err != ERR_NONE) {
     return err;
   }
@@ -1255,14 +1898,14 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
 #ifdef ESP_INT8_COSIM_LITE
 #pragma HLS INTERFACE ap_memory port=gmem_frame_in depth=49152
 #pragma HLS INTERFACE ap_memory port=gmem_frame_out depth=16384
-#pragma HLS INTERFACE ap_memory port=gmem_param depth=4096
+#pragma HLS INTERFACE ap_memory port=gmem_param depth=8192
 #pragma HLS INTERFACE ap_none port=mode
 #pragma HLS INTERFACE ap_none port=uop_count
 #pragma HLS INTERFACE ap_ctrl_hs port=return
 #else
 #pragma HLS INTERFACE m_axi port=gmem_frame_in offset=slave bundle=gmem0 depth=49152 max_read_burst_length=64 num_read_outstanding=4
 #pragma HLS INTERFACE m_axi port=gmem_frame_out offset=slave bundle=gmem1 depth=16384 max_write_burst_length=64 num_write_outstanding=4
-#pragma HLS INTERFACE m_axi port=gmem_param offset=slave bundle=gmem2 depth=4096 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS INTERFACE m_axi port=gmem_param offset=slave bundle=gmem2 depth=8192 max_read_burst_length=64 num_read_outstanding=4
 #pragma HLS INTERFACE s_axilite port=gmem_frame_in bundle=control
 #pragma HLS INTERFACE s_axilite port=gmem_frame_out bundle=control
 #pragma HLS INTERFACE s_axilite port=gmem_param bundle=control

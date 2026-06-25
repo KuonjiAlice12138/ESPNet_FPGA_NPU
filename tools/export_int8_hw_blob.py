@@ -12,6 +12,7 @@ the current ESP_INT8_hls implementation.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import shutil
@@ -26,7 +27,18 @@ import torch
 
 PARAM_BLOB_MAGIC = 0x544E4945
 PARAM_BLOB_VERSION = 0x00010000
+PARAM_BLOB_VERSION_SCHED = 3
 SECTION_ALIGN = 64
+PARAM_HEADER_WORDS = 32
+PARAM_HEADER_BYTES = PARAM_HEADER_WORDS * 4
+
+TM = 32
+TK = 32
+WBUF_BYTES = 128 * 1024
+MAX_K_TILE_COUNT = 40
+MAX_PACK_CMDS_PER_KT = 9
+MAX_WINDOW_PACK_CMD_COUNT = 2048
+MAX_EXEC_PLAN_COUNT = 96
 
 ACT_NONE = 0
 ACT_RELU = 1
@@ -39,6 +51,56 @@ UOP_ADD = 4
 UOP_AFFINE = 5
 UOP_STORE = 6
 UOP_END = 15
+
+WIN_MODE_INVALID = 0
+WIN_MODE_SMALLC_3X3_STAGED = 1
+WIN_MODE_LARGEC_3X3_SEGMENT = 2
+WIN_MODE_1X1_ALIGNED = 3
+WIN_MODE_1X1_PACKED = 4
+WIN_MODE_FIRST_C3 = 5
+
+PACK_CMD_VALID = 1 << 0
+PACK_CMD_ZERO = 1 << 1
+PACK_CMD_CONTIG_READ = 1 << 2
+PACK_CMD_ALIGNED_READ = 1 << 3
+
+ROW_CONSUMER_NONE = 0
+ROW_CONSUMER_STORE = 1
+ROW_CONSUMER_ADD_STORE = 2
+ROW_CONSUMER_ADD_AFFINE_STORE = 3
+ROW_CONSUMER_UPSAMPLE_OUT = 4
+
+STORE_LAYOUT_NONE = 0
+STORE_LAYOUT_COMPACT_C2 = 1
+STORE_LAYOUT_COMPACT_C12 = 2
+STORE_LAYOUT_COMPACT_C16 = 3
+STORE_LAYOUT_COMPACT_C25 = 4
+STORE_LAYOUT_COMPACT_C28 = 5
+STORE_LAYOUT_C16_INTO_C19 = 6
+STORE_LAYOUT_ALIGNED_TILE_COPY = 7
+STORE_LAYOUT_NARROW_FIXED = 8
+STORE_LAYOUT_COLD_RMW_FALLBACK = 15
+
+STORE_LAYOUT_NAMES = {
+    STORE_LAYOUT_NONE: "NONE",
+    STORE_LAYOUT_COMPACT_C2: "COMPACT_C2",
+    STORE_LAYOUT_COMPACT_C12: "COMPACT_C12",
+    STORE_LAYOUT_COMPACT_C16: "COMPACT_C16",
+    STORE_LAYOUT_COMPACT_C25: "COMPACT_C25",
+    STORE_LAYOUT_COMPACT_C28: "COMPACT_C28",
+    STORE_LAYOUT_C16_INTO_C19: "C16_INTO_C19",
+    STORE_LAYOUT_ALIGNED_TILE_COPY: "ALIGNED_TILE_COPY",
+    STORE_LAYOUT_NARROW_FIXED: "NARROW_FIXED",
+    STORE_LAYOUT_COLD_RMW_FALLBACK: "COLD_RMW_FALLBACK",
+}
+
+EXEC_NOP = 0
+EXEC_CONV = 1
+EXEC_POOL = 2
+EXEC_AFFINE = 3
+EXEC_STORE = 4
+EXEC_ADD_AFFINE = 5
+EXEC_END = 255
 
 FLAG_BIAS_EN = 1 << 0
 FLAG_RELU_EN = 1 << 1
@@ -139,6 +201,87 @@ class Uop:
     qparam_id: int = 0
 
 
+@dataclass(frozen=True)
+class WindowPackCmd:
+    spatial_id: int
+    src_c_begin: int
+    dst_lane_begin: int
+    byte_count: int
+    flags: int = PACK_CMD_VALID | PACK_CMD_CONTIG_READ
+    reserved0: int = 0
+    reserved1: int = 0
+
+
+@dataclass(frozen=True)
+class WindowSchedDesc:
+    mode: int
+    kernel: int
+    stride: int
+    dilation: int
+    in_c: int
+    k_tiles: int
+    cmd_base: int
+    cmd_count: int
+    kt_cmd_base: Tuple[int, ...]
+    flags: int = 0
+
+
+@dataclass(frozen=True)
+class ConvExecDesc:
+    param_id: int
+    qparam_id: int
+    window_sched_id: int
+    row_consumer_id: int
+    in_h: int
+    in_w: int
+    in_c: int
+    out_c: int
+    kernel: int
+    stride: int
+    dilation: int
+    padding: int
+    src_tensor: int
+    dst_tensor: int
+    dst_c_offset: int
+    valid_c: int
+    packed_weight_word_offset: int
+    k_tiles: int
+    weight_words: int
+    flags: int = 0
+    reserved: int = 0
+
+
+@dataclass(frozen=True)
+class RowConsumerDesc:
+    mode: int
+    add_other_tensor: int = TID_INVALID
+    store_dst_tensor: int = TID_INVALID
+    add_qparam_id: int = 0
+    store_c_offset: int = 0
+    valid_c: int = 0
+    alias_tensor: int = TID_INVALID
+    affine_param_id: int = 0
+    affine_block_base: int = 0
+    act_type: int = ACT_NONE
+    reserved0: int = 0
+    reserved1: int = 0
+
+
+@dataclass(frozen=True)
+class ExecPlanEntry:
+    kind: int
+    desc_id: int
+    logical_uop_id: int
+    flags: int = 0
+
+
+@dataclass(frozen=True)
+class PackedConvWeights:
+    words: Tuple[bytes, ...]
+    k_tiles: int
+    active_oc: int
+
+
 TENSORS: List[TensorDesc] = [
     TensorDesc(0, "T_INPUT", BANK_FMEM0, 0x000000, 512, 1024, 3, 3, 0),
     TensorDesc(1, "T_POOL1", BANK_FMEM0, FMBUF_POOL1_BASE, 256, 512, 3, 3, 0),
@@ -226,6 +369,14 @@ POOLS: List[PoolSpec] = [
     PoolSpec(1, "POOL_B2_TMP", "quant", "quant", True),
     PoolSpec(2, "POOL_B2_OUT", "quant", "b2_cat_ff", False),
 ]
+
+# P7 compiler-side names.  Keep the legacy constants above for compatibility
+# with the existing P6 blob path and CSim comparisons.
+TENSOR_PLAN = TENSORS
+CONV_PLAN = CONVS
+AFFINE_PLAN = AFFINES
+ADD_PLAN = ADDS
+POOL_PLAN = POOLS
 
 
 def safe_name(name: str) -> str:
@@ -324,6 +475,90 @@ def pack_uop(uop: Uop) -> bytes:
         0,
         0,
     )
+
+
+def pack_window_pack_cmd(cmd: WindowPackCmd) -> bytes:
+    return struct.pack(
+        "<6BH",
+        cmd.spatial_id,
+        cmd.src_c_begin,
+        cmd.dst_lane_begin,
+        cmd.byte_count,
+        cmd.flags,
+        cmd.reserved0,
+        cmd.reserved1,
+    )
+
+
+def pack_window_sched_desc(desc: WindowSchedDesc) -> bytes:
+    kt_bases = list(desc.kt_cmd_base)
+    if len(kt_bases) > MAX_K_TILE_COUNT + 1:
+        raise ValueError(f"window schedule has too many kt offsets: {len(kt_bases)}")
+    kt_bases += [kt_bases[-1] if kt_bases else 0] * (MAX_K_TILE_COUNT + 1 - len(kt_bases))
+    return (
+        struct.pack(
+            "<4B4H",
+            desc.mode,
+            desc.kernel,
+            desc.stride,
+            desc.dilation,
+            desc.in_c,
+            desc.k_tiles,
+            desc.cmd_base,
+            desc.cmd_count,
+        )
+        + struct.pack("<41H", *kt_bases)
+        + struct.pack("<H", desc.flags)
+    )
+
+
+def pack_conv_exec_desc(desc: ConvExecDesc) -> bytes:
+    return struct.pack(
+        "<4B4H4B2B2HI4H2x",
+        desc.param_id,
+        desc.qparam_id,
+        desc.window_sched_id,
+        desc.row_consumer_id,
+        desc.in_h,
+        desc.in_w,
+        desc.in_c,
+        desc.out_c,
+        desc.kernel,
+        desc.stride,
+        desc.dilation,
+        desc.padding,
+        desc.src_tensor,
+        desc.dst_tensor,
+        desc.dst_c_offset,
+        desc.valid_c,
+        desc.packed_weight_word_offset,
+        desc.k_tiles,
+        desc.weight_words,
+        desc.flags,
+        desc.reserved,
+    )
+
+
+def pack_row_consumer_desc(desc: RowConsumerDesc) -> bytes:
+    return struct.pack(
+        "<4B2H4B2H",
+        desc.mode,
+        desc.add_other_tensor,
+        desc.store_dst_tensor,
+        desc.add_qparam_id,
+        desc.store_c_offset,
+        desc.valid_c,
+        desc.alias_tensor,
+        desc.affine_param_id,
+        desc.affine_block_base,
+        desc.act_type,
+        desc.reserved0,
+        desc.reserved1,
+    )
+
+
+def pack_exec_plan_entry(entry: ExecPlanEntry) -> bytes:
+    return struct.pack("<4B", entry.kind, entry.desc_id, entry.logical_uop_id, entry.flags)
 
 
 def pack_conv_qparam(bias: Sequence[int], mult: Sequence[int], shift: Sequence[int]) -> bytes:
@@ -474,6 +709,258 @@ def require_int8_array(path: Path) -> np.ndarray:
     if arr.min() < -128 or arr.max() > 127:
         raise ValueError(f"{path} contains values outside int8 range")
     return arr.astype(np.int8, copy=False)
+
+
+def linear_k_to_spatial_c(k: int, in_c: int, kernel: int) -> Tuple[int, int, int, int]:
+    if in_c <= 0 or kernel not in (1, 3):
+        raise ValueError(f"unsupported K layout: in_c={in_c}, kernel={kernel}")
+    spatial = k // in_c
+    cin = k % in_c
+    kh = spatial // kernel
+    kw = spatial % kernel
+    return spatial, kh, kw, cin
+
+
+TENSOR_DESC_BY_ID: Dict[int, TensorDesc] = {desc.tensor_id: desc for desc in TENSORS}
+
+
+def tensor_desc_supports_aligned_1x1_read(desc: TensorDesc) -> bool:
+    return (
+        desc.phys_c >= TK
+        and desc.phys_c % TK == 0
+        and (desc.base_offset + desc.c_offset) % TK == 0
+    )
+
+
+def tensor_supports_aligned_1x1_read(tensor_id: int) -> bool:
+    desc = TENSOR_DESC_BY_ID.get(tensor_id)
+    return False if desc is None else tensor_desc_supports_aligned_1x1_read(desc)
+
+
+def tensor_is_scratch_id(tensor_id: int) -> bool:
+    return tensor_id in (LS_C1, LS_A, LS_B, LS_TMP)
+
+
+def scratch_index(tensor_id: int) -> int:
+    return {LS_C1: 0, LS_A: 1, LS_B: 2, LS_TMP: 3}[tensor_id]
+
+
+def conv_out_dim(size: int, stride: int) -> int:
+    eff_stride = 1 if stride == 0 else stride
+    return (size + eff_stride - 1) // eff_stride
+
+
+def scratch_desc_for_conv_store(tensor_id: int, producer: Uop, valid_c: int) -> TensorDesc:
+    idx = scratch_index(tensor_id)
+    pid = producer.param_id
+    if 1 <= pid <= 6:
+        if idx == 0:
+            phys_c, c_offset = valid_c, 0
+        else:
+            phys_c, c_offset = FMBUF_L20_PHYS_C, (idx - 1) * 16
+    elif 7 <= pid <= 12:
+        phys_c, c_offset = valid_c, 0
+    elif 13 <= pid <= 18:
+        phys_c, c_offset = valid_c, 0
+    elif 19 <= pid <= 24:
+        phys_c, c_offset = 256, idx * 32
+    else:
+        phys_c, c_offset = valid_c, 0
+    return TensorDesc(
+        tensor_id=tensor_id,
+        name=f"scratch_{tensor_id:02x}",
+        bank_id=BANK_FMEM0,
+        base_offset=0,
+        h=conv_out_dim(producer.in_h, producer.stride),
+        w=conv_out_dim(producer.in_w, producer.stride),
+        c=valid_c,
+        phys_c=phys_c,
+        c_offset=c_offset,
+    )
+
+
+def resolve_compile_time_store_desc(dst_tensor: int, producer: Uop, valid_c: int) -> TensorDesc:
+    if tensor_is_scratch_id(dst_tensor):
+        return scratch_desc_for_conv_store(dst_tensor, producer, valid_c)
+    desc = TENSOR_DESC_BY_ID.get(dst_tensor)
+    if desc is None:
+        raise ValueError(f"store layout references unknown tensor id {dst_tensor}")
+    return desc
+
+
+def store_layout_for(
+    *,
+    dst_tensor: int,
+    producer: Uop,
+    c_offset: int,
+    valid_c: int,
+    out_w: int,
+) -> int:
+    if dst_tensor == TID_INVALID:
+        return STORE_LAYOUT_NONE
+    desc = resolve_compile_time_store_desc(dst_tensor, producer, valid_c)
+    if valid_c <= 0 or valid_c > TM:
+        raise ValueError(
+            f"store layout only supports row-buffer slices with 1..{TM} channels, "
+            f"got tensor={dst_tensor} valid_c={valid_c}"
+        )
+
+    compact_full_row = c_offset == 0 and desc.c == valid_c and desc.phys_c == desc.c
+    if compact_full_row:
+        if valid_c == 2 and out_w % 16 == 0:
+            return STORE_LAYOUT_COMPACT_C2
+        if valid_c == 12 and out_w % 8 == 0:
+            return STORE_LAYOUT_COMPACT_C12
+        if valid_c == 16 and out_w % 2 == 0:
+            return STORE_LAYOUT_COMPACT_C16
+        if valid_c == 25 and out_w % 32 == 0:
+            return STORE_LAYOUT_COMPACT_C25
+        if valid_c == 28 and out_w % 8 == 0:
+            return STORE_LAYOUT_COMPACT_C28
+
+    if c_offset == 0 and valid_c == 16 and desc.c == 19 and desc.phys_c == 19 and out_w % 32 == 0:
+        return STORE_LAYOUT_C16_INTO_C19
+
+    start_c = desc.c_offset + c_offset
+    if valid_c == TM and desc.phys_c % TM == 0 and start_c % TM == 0:
+        return STORE_LAYOUT_ALIGNED_TILE_COPY
+    if valid_c <= TM:
+        return STORE_LAYOUT_NARROW_FIXED
+    return STORE_LAYOUT_COLD_RMW_FALLBACK
+
+
+def window_mode_for(in_c: int, kernel: int, aligned_1x1_source: bool = True) -> int:
+    if kernel == 1:
+        return WIN_MODE_1X1_ALIGNED if in_c % TK == 0 and aligned_1x1_source else WIN_MODE_1X1_PACKED
+    if kernel != 3:
+        raise ValueError(f"unsupported kernel size: {kernel}")
+    if in_c == 3:
+        return WIN_MODE_FIRST_C3
+    if in_c <= 32:
+        return WIN_MODE_SMALLC_3X3_STAGED
+    return WIN_MODE_LARGEC_3X3_SEGMENT
+
+
+def make_window_pack_schedule(
+    in_c: int,
+    kernel: int,
+    tk: int = TK,
+    mode: Optional[int] = None,
+) -> Tuple[WindowSchedDesc, List[WindowPackCmd]]:
+    k_total = kernel * kernel * in_c
+    k_tiles = math.ceil(k_total / tk)
+    if k_tiles > MAX_K_TILE_COUNT:
+        raise ValueError(f"k_tiles={k_tiles} exceeds MAX_K_TILE_COUNT={MAX_K_TILE_COUNT}")
+
+    commands: List[WindowPackCmd] = []
+    kt_cmd_base: List[int] = []
+    for kt in range(k_tiles):
+        kt_cmd_base.append(len(commands))
+        k = kt * tk
+        kt_end = min(k + tk, k_total)
+        while k < kt_end:
+            spatial, _kh, _kw, cin = linear_k_to_spatial_c(k, in_c, kernel)
+            dst_lane = k - kt * tk
+            count = min(kt_end - k, in_c - cin, tk - dst_lane)
+            if count <= 0:
+                raise AssertionError("zero-length window pack command")
+            commands.append(
+                WindowPackCmd(
+                    spatial_id=spatial,
+                    src_c_begin=cin,
+                    dst_lane_begin=dst_lane,
+                    byte_count=count,
+                    flags=PACK_CMD_VALID | PACK_CMD_CONTIG_READ,
+                )
+            )
+            k += count
+        if len(commands) - kt_cmd_base[-1] > MAX_PACK_CMDS_PER_KT:
+            raise ValueError(
+                f"in_c={in_c} kernel={kernel} kt={kt} uses "
+                f"{len(commands) - kt_cmd_base[-1]} commands, max={MAX_PACK_CMDS_PER_KT}"
+            )
+    kt_cmd_base.append(len(commands))
+
+    desc = WindowSchedDesc(
+        mode=window_mode_for(in_c, kernel) if mode is None else mode,
+        kernel=kernel,
+        stride=0,
+        dilation=0,
+        in_c=in_c,
+        k_tiles=k_tiles,
+        cmd_base=0,
+        cmd_count=len(commands),
+        kt_cmd_base=tuple(kt_cmd_base),
+    )
+    return desc, commands
+
+
+def pack_single_conv_weights(weight: np.ndarray, out_c: int, in_c: int, kernel: int) -> PackedConvWeights:
+    if weight.shape[:2] != (out_c, in_c) or weight.shape[2:] != (kernel, kernel):
+        raise ValueError(
+            f"weight shape {weight.shape} does not match out_c={out_c}, in_c={in_c}, kernel={kernel}"
+        )
+    k_total = kernel * kernel * in_c
+    k_tiles = math.ceil(k_total / TK)
+    words: List[bytes] = []
+    for oc in range(out_c):
+        for kt in range(k_tiles):
+            word = bytearray(TK)
+            for lane in range(TK):
+                k = kt * TK + lane
+                if k < k_total:
+                    _spatial, kh, kw, cin = linear_k_to_spatial_c(k, in_c, kernel)
+                    word[lane] = int(weight[oc, cin, kh, kw]) & 0xFF
+            words.append(bytes(word))
+    return PackedConvWeights(tuple(words), k_tiles=k_tiles, active_oc=out_c)
+
+
+def build_packed_weight_section(artifact_dir: Path, warnings: List[str]) -> Tuple[bytearray, Dict[int, int], List[dict]]:
+    weight_blob = bytearray()
+    word_offsets: Dict[int, int] = {}
+    report: List[dict] = []
+
+    for spec in CONV_PLAN:
+        layer_dir = artifact_dir / "layers" / safe_name(spec.name)
+        weight = require_int8_array(layer_dir / "weight_int8.npy")
+        out_c, in_c, kh, kw = weight.shape
+        if out_c != spec.out_c or kh != kw or kh not in (1, 3):
+            raise ValueError(f"{spec.name}: unsupported weight shape {weight.shape}, spec out_c={spec.out_c}")
+
+        zp_path = layer_dir / "weight_zero_points.npy"
+        if zp_path.exists():
+            zps = np.load(zp_path).reshape(-1)
+            non_zero = sorted({int(x) for x in zps.tolist() if int(x) != 0})
+            if non_zero:
+                warnings.append(
+                    f"{spec.name}: exported weight_zero_points has non-zero entries {non_zero}; "
+                    "weight_int8.npy is still treated as symmetric signed INT8."
+                )
+
+        pad_to(weight_blob)
+        word_offsets[spec.param_id] = len(weight_blob) // TK
+        packed = pack_single_conv_weights(weight, out_c=out_c, in_c=in_c, kernel=kh)
+        for word in packed.words:
+            if len(word) != TK:
+                raise AssertionError("packed weight word is not 32 bytes")
+            weight_blob.extend(word)
+        report.append(
+            {
+                "param_id": spec.param_id,
+                "name": spec.name,
+                "shape_oihw": [int(x) for x in weight.shape],
+                "packed_word_offset": word_offsets[spec.param_id],
+                "packed_words": len(packed.words),
+                "k_tiles": packed.k_tiles,
+                "active_oc": packed.active_oc,
+                "layout": "active_oc_major_then_kt; invalid tm lanes are implicit zero in HLS",
+            }
+        )
+
+    pad_to(weight_blob)
+    if len(weight_blob) > WBUF_BYTES:
+        raise ValueError(f"packed weights use {len(weight_blob)} bytes, WBUF_BYTES={WBUF_BYTES}")
+    return weight_blob, word_offsets, report
 
 
 def build_weight_section(artifact_dir: Path, warnings: List[str]) -> Tuple[bytearray, Dict[int, int]]:
@@ -819,6 +1306,254 @@ def build_uops() -> List[Uop]:
     return uops
 
 
+def build_window_schedule_sections(uops: Sequence[Uop]) -> Tuple[List[WindowSchedDesc], List[WindowPackCmd], Dict[int, int], List[dict]]:
+    schedules: List[WindowSchedDesc] = []
+    commands: List[WindowPackCmd] = []
+    schedule_ids_by_param: Dict[int, int] = {}
+    cache: Dict[Tuple[int, int, int], int] = {}
+
+    for uop in uops:
+        if uop.opcode != UOP_CONV:
+            continue
+        source_aligned = tensor_supports_aligned_1x1_read(uop.src0)
+        mode = window_mode_for(uop.in_c, uop.kernel, source_aligned)
+        key = (uop.kernel, uop.in_c, mode)
+        if key not in cache:
+            local_desc, local_cmds = make_window_pack_schedule(uop.in_c, uop.kernel, mode=mode)
+            if len(commands) + len(local_cmds) > MAX_WINDOW_PACK_CMD_COUNT:
+                raise ValueError("window_pack_cmd_count exceeds MAX_WINDOW_PACK_CMD_COUNT")
+            global_desc = WindowSchedDesc(
+                mode=local_desc.mode,
+                kernel=local_desc.kernel,
+                stride=0,
+                dilation=0,
+                in_c=local_desc.in_c,
+                k_tiles=local_desc.k_tiles,
+                cmd_base=len(commands),
+                cmd_count=len(local_cmds),
+                kt_cmd_base=local_desc.kt_cmd_base,
+                flags=0,
+            )
+            cache[key] = len(schedules)
+            schedules.append(global_desc)
+            commands.extend(local_cmds)
+        schedule_ids_by_param[uop.param_id] = cache[key]
+
+    audit = []
+    for idx, desc in enumerate(schedules):
+        cmds_per_kt = [
+            desc.kt_cmd_base[kt + 1] - desc.kt_cmd_base[kt]
+            for kt in range(desc.k_tiles)
+        ]
+        byte_count_by_kt = [
+            sum(commands[desc.cmd_base + j].byte_count for j in range(desc.kt_cmd_base[kt], desc.kt_cmd_base[kt + 1]))
+            for kt in range(desc.k_tiles)
+        ]
+        lane_level_suspected = desc.cmd_count >= desc.k_tiles * 16 or sum(
+            1 for j in range(desc.cmd_base, desc.cmd_base + desc.cmd_count)
+            if commands[j].byte_count == 1
+        ) > desc.k_tiles * 8
+        audit.append(
+            {
+                "id": idx,
+                "key": [desc.kernel, desc.in_c, desc.mode],
+                "k_tiles": desc.k_tiles,
+                "cmd_base": desc.cmd_base,
+                "cmd_count": desc.cmd_count,
+                "cmds_per_kt": cmds_per_kt,
+                "bytes_per_kt": byte_count_by_kt,
+                "lane_level_suspected": lane_level_suspected,
+            }
+        )
+    return schedules, commands, schedule_ids_by_param, audit
+
+
+def _uop_is_store_of(uop: Uop, src: int) -> bool:
+    return uop.opcode == UOP_STORE and uop.src0 == src
+
+
+def _uop_is_add_of(uop: Uop, src: int) -> bool:
+    return uop.opcode == UOP_ADD and (uop.src0 == src or uop.src1 == src)
+
+
+def build_exec_plan_sections(
+    uops: Sequence[Uop],
+    schedule_ids_by_param: Dict[int, int],
+    packed_weight_word_offsets: Dict[int, int],
+    weight_report: Sequence[dict],
+) -> Tuple[List[ConvExecDesc], List[RowConsumerDesc], List[ExecPlanEntry], dict]:
+    weight_words_by_param = {int(x["param_id"]): int(x["packed_words"]) for x in weight_report}
+    k_tiles_by_param = {int(x["param_id"]): int(x["k_tiles"]) for x in weight_report}
+    conv_exec_descs: List[ConvExecDesc] = []
+    row_consumers: List[RowConsumerDesc] = []
+    exec_plan: List[ExecPlanEntry] = []
+    skipped: set[int] = set()
+
+    add_total = sum(1 for u in uops if u.opcode == UOP_ADD)
+    store_total = sum(1 for u in uops if u.opcode == UOP_STORE)
+    affine_total = sum(1 for u in uops if u.opcode == UOP_AFFINE)
+    add_fused = 0
+    store_as_row_consumer = 0
+    standalone_store_fixed = 0
+    affine_fused = 0
+    standalone_affine = 0
+
+    for idx, uop in enumerate(uops):
+        if idx in skipped or uop.opcode in (UOP_LOAD_FM, UOP_NOP):
+            continue
+        if uop.opcode == UOP_END:
+            break
+
+        if uop.opcode == UOP_CONV:
+            out_w = conv_out_dim(uop.in_w, uop.stride)
+            row_consumer = RowConsumerDesc(
+                mode=ROW_CONSUMER_NONE,
+                store_dst_tensor=uop.dst,
+                store_c_offset=uop.c_offset,
+                valid_c=uop.valid_c,
+                reserved0=store_layout_for(
+                    dst_tensor=uop.dst,
+                    producer=uop,
+                    c_offset=uop.c_offset,
+                    valid_c=uop.valid_c,
+                    out_w=out_w,
+                ),
+            )
+            if idx + 1 < len(uops) and _uop_is_store_of(uops[idx + 1], uop.dst):
+                store = uops[idx + 1]
+                mode = ROW_CONSUMER_UPSAMPLE_OUT if store.dst == TID_INVALID else ROW_CONSUMER_STORE
+                layout = (
+                    STORE_LAYOUT_NONE
+                    if mode == ROW_CONSUMER_UPSAMPLE_OUT
+                    else store_layout_for(
+                        dst_tensor=store.dst,
+                        producer=uop,
+                        c_offset=store.c_offset,
+                        valid_c=store.valid_c,
+                        out_w=out_w,
+                    )
+                )
+                row_consumer = RowConsumerDesc(
+                    mode=mode,
+                    store_dst_tensor=store.dst,
+                    store_c_offset=store.c_offset,
+                    valid_c=store.valid_c,
+                    alias_tensor=(uop.dst if mode == ROW_CONSUMER_STORE and uop.dst != store.dst else TID_INVALID),
+                    reserved0=layout,
+                )
+                skipped.add(idx + 1)
+                store_as_row_consumer += 1
+            elif (
+                idx + 2 < len(uops)
+                and _uop_is_add_of(uops[idx + 1], uop.dst)
+                and _uop_is_store_of(uops[idx + 2], uops[idx + 1].dst)
+            ):
+                add = uops[idx + 1]
+                store = uops[idx + 2]
+                other = add.src1 if add.src0 == uop.dst else add.src0
+                row_consumer = RowConsumerDesc(
+                    mode=ROW_CONSUMER_ADD_STORE,
+                    add_other_tensor=other,
+                    store_dst_tensor=store.dst,
+                    add_qparam_id=add.param_id,
+                    store_c_offset=store.c_offset,
+                    valid_c=store.valid_c,
+                    alias_tensor=(add.dst if add.dst != store.dst else TID_INVALID),
+                    reserved0=store_layout_for(
+                        dst_tensor=store.dst,
+                        producer=uop,
+                        c_offset=store.c_offset,
+                        valid_c=store.valid_c,
+                        out_w=out_w,
+                    ),
+                )
+                skipped.update({idx + 1, idx + 2})
+                add_fused += 1
+                store_as_row_consumer += 1
+
+            row_id = len(row_consumers)
+            row_consumers.append(row_consumer)
+            conv_id = len(conv_exec_descs)
+            conv_exec_descs.append(
+                ConvExecDesc(
+                    param_id=uop.param_id,
+                    qparam_id=uop.qparam_id if uop.qparam_id else uop.param_id,
+                    window_sched_id=schedule_ids_by_param[uop.param_id],
+                    row_consumer_id=row_id,
+                    in_h=uop.in_h,
+                    in_w=uop.in_w,
+                    in_c=uop.in_c,
+                    out_c=uop.out_c,
+                    kernel=uop.kernel,
+                    stride=uop.stride,
+                    dilation=uop.dilation,
+                    padding=uop.padding,
+                    src_tensor=uop.src0,
+                    dst_tensor=uop.dst,
+                    dst_c_offset=uop.c_offset,
+                    valid_c=uop.valid_c,
+                    packed_weight_word_offset=packed_weight_word_offsets[uop.param_id],
+                    k_tiles=k_tiles_by_param[uop.param_id],
+                    weight_words=weight_words_by_param[uop.param_id],
+                    flags=uop.flags,
+                )
+            )
+            exec_plan.append(ExecPlanEntry(EXEC_CONV, conv_id, idx, 0))
+            continue
+
+        if uop.opcode == UOP_POOL:
+            exec_plan.append(ExecPlanEntry(EXEC_POOL, uop.param_id, idx, uop.flags))
+            continue
+
+        if uop.opcode == UOP_AFFINE:
+            standalone_affine += 1
+            exec_plan.append(ExecPlanEntry(EXEC_AFFINE, uop.param_id, idx, uop.flags))
+            continue
+
+        if uop.opcode == UOP_STORE:
+            standalone_store_fixed += 1
+            exec_plan.append(ExecPlanEntry(EXEC_STORE, idx, idx, uop.flags))
+            continue
+
+        if uop.opcode == UOP_ADD:
+            if idx + 1 < len(uops) and uops[idx + 1].opcode == UOP_AFFINE and uops[idx + 1].src0 == uop.dst:
+                affine = uops[idx + 1]
+                exec_plan.append(ExecPlanEntry(EXEC_ADD_AFFINE, affine.param_id, idx + 1, affine.flags))
+                skipped.add(idx + 1)
+                add_fused += 1
+                affine_fused += 1
+                continue
+            raise ValueError(f"standalone ADD uop[{idx}] is not covered by P7 fusion plan")
+
+        raise ValueError(f"unsupported logical uop[{idx}] opcode={uop.opcode}")
+
+    exec_plan.append(ExecPlanEntry(EXEC_END, 0, len(uops) - 1, 0))
+    if len(exec_plan) > MAX_EXEC_PLAN_COUNT:
+        raise ValueError(f"exec_plan_count={len(exec_plan)} exceeds MAX_EXEC_PLAN_COUNT={MAX_EXEC_PLAN_COUNT}")
+    coverage = {
+        "legacy_uop_count": len(uops),
+        "exec_entry_count": len(exec_plan),
+        "conv_count": len(conv_exec_descs),
+        "add_total": add_total,
+        "add_fused": add_fused,
+        "standalone_add": add_total - add_fused,
+        "store_total": store_total,
+        "store_as_row_consumer": store_as_row_consumer,
+        "standalone_store_fixed": standalone_store_fixed,
+        "standalone_concat": 0,
+        "affine_total": affine_total,
+        "affine_fused": affine_fused,
+        "standalone_affine": standalone_affine,
+        "store_layouts": {
+            STORE_LAYOUT_NAMES.get(layout, str(layout)): sum(1 for rc in row_consumers if rc.reserved0 == layout)
+            for layout in sorted({rc.reserved0 for rc in row_consumers})
+        },
+    }
+    if coverage["standalone_add"] != 0:
+        raise ValueError(f"ADD fusion incomplete: {coverage}")
+    return conv_exec_descs, row_consumers, exec_plan, coverage
+
+
 def build_hw_frame_files(artifact_dir: Path, out_dir: Path) -> Dict[str, object]:
     golden_dir = artifact_dir / "golden_sample"
     input_nchw = require_int8_array(golden_dir / "quant" / "input_int.npy")
@@ -835,7 +1570,9 @@ def build_hw_frame_files(artifact_dir: Path, out_dir: Path) -> Dict[str, object]
     np.save(out_dir / "input_q_nhwc.npy", input_nhwc)
     np.save(out_dir / "golden_output_q_nhwc.npy", output_nhwc)
     input_nhwc.tofile(out_dir / "input_q.bin")
+    input_nhwc.tofile(out_dir / "INPUTQ.BIN")
     output_nhwc.tofile(out_dir / "golden_output_q.bin")
+    output_nhwc.tofile(out_dir / "expected_output_q.bin")
 
     fp32_src = golden_dir / "model_output_fp32.npy"
     target_src = golden_dir / "target.npy"
@@ -855,7 +1592,281 @@ def build_hw_frame_files(artifact_dir: Path, out_dir: Path) -> Dict[str, object]
     }
 
 
-def build_blob(args: argparse.Namespace) -> dict:
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_param_audit(
+    *,
+    qparams: Dict[str, Tuple[float, int, str]],
+    scale_names: Sequence[str],
+    section_offsets: Dict[str, int],
+    section_sizes: Dict[str, int],
+    window_audit: Sequence[dict],
+    weight_report: Sequence[dict],
+    fusion_coverage: dict,
+    warnings: Sequence[str],
+) -> dict:
+    required_smallc = {
+        (3, uop.in_c)
+        for uop in build_uops()
+        if uop.opcode == UOP_CONV and uop.kernel == 3 and 3 < uop.in_c <= 32
+    }
+    present = {(int(x["key"][0]), int(x["key"][1])) for x in window_audit}
+    missing = sorted(list(required_smallc - present))
+    if missing:
+        raise ValueError(f"missing required small-C window schedules: {missing}")
+    if any(x["lane_level_suspected"] for x in window_audit):
+        raise ValueError("lane-level window schedule suspected; refusing PARAM v3 export")
+    if fusion_coverage["add_fused"] != fusion_coverage["add_total"]:
+        raise ValueError(f"ADD fusion incomplete: {fusion_coverage}")
+    store_layouts = fusion_coverage.get("store_layouts", {})
+    if store_layouts.get(STORE_LAYOUT_NAMES[STORE_LAYOUT_COLD_RMW_FALLBACK], 0):
+        raise ValueError(f"S5 hot path selected cold RMW fallback: {store_layouts}")
+
+    scale_report = [
+        {
+            "scale_id": idx,
+            "name": name,
+            "scale": qparams[name][0],
+            "zero_point": qparams[name][1],
+            "source": qparams[name][2],
+        }
+        for idx, name in enumerate(scale_names)
+    ]
+    return {
+        "format": "ESP_INT8_PARAM_AUDIT_V3",
+        "param_version": PARAM_BLOB_VERSION_SCHED,
+        "section_offsets": section_offsets,
+        "section_sizes": section_sizes,
+        "scale_table": scale_report,
+        "window_schedules": list(window_audit),
+        "window_pack_cmd_count": sum(int(x["cmd_count"]) for x in window_audit),
+        "window_pack_cmd_bytes": sum(int(x["cmd_count"]) for x in window_audit) * 8,
+        "packed_weights": {
+            "total_bytes": sum(int(x["packed_words"]) for x in weight_report) * TK,
+            "wbuf_bytes": WBUF_BYTES,
+            "layers": list(weight_report),
+        },
+        "fusion_coverage": fusion_coverage,
+        "hard_checks": {
+            "required_smallc_schedules_present": True,
+            "no_lane_level_window_schedule": True,
+            "all_adds_fused": True,
+            "no_standalone_concat": fusion_coverage["standalone_concat"] == 0,
+            "packed_weight_fits_wbuf": sum(int(x["packed_words"]) for x in weight_report) * TK <= WBUF_BYTES,
+            "store_layouts_scheduled": bool(store_layouts),
+            "no_store_cold_rmw_fallback": store_layouts.get(STORE_LAYOUT_NAMES[STORE_LAYOUT_COLD_RMW_FALLBACK], 0) == 0,
+        },
+        "warnings": list(warnings),
+    }
+
+
+def build_blob_v3(args: argparse.Namespace) -> dict:
+    artifact_dir = Path(args.artifact_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    warnings: List[str] = []
+
+    qparams = collect_activation_qparams(artifact_dir)
+    scale_names, scale_ids = build_scale_table(qparams)
+    for name in scale_names:
+        scale, zp, source = qparams[name]
+        if zp != 0:
+            warnings.append(
+                f"{name}: activation zero_point={zp} from {source}; P7 hardware expects symmetric activations."
+            )
+
+    state = torch.load(artifact_dir / "fake_quant_state_dict.pth", map_location="cpu")
+    packed_weight_blob, packed_weight_word_offsets, weight_report = build_packed_weight_section(artifact_dir, warnings)
+    conv_q_blob, conv_q_local_offsets, conv_report = build_conv_qparams(artifact_dir, state, qparams)
+    affine_q_blob, affine_q_local_offsets, affine_report = build_affine_qparams(state, qparams)
+    add_q_blob, add_q_local_offsets, add_report = build_add_qparams(qparams, scale_ids, warnings)
+    pool_q_blob, pool_q_local_offsets, pool_report = build_pool_qparams(qparams, scale_ids)
+
+    uops = build_uops()
+    window_scheds, window_cmds, schedule_ids_by_param, window_audit = build_window_schedule_sections(uops)
+    conv_exec_descs, row_consumers, exec_plan, fusion_coverage = build_exec_plan_sections(
+        uops,
+        schedule_ids_by_param,
+        packed_weight_word_offsets,
+        weight_report,
+    )
+
+    tensor_desc_data = b"".join(pack_tensor_desc(desc) for desc in TENSOR_PLAN)
+    scale_desc_data = b"".join(pack_scale_desc(qparams[name][0]) for name in scale_names)
+    conv_exec_data = b"".join(pack_conv_exec_desc(desc) for desc in conv_exec_descs)
+    window_sched_data = b"".join(pack_window_sched_desc(desc) for desc in window_scheds)
+    window_cmd_data = b"".join(pack_window_pack_cmd(cmd) for cmd in window_cmds)
+    row_consumer_data = b"".join(pack_row_consumer_desc(desc) for desc in row_consumers)
+    exec_plan_data = b"".join(pack_exec_plan_entry(entry) for entry in exec_plan)
+    uop_data = b"".join(pack_uop(uop) for uop in uops)
+
+    section_data = {
+        "tensor_desc": tensor_desc_data,
+        "scale_desc": scale_desc_data,
+        "conv_exec_desc": conv_exec_data,
+        "window_sched_desc": window_sched_data,
+        "window_pack_cmd": window_cmd_data,
+        "row_consumer_desc": row_consumer_data,
+        "exec_plan": exec_plan_data,
+        "weight_packed": packed_weight_blob,
+        "conv_qparam": conv_q_blob,
+        "affine_qparam": affine_q_blob,
+        "add_qparam": add_q_blob,
+        "pool_qparam": pool_q_blob,
+        "legacy_uop_debug": uop_data,
+    }
+
+    offsets: Dict[str, int] = {}
+    cursor = PARAM_HEADER_BYTES
+    for name, data in section_data.items():
+        cursor = align_up(cursor)
+        offsets[name] = cursor
+        cursor += len(data)
+
+    section_sizes = {"header": PARAM_HEADER_BYTES, **{name: len(data) for name, data in section_data.items()}}
+    header_words = [
+        PARAM_BLOB_MAGIC,
+        PARAM_BLOB_VERSION_SCHED,
+        len(TENSOR_PLAN),
+        len(scale_names),
+        len(conv_exec_descs),
+        len(AFFINE_PLAN),
+        len(ADD_PLAN),
+        len(POOL_PLAN),
+        len(uops),
+        len(exec_plan),
+        offsets["tensor_desc"],
+        offsets["scale_desc"],
+        0,
+        0,
+        0,
+        0,
+        offsets["legacy_uop_debug"],
+        offsets["weight_packed"],
+        offsets["conv_qparam"],
+        offsets["affine_qparam"],
+        offsets["add_qparam"],
+        offsets["pool_qparam"],
+        offsets["conv_exec_desc"],
+        offsets["window_sched_desc"],
+        offsets["window_pack_cmd"],
+        offsets["row_consumer_desc"],
+        0,
+        offsets["exec_plan"],
+        len(window_scheds),
+        len(window_cmds),
+        len(conv_exec_descs),
+        len(row_consumers),
+    ]
+
+    blob = bytearray(struct.pack("<32I", *header_words))
+
+    def append_section(name: str, data: bytes) -> None:
+        if len(blob) > offsets[name]:
+            raise AssertionError(f"Section overlap before {name}")
+        blob.extend(b"\x00" * (offsets[name] - len(blob)))
+        blob.extend(data)
+
+    for name, data in section_data.items():
+        append_section(name, data)
+    pad_to(blob)
+
+    audit = build_param_audit(
+        qparams=qparams,
+        scale_names=scale_names,
+        section_offsets=offsets,
+        section_sizes=section_sizes,
+        window_audit=window_audit,
+        weight_report=weight_report,
+        fusion_coverage=fusion_coverage,
+        warnings=warnings,
+    )
+
+    blob_path = out_dir / "param_blob.bin"
+    blob_path.write_bytes(blob)
+    shutil.copy2(blob_path, out_dir / "PARAM.BIN")
+    (out_dir / "uop_table.bin").write_bytes(uop_data)
+    (out_dir / "tensor_desc_table.bin").write_bytes(tensor_desc_data)
+    (out_dir / "exec_plan.bin").write_bytes(exec_plan_data)
+    (out_dir / "window_pack_cmd.bin").write_bytes(window_cmd_data)
+
+    frame_report = build_hw_frame_files(artifact_dir, out_dir)
+
+    scale_report = audit["scale_table"]
+    (out_dir / "scale_table.json").write_text(
+        json.dumps(scale_report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    audit["param_blob"] = {
+        "file": "PARAM.BIN",
+        "param_blob_file": "param_blob.bin",
+        "bytes": len(blob),
+        "sha256": sha256_file(blob_path),
+    }
+    (out_dir / "param_audit.json").write_text(
+        json.dumps(audit, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    manifest = {
+        "format": "ESP_INT8_HW_ARTIFACT_SINGLE_V3",
+        "artifact_dir": str(artifact_dir),
+        "param_blob": str(blob_path),
+        "param_bin": str(out_dir / "PARAM.BIN"),
+        "param_blob_bytes": len(blob),
+        "param_blob_sha256": audit["param_blob"]["sha256"],
+        "param_version": PARAM_BLOB_VERSION_SCHED,
+        "hardware_contract": {
+            "memory_layout": "shared_fmbuf_compact_l20_view_20260511",
+            "schedule": "P7_PARAM_V3_EXEC_PLAN",
+            "weight_layout": "SA-ready packed weight words: oc-local TM lane, kt K-tile",
+            "window_schedule": "segment-level K tile pack commands, not per-lane/per-pixel absolute addresses",
+            "board_input": "NHWC signed int8, 512x1024x3",
+            "board_output": "full-res uint8 mask for P7 fullres hardware, or low-res logits debug files",
+        },
+        "uop_count": len(uops),
+        "exec_entry_count": len(exec_plan),
+        "tensor_desc_count": len(TENSOR_PLAN),
+        "scale_desc_count": len(scale_names),
+        "conv_exec_desc_count": len(conv_exec_descs),
+        "window_sched_count": len(window_scheds),
+        "window_pack_cmd_count": len(window_cmds),
+        "row_consumer_desc_count": len(row_consumers),
+        "section_offsets": offsets,
+        "section_sizes": section_sizes,
+        "frame_data": frame_report,
+        "conv_qparams": conv_report,
+        "affine_qparams": affine_report,
+        "add_qparams": add_report,
+        "pool_qparams": pool_report,
+        "fusion_coverage": fusion_coverage,
+        "warnings": warnings,
+        "param_audit": str(out_dir / "param_audit.json"),
+    }
+    (out_dir / "export_manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (out_dir / "single_manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    if args.strict_zp and warnings:
+        raise RuntimeError("Strict zero-point/alignment mode failed; see export_manifest.json warnings.")
+    if args.strict_schedule:
+        parse_and_check_blob_v3(blob_path, audit)
+    return manifest
+
+
+def build_blob_v1(args: argparse.Namespace) -> dict:
     artifact_dir = Path(args.artifact_dir)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1120,6 +2131,176 @@ def parse_and_check_blob(path: Path) -> None:
             raise ValueError(f"uop[{idx}] mismatch: got={got}, expected={expected}")
 
 
+def parse_and_check_blob_v3(path: Path, audit: dict | None = None) -> None:
+    data = path.read_bytes()
+    if len(data) < PARAM_HEADER_BYTES:
+        raise ValueError("PARAM v3 blob is shorter than header")
+    header = struct.unpack("<32I", data[:PARAM_HEADER_BYTES])
+    if header[0] != PARAM_BLOB_MAGIC or header[1] != PARAM_BLOB_VERSION_SCHED:
+        raise ValueError(f"bad PARAM v3 magic/version: magic=0x{header[0]:08x} version={header[1]}")
+
+    counts = {
+        "tensor_desc_count": header[2],
+        "scale_desc_count": header[3],
+        "conv_exec_desc_count": header[4],
+        "legacy_uop_count": header[8],
+        "exec_entry_count": header[9],
+        "window_sched_count": header[28],
+        "window_pack_cmd_count": header[29],
+        "row_consumer_desc_count": header[31],
+    }
+    if counts["tensor_desc_count"] != len(TENSOR_PLAN):
+        raise ValueError(f"unexpected tensor count: {counts['tensor_desc_count']}")
+    if counts["legacy_uop_count"] != 75:
+        raise ValueError(f"unexpected legacy uop count: {counts['legacy_uop_count']}")
+    if counts["conv_exec_desc_count"] != len(CONV_PLAN):
+        raise ValueError(f"unexpected conv exec count: {counts['conv_exec_desc_count']}")
+
+    offsets = {
+        "tensor_desc": header[10],
+        "scale_desc": header[11],
+        "legacy_uop_debug": header[16],
+        "weight_packed": header[17],
+        "conv_qparam": header[18],
+        "affine_qparam": header[19],
+        "add_qparam": header[20],
+        "pool_qparam": header[21],
+        "conv_exec_desc": header[22],
+        "window_sched_desc": header[23],
+        "window_pack_cmd": header[24],
+        "row_consumer_desc": header[25],
+        "exec_plan": header[27],
+    }
+    for name, off in offsets.items():
+        if off % SECTION_ALIGN != 0:
+            raise ValueError(f"{name} offset is not {SECTION_ALIGN}B-aligned: {off}")
+        if off >= len(data):
+            raise ValueError(f"{name} offset out of range: {off} >= {len(data)}")
+    sorted_offsets = sorted(offsets.items(), key=lambda x: x[1])
+    for (name_a, off_a), (name_b, off_b) in zip(sorted_offsets, sorted_offsets[1:]):
+        if off_a > off_b:
+            raise ValueError(f"section order is not monotonic: {name_a}->{name_b}")
+
+    tensor_descs: List[TensorDesc] = []
+    tensor_off = offsets["tensor_desc"]
+    for tid in range(counts["tensor_desc_count"]):
+        off = tensor_off + tid * 16
+        bank_id, _layout_tag, phys_c, base_offset, h, w, c, c_offset = struct.unpack(
+            "<BBHIHHHH", data[off : off + 16]
+        )
+        tensor_descs.append(
+            TensorDesc(
+                tensor_id=tid,
+                name=f"tensor_{tid}",
+                bank_id=bank_id,
+                base_offset=base_offset,
+                h=h,
+                w=w,
+                c=c,
+                phys_c=phys_c,
+                c_offset=c_offset,
+            )
+        )
+
+    exec_off = offsets["exec_plan"]
+    exec_count = counts["exec_entry_count"]
+    if exec_count == 0 or exec_count > MAX_EXEC_PLAN_COUNT:
+        raise ValueError(f"invalid exec_entry_count={exec_count}")
+    last = struct.unpack("<4B", data[exec_off + (exec_count - 1) * 4 : exec_off + exec_count * 4])
+    if last[0] != EXEC_END:
+        raise ValueError(f"exec_plan last entry is not EXEC_END: {last}")
+    for i in range(exec_count):
+        kind = data[exec_off + i * 4]
+        if kind not in (EXEC_CONV, EXEC_POOL, EXEC_AFFINE, EXEC_STORE, EXEC_ADD_AFFINE, EXEC_END):
+            raise ValueError(f"unsupported exec_plan[{i}] kind={kind}")
+
+    cmd_count = counts["window_pack_cmd_count"]
+    sched_count = counts["window_sched_count"]
+    sched_off = offsets["window_sched_desc"]
+    schedule_modes: List[int] = []
+    for sid in range(sched_count):
+        off = sched_off + sid * 96
+        fields = struct.unpack("<4B4H", data[off : off + 12])
+        mode, kernel, _stride, _dilation, in_c, k_tiles, cmd_base, cmd_len = fields
+        schedule_modes.append(mode)
+        if mode == WIN_MODE_INVALID or kernel not in (1, 3) or in_c == 0:
+            raise ValueError(f"bad window schedule[{sid}] header: {fields}")
+        if k_tiles > MAX_K_TILE_COUNT:
+            raise ValueError(f"window schedule[{sid}] k_tiles={k_tiles} exceeds max")
+        if cmd_base + cmd_len > cmd_count:
+            raise ValueError(f"window schedule[{sid}] command range out of bounds")
+
+    row_consumer_off = offsets["row_consumer_desc"]
+    row_consumer_count = counts["row_consumer_desc_count"]
+    row_consumer_modes: List[int] = []
+    row_consumer_layouts: List[int] = []
+    valid_store_layouts = set(STORE_LAYOUT_NAMES.keys())
+    for rid in range(row_consumer_count):
+        off = row_consumer_off + rid * 16
+        mode = data[off]
+        layout = struct.unpack("<H", data[off + 12 : off + 14])[0]
+        row_consumer_modes.append(mode)
+        row_consumer_layouts.append(layout)
+        if mode == ROW_CONSUMER_UPSAMPLE_OUT:
+            if layout != STORE_LAYOUT_NONE:
+                raise ValueError(f"row_consumer[{rid}] upsample must use STORE_LAYOUT_NONE, got {layout}")
+            continue
+        if mode in (ROW_CONSUMER_NONE, ROW_CONSUMER_STORE, ROW_CONSUMER_ADD_STORE):
+            if layout == STORE_LAYOUT_NONE:
+                raise ValueError(f"row_consumer[{rid}] mode={mode} is missing scheduled store layout")
+            if layout not in valid_store_layouts:
+                raise ValueError(f"row_consumer[{rid}] has unknown store layout={layout}")
+            if layout == STORE_LAYOUT_COLD_RMW_FALLBACK:
+                raise ValueError(f"row_consumer[{rid}] selected cold RMW fallback in hot path")
+        else:
+            raise ValueError(f"row_consumer[{rid}] unsupported mode={mode}")
+
+    conv_off = offsets["conv_exec_desc"]
+    weight_words = (offsets["conv_qparam"] - offsets["weight_packed"]) // TK
+    for cid in range(counts["conv_exec_desc_count"]):
+        off = conv_off + cid * 36
+        fields = struct.unpack("<4B4H4B2B2HI4H2x", data[off : off + 36])
+        param_id = fields[0]
+        window_sched_id = fields[2]
+        row_consumer_id = fields[3]
+        in_c = fields[6]
+        kernel = fields[8]
+        src_tensor = fields[12]
+        packed_weight_word_offset = fields[16]
+        weight_word_count = fields[18]
+        if param_id >= len(CONV_PLAN):
+            raise ValueError(f"conv_exec[{cid}] bad param_id={param_id}")
+        if window_sched_id >= sched_count:
+            raise ValueError(f"conv_exec[{cid}] bad window_sched_id={window_sched_id}")
+        if row_consumer_id >= row_consumer_count:
+            raise ValueError(f"conv_exec[{cid}] bad row_consumer_id={row_consumer_id}")
+        if kernel == 1 and schedule_modes[window_sched_id] == WIN_MODE_1X1_ALIGNED:
+            if src_tensor >= len(tensor_descs):
+                raise ValueError(f"conv_exec[{cid}] bad src_tensor={src_tensor}")
+            src_desc = tensor_descs[src_tensor]
+            if in_c % TK != 0 or not tensor_desc_supports_aligned_1x1_read(src_desc):
+                raise ValueError(
+                    "conv_exec[{}] selects WIN_MODE_1X1_ALIGNED for non-aligned source "
+                    "tensor={} phys_c={} c_offset={} base=0x{:x} in_c={}".format(
+                        cid,
+                        src_tensor,
+                        src_desc.phys_c,
+                        src_desc.c_offset,
+                        src_desc.base_offset,
+                        in_c,
+                    )
+                )
+        if packed_weight_word_offset + weight_word_count > weight_words:
+            raise ValueError(f"conv_exec[{cid}] packed weight range exceeds WBUF section")
+
+    if audit is not None:
+        coverage = audit.get("fusion_coverage", {})
+        if coverage.get("add_fused") != coverage.get("add_total"):
+            raise ValueError(f"audit ADD fusion incomplete: {coverage}")
+        if not audit.get("hard_checks", {}).get("packed_weight_fits_wbuf", False):
+            raise ValueError("audit reports packed weight WBUF overflow")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1129,22 +2310,41 @@ def main() -> None:
     )
     parser.add_argument(
         "--out-dir",
-        default=r"D:\ESP_INT8\hw_artifacts\hw_constrained_qat_3ep_single",
+        default=r"D:\ESP_INT8\hw_artifacts\sched_v3_single",
         help="Hardware-facing output directory.",
+    )
+    parser.add_argument(
+        "--param-version",
+        type=int,
+        choices=(1, 3),
+        default=3,
+        help="1 exports the legacy P6 blob; 3 exports the P7 schedule blob.",
     )
     parser.add_argument(
         "--strict-zp",
         action="store_true",
         help="Fail if non-zero activation zp or bypass scale mismatches are detected.",
     )
+    parser.add_argument(
+        "--strict-schedule",
+        action="store_true",
+        help="Fail if PARAM v3 schedule, weight packing, or fusion audit is incomplete.",
+    )
     args = parser.parse_args()
 
-    manifest = build_blob(args)
-    parse_and_check_blob(Path(manifest["param_blob"]))
+    if args.param_version == 1:
+        manifest = build_blob_v1(args)
+        parse_and_check_blob(Path(manifest["param_blob"]))
+    else:
+        manifest = build_blob_v3(args)
+        parse_and_check_blob_v3(Path(manifest["param_blob"]), load_json(Path(args.out_dir) / "param_audit.json"))
 
     print(f"Exported param blob: {manifest['param_blob']}")
     print(f"Output directory: {args.out_dir}")
+    print(f"PARAM version: {manifest.get('param_version', PARAM_BLOB_VERSION)}")
     print(f"UOP count: {manifest['uop_count']}")
+    if "exec_entry_count" in manifest:
+        print(f"Exec entries: {manifest['exec_entry_count']}")
     print(f"Warnings: {len(manifest['warnings'])}")
     for warning in manifest["warnings"][:8]:
         print(f"  - {warning}")

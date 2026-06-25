@@ -1,22 +1,26 @@
 #include "../include/npu_config.hpp"
+#include "../include/npu_schedule.hpp"
 #include "../include/npu_uop.hpp"
 
 namespace esp_int8 {
 
 static param_blob_header_t s_header;
 static tensor_desc_t s_tensor_desc[MAX_TENSOR_DESC_COUNT];
-static conv_param_desc_t s_conv_desc[MAX_CONV_PARAM_DESC_COUNT];
-static affine_param_desc_t s_affine_desc[MAX_AFFINE_PARAM_DESC_COUNT];
-static add_param_desc_t s_add_desc[MAX_ADD_PARAM_DESC_COUNT];
-static pool_param_desc_t s_pool_desc[MAX_POOL_PARAM_DESC_COUNT];
 static conv_qparam_t s_conv_qparam[MAX_CONV_PARAM_DESC_COUNT];
 static affine_qparam_t s_affine_qparam[MAX_AFFINE_PARAM_DESC_COUNT][8];
 static u8_t s_affine_qparam_count[MAX_AFFINE_PARAM_DESC_COUNT];
 static add_qparam_t s_add_qparam[MAX_ADD_PARAM_DESC_COUNT];
 static pool_qparam_t s_pool_qparam[MAX_POOL_PARAM_DESC_COUNT];
+static conv_exec_desc_t s_conv_exec_desc[MAX_CONV_EXEC_DESC_COUNT];
+static window_sched_desc_t s_window_sched_desc[MAX_WINDOW_SCHED_COUNT];
+static window_pack_cmd_t s_window_pack_cmd[MAX_WINDOW_PACK_CMD_COUNT];
+static row_consumer_desc_t s_row_consumer_desc[MAX_ROW_CONSUMER_DESC_COUNT];
+static exec_plan_entry_t s_exec_plan[MAX_EXEC_PLAN_COUNT];
 static u32_t s_weight_bytes = 0;
 
 static bool s_ready = false;
+
+static const unsigned k_v3_affine_blocks[MAX_AFFINE_PARAM_DESC_COUNT] = {1, 2, 2, 5, 4, 4, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
 static axi_vec_t* get_wbuf() {
 #pragma HLS INLINE
@@ -57,14 +61,71 @@ static i32_t read_i32_le(const axi_vec_t* gmem_param, u32_t byte_offset) {
     return value;
 }
 
+static i32_t word_i32_le(axi_vec_t word, int lane32) {
+#pragma HLS INLINE
+    i32_t value;
+    value.range(31, 0) = word.range(lane32 * 32 + 31, lane32 * 32);
+    return value;
+}
+
+static u8_t word_u8(axi_vec_t word, int lane8) {
+#pragma HLS INLINE
+    return word.range(lane8 * 8 + 7, lane8 * 8);
+}
+
 static bool is_aligned64(u32_t offset) {
 #pragma HLS INLINE
     return (offset & (SECTION_ALIGNMENT_BYTES - 1)) == 0;
 }
 
-static u16_t effective_kernel(const conv_cfg_t& cfg) {
+static bool param_blob_is_v3() {
 #pragma HLS INLINE
-    return (cfg.kernel == 1) ? static_cast<u16_t>(1) : static_cast<u16_t>(3);
+    return s_header.version.to_uint() == PARAM_BLOB_VERSION_SCHED;
+}
+
+static u32_t v3_exec_entry_count(const param_blob_header_t& header) {
+#pragma HLS INLINE
+    return header.reserved0;
+}
+
+static u32_t v3_conv_exec_offset(const param_blob_header_t& header) {
+#pragma HLS INLINE
+    return header.reserved1[0];
+}
+
+static u32_t v3_window_sched_offset(const param_blob_header_t& header) {
+#pragma HLS INLINE
+    return header.reserved1[1];
+}
+
+static u32_t v3_window_pack_cmd_offset(const param_blob_header_t& header) {
+#pragma HLS INLINE
+    return header.reserved1[2];
+}
+
+static u32_t v3_row_consumer_offset(const param_blob_header_t& header) {
+#pragma HLS INLINE
+    return header.reserved1[3];
+}
+
+static u32_t v3_exec_plan_offset(const param_blob_header_t& header) {
+#pragma HLS INLINE
+    return header.reserved1[5];
+}
+
+static u32_t v3_window_sched_count(const param_blob_header_t& header) {
+#pragma HLS INLINE
+    return header.reserved1[6];
+}
+
+static u32_t v3_window_pack_cmd_count(const param_blob_header_t& header) {
+#pragma HLS INLINE
+    return header.reserved1[7];
+}
+
+static u32_t v3_row_consumer_count(const param_blob_header_t& header) {
+#pragma HLS INLINE
+    return header.reserved1[9];
 }
 
 static void load_header(const axi_vec_t* gmem_param, param_blob_header_t& header) {
@@ -100,7 +161,10 @@ static void load_header(const axi_vec_t* gmem_param, param_blob_header_t& header
 
 static error_code_t validate_header(const param_blob_header_t& header) {
 #pragma HLS INLINE
-    if (header.magic != PARAM_BLOB_MAGIC || header.version != PARAM_BLOB_VERSION) {
+    if (header.magic != PARAM_BLOB_MAGIC) {
+        return ERR_BAD_BLOB;
+    }
+    if (header.version.to_uint() != PARAM_BLOB_VERSION_SCHED) {
         return ERR_BAD_BLOB;
     }
     if (header.uop_count.to_uint() != static_cast<unsigned>(UOP_COUNT_ENCODER)) {
@@ -110,18 +174,25 @@ static error_code_t validate_header(const param_blob_header_t& header) {
         header.scale_desc_count > SCALE_DESC_COUNT_MAX) {
         return ERR_TENSOR_DESC_RANGE;
     }
-    if (header.conv_desc_count > MAX_CONV_PARAM_DESC_COUNT ||
+    if (header.conv_desc_count > MAX_CONV_EXEC_DESC_COUNT ||
         header.affine_desc_count > MAX_AFFINE_PARAM_DESC_COUNT ||
         header.add_desc_count > MAX_ADD_PARAM_DESC_COUNT ||
-        header.pool_desc_count > MAX_POOL_PARAM_DESC_COUNT) {
+        header.pool_desc_count > MAX_POOL_PARAM_DESC_COUNT ||
+        v3_window_sched_count(header) > MAX_WINDOW_SCHED_COUNT ||
+        v3_window_pack_cmd_count(header) > MAX_WINDOW_PACK_CMD_COUNT ||
+        v3_row_consumer_count(header) > MAX_ROW_CONSUMER_DESC_COUNT ||
+        v3_exec_entry_count(header) > MAX_EXEC_PLAN_COUNT) {
+        return ERR_PARAM_DESC_RANGE;
+    }
+    if (!is_aligned64(v3_conv_exec_offset(header)) ||
+        !is_aligned64(v3_window_sched_offset(header)) ||
+        !is_aligned64(v3_window_pack_cmd_offset(header)) ||
+        !is_aligned64(v3_row_consumer_offset(header)) ||
+        !is_aligned64(v3_exec_plan_offset(header))) {
         return ERR_PARAM_DESC_RANGE;
     }
     if (!is_aligned64(header.tensor_desc_offset) ||
         !is_aligned64(header.scale_desc_offset) ||
-        !is_aligned64(header.conv_desc_offset) ||
-        !is_aligned64(header.affine_desc_offset) ||
-        !is_aligned64(header.add_desc_offset) ||
-        !is_aligned64(header.pool_desc_offset) ||
         !is_aligned64(header.uop_offset) ||
         !is_aligned64(header.weight_data_offset) ||
         !is_aligned64(header.conv_qparam_offset) ||
@@ -147,66 +218,66 @@ static tensor_desc_t load_tensor_desc(const axi_vec_t* gmem_param, u32_t offset)
     return desc;
 }
 
-static conv_param_desc_t load_conv_desc(const axi_vec_t* gmem_param, u32_t offset) {
-#pragma HLS INLINE
-    conv_param_desc_t desc;
-    desc.weight_offset = read_u32_le(gmem_param, offset + 0);
-    desc.bias_offset = read_u32_le(gmem_param, offset + 4);
-    desc.requant_offset = read_u32_le(gmem_param, offset + 8);
-    desc.reserved = read_u32_le(gmem_param, offset + 12);
-    return desc;
-}
-
-static affine_param_desc_t load_affine_desc(const axi_vec_t* gmem_param, u32_t offset) {
-#pragma HLS INLINE
-    affine_param_desc_t desc;
-    desc.affine_offset = read_u32_le(gmem_param, offset + 0);
-    desc.reserved0 = read_u32_le(gmem_param, offset + 4);
-    desc.reserved1 = read_u32_le(gmem_param, offset + 8);
-    desc.reserved2 = read_u32_le(gmem_param, offset + 12);
-    return desc;
-}
-
-static add_param_desc_t load_add_desc(const axi_vec_t* gmem_param, u32_t offset) {
-#pragma HLS INLINE
-    add_param_desc_t desc;
-    desc.add_offset = read_u32_le(gmem_param, offset + 0);
-    desc.reserved0 = read_u32_le(gmem_param, offset + 4);
-    desc.reserved1 = read_u32_le(gmem_param, offset + 8);
-    desc.reserved2 = read_u32_le(gmem_param, offset + 12);
-    return desc;
-}
-
-static pool_param_desc_t load_pool_desc(const axi_vec_t* gmem_param, u32_t offset) {
-#pragma HLS INLINE
-    pool_param_desc_t desc;
-    desc.pool_offset = read_u32_le(gmem_param, offset + 0);
-    desc.reserved0 = read_u32_le(gmem_param, offset + 4);
-    desc.reserved1 = read_u32_le(gmem_param, offset + 8);
-    desc.reserved2 = read_u32_le(gmem_param, offset + 12);
-    return desc;
-}
-
-static conv_qparam_t load_conv_qparam(const axi_vec_t* gmem_param, u32_t offset) {
-#pragma HLS INLINE
+static conv_qparam_t load_conv_qparam_wordwise(const axi_vec_t* gmem_param, u32_t offset) {
+#pragma HLS INLINE off
     conv_qparam_t qparam;
-    for (int i = 0; i < 32; ++i) {
-        qparam.bias[i] = read_i32_le(gmem_param, offset + i * 4);
-        qparam.mult[i] = read_i32_le(gmem_param, offset + 128 + i * 4);
-        qparam.shift[i] = read_u8(gmem_param, offset + 256 + i);
-        qparam.reserved[i] = read_u8(gmem_param, offset + 288 + i);
+    const u32_t word_base = offset >> 5;
+
+    for (int word_idx = 0; word_idx < 4; ++word_idx) {
+#pragma HLS PIPELINE off
+        const axi_vec_t word = gmem_param[word_base + word_idx];
+        for (int lane = 0; lane < 8; ++lane) {
+#pragma HLS UNROLL
+            qparam.bias[word_idx * 8 + lane] = word_i32_le(word, lane);
+        }
+    }
+    for (int word_idx = 0; word_idx < 4; ++word_idx) {
+#pragma HLS PIPELINE off
+        const axi_vec_t word = gmem_param[word_base + 4 + word_idx];
+        for (int lane = 0; lane < 8; ++lane) {
+#pragma HLS UNROLL
+            qparam.mult[word_idx * 8 + lane] = word_i32_le(word, lane);
+        }
+    }
+
+    const axi_vec_t shift_word = gmem_param[word_base + 8];
+    const axi_vec_t reserved_word = gmem_param[word_base + 9];
+    for (int lane = 0; lane < 32; ++lane) {
+#pragma HLS UNROLL
+        qparam.shift[lane] = word_u8(shift_word, lane);
+        qparam.reserved[lane] = word_u8(reserved_word, lane);
     }
     return qparam;
 }
 
-static affine_qparam_t load_affine_qparam(const axi_vec_t* gmem_param, u32_t offset) {
-#pragma HLS INLINE
+static affine_qparam_t load_affine_qparam_wordwise(const axi_vec_t* gmem_param, u32_t offset) {
+#pragma HLS INLINE off
     affine_qparam_t qparam;
-    for (int i = 0; i < 32; ++i) {
-        qparam.mul[i] = read_i32_le(gmem_param, offset + i * 4);
-        qparam.bias[i] = read_i32_le(gmem_param, offset + 128 + i * 4);
-        qparam.shift[i] = read_u8(gmem_param, offset + 256 + i);
-        qparam.reserved[i] = read_u8(gmem_param, offset + 288 + i);
+    const u32_t word_base = offset >> 5;
+
+    for (int word_idx = 0; word_idx < 4; ++word_idx) {
+#pragma HLS PIPELINE off
+        const axi_vec_t word = gmem_param[word_base + word_idx];
+        for (int lane = 0; lane < 8; ++lane) {
+#pragma HLS UNROLL
+            qparam.mul[word_idx * 8 + lane] = word_i32_le(word, lane);
+        }
+    }
+    for (int word_idx = 0; word_idx < 4; ++word_idx) {
+#pragma HLS PIPELINE off
+        const axi_vec_t word = gmem_param[word_base + 4 + word_idx];
+        for (int lane = 0; lane < 8; ++lane) {
+#pragma HLS UNROLL
+            qparam.bias[word_idx * 8 + lane] = word_i32_le(word, lane);
+        }
+    }
+
+    const axi_vec_t shift_word = gmem_param[word_base + 8];
+    const axi_vec_t reserved_word = gmem_param[word_base + 9];
+    for (int lane = 0; lane < 32; ++lane) {
+#pragma HLS UNROLL
+        qparam.shift[lane] = word_u8(shift_word, lane);
+        qparam.reserved[lane] = word_u8(reserved_word, lane);
     }
     return qparam;
 }
@@ -244,6 +315,93 @@ static pool_qparam_t load_pool_qparam(const axi_vec_t* gmem_param, u32_t offset)
     return qparam;
 }
 
+static window_pack_cmd_t load_window_pack_cmd(const axi_vec_t* gmem_param, u32_t offset) {
+#pragma HLS INLINE
+    window_pack_cmd_t cmd;
+    cmd.spatial_id = read_u8(gmem_param, offset + 0);
+    cmd.src_c_begin = read_u8(gmem_param, offset + 1);
+    cmd.dst_lane_begin = read_u8(gmem_param, offset + 2);
+    cmd.byte_count = read_u8(gmem_param, offset + 3);
+    cmd.flags = read_u8(gmem_param, offset + 4);
+    cmd.reserved0 = read_u8(gmem_param, offset + 5);
+    cmd.reserved1 = read_u16_le(gmem_param, offset + 6);
+    return cmd;
+}
+
+static window_sched_desc_t load_window_sched_desc(const axi_vec_t* gmem_param, u32_t offset) {
+#pragma HLS INLINE
+    window_sched_desc_t desc;
+    desc.mode = read_u8(gmem_param, offset + 0);
+    desc.kernel = read_u8(gmem_param, offset + 1);
+    desc.stride = read_u8(gmem_param, offset + 2);
+    desc.dilation = read_u8(gmem_param, offset + 3);
+    desc.in_c = read_u16_le(gmem_param, offset + 4);
+    desc.k_tiles = read_u16_le(gmem_param, offset + 6);
+    desc.cmd_base = read_u16_le(gmem_param, offset + 8);
+    desc.cmd_count = read_u16_le(gmem_param, offset + 10);
+    for (int i = 0; i < MAX_K_TILE_COUNT + 1; ++i) {
+#pragma HLS PIPELINE off
+        desc.kt_cmd_base[i] = read_u16_le(gmem_param, offset + 12 + i * 2);
+    }
+    desc.flags = read_u16_le(gmem_param, offset + 94);
+    return desc;
+}
+
+static conv_exec_desc_t load_conv_exec_desc(const axi_vec_t* gmem_param, u32_t offset) {
+#pragma HLS INLINE
+    conv_exec_desc_t desc;
+    desc.param_id = read_u8(gmem_param, offset + 0);
+    desc.qparam_id = read_u8(gmem_param, offset + 1);
+    desc.window_sched_id = read_u8(gmem_param, offset + 2);
+    desc.row_consumer_id = read_u8(gmem_param, offset + 3);
+    desc.in_h = read_u16_le(gmem_param, offset + 4);
+    desc.in_w = read_u16_le(gmem_param, offset + 6);
+    desc.in_c = read_u16_le(gmem_param, offset + 8);
+    desc.out_c = read_u16_le(gmem_param, offset + 10);
+    desc.kernel = read_u8(gmem_param, offset + 12);
+    desc.stride = read_u8(gmem_param, offset + 13);
+    desc.dilation = read_u8(gmem_param, offset + 14);
+    desc.padding = read_u8(gmem_param, offset + 15);
+    desc.src_tensor = read_u8(gmem_param, offset + 16);
+    desc.dst_tensor = read_u8(gmem_param, offset + 17);
+    desc.dst_c_offset = read_u16_le(gmem_param, offset + 18);
+    desc.valid_c = read_u16_le(gmem_param, offset + 20);
+    desc.packed_weight_word_offset = read_u32_le(gmem_param, offset + 22);
+    desc.k_tiles = read_u16_le(gmem_param, offset + 26);
+    desc.weight_words = read_u16_le(gmem_param, offset + 28);
+    desc.flags = read_u16_le(gmem_param, offset + 30);
+    desc.reserved = read_u16_le(gmem_param, offset + 32);
+    return desc;
+}
+
+static row_consumer_desc_t load_row_consumer_desc(const axi_vec_t* gmem_param, u32_t offset) {
+#pragma HLS INLINE
+    row_consumer_desc_t desc;
+    desc.mode = read_u8(gmem_param, offset + 0);
+    desc.add_other_tensor = read_u8(gmem_param, offset + 1);
+    desc.store_dst_tensor = read_u8(gmem_param, offset + 2);
+    desc.add_qparam_id = read_u8(gmem_param, offset + 3);
+    desc.store_c_offset = read_u16_le(gmem_param, offset + 4);
+    desc.valid_c = read_u16_le(gmem_param, offset + 6);
+    desc.alias_tensor = read_u8(gmem_param, offset + 8);
+    desc.affine_param_id = read_u8(gmem_param, offset + 9);
+    desc.affine_block_base = read_u8(gmem_param, offset + 10);
+    desc.act_type = read_u8(gmem_param, offset + 11);
+    desc.reserved0 = read_u16_le(gmem_param, offset + 12);
+    desc.reserved1 = read_u16_le(gmem_param, offset + 14);
+    return desc;
+}
+
+static exec_plan_entry_t load_exec_plan_entry(const axi_vec_t* gmem_param, u32_t offset) {
+#pragma HLS INLINE
+    exec_plan_entry_t entry;
+    entry.kind = read_u8(gmem_param, offset + 0);
+    entry.desc_id = read_u8(gmem_param, offset + 1);
+    entry.logical_uop_id = read_u8(gmem_param, offset + 2);
+    entry.flags = read_u8(gmem_param, offset + 3);
+    return entry;
+}
+
 static bool load_weight_data(const axi_vec_t* gmem_param) {
 #pragma HLS INLINE
     if (s_header.conv_qparam_offset < s_header.weight_data_offset) {
@@ -268,30 +426,29 @@ static bool load_weight_data(const axi_vec_t* gmem_param) {
     return true;
 }
 
-static bool read_wbuf_i8(u32_t local_offset, i8_t& value) {
+static bool read_wbuf_word(u32_t local_word_offset, wgt_vec_t& word) {
 #pragma HLS INLINE
-    if (local_offset >= s_weight_bytes) {
-        value = 0;
+    const u32_t byte_offset = local_word_offset << 5;
+    if (byte_offset >= s_weight_bytes) {
+        word = 0;
         return false;
     }
-
-    const axi_vec_t word = get_wbuf()[local_offset >> 5];
-    const unsigned lane = local_offset.to_uint() & 0x1fU;
-    u8_t raw = word.range(lane * 8 + 7, lane * 8);
-    value.range(7, 0) = raw;
+    word = get_wbuf()[local_word_offset];
     return true;
-}
-
-static void set_wgt_vec_lane_dynamic(wgt_vec_t& word, int lane, i8_t value) {
-#pragma HLS INLINE
-    u8_t raw = 0;
-    raw.range(7, 0) = value.range(7, 0);
-    const wgt_vec_t widened = static_cast<wgt_vec_t>(raw);
-    word |= static_cast<wgt_vec_t>(widened << (lane * 8));
 }
 
 void param_dma_init(const axi_vec_t* gmem_param) {
 #pragma HLS INLINE off
+#pragma HLS BIND_STORAGE variable=s_conv_exec_desc type=ram_2p impl=bram
+#pragma HLS BIND_STORAGE variable=s_window_sched_desc type=ram_2p impl=bram
+#pragma HLS BIND_STORAGE variable=s_window_pack_cmd type=ram_2p impl=bram
+#pragma HLS BIND_STORAGE variable=s_row_consumer_desc type=ram_2p impl=bram
+#pragma HLS BIND_STORAGE variable=s_exec_plan type=ram_2p impl=bram
+#pragma HLS RESET variable=s_conv_exec_desc off
+#pragma HLS RESET variable=s_window_sched_desc off
+#pragma HLS RESET variable=s_window_pack_cmd off
+#pragma HLS RESET variable=s_row_consumer_desc off
+#pragma HLS RESET variable=s_exec_plan off
     s_ready = false;
     s_weight_bytes = 0;
 
@@ -310,65 +467,75 @@ void param_dma_init(const axi_vec_t* gmem_param) {
             s_tensor_desc[i] = load_tensor_desc(gmem_param, s_header.tensor_desc_offset + i * 16);
         }
     }
+    for (int i = 0; i < MAX_CONV_EXEC_DESC_COUNT; ++i) {
+#pragma HLS PIPELINE off
+        if (i < static_cast<int>(s_header.conv_desc_count.to_uint())) {
+            s_conv_exec_desc[i] =
+                load_conv_exec_desc(gmem_param, v3_conv_exec_offset(s_header) + i * CONV_EXEC_DESC_BLOB_BYTES);
+        }
+    }
+    for (int i = 0; i < MAX_WINDOW_SCHED_COUNT; ++i) {
+#pragma HLS PIPELINE off
+        if (i < static_cast<int>(v3_window_sched_count(s_header).to_uint())) {
+            s_window_sched_desc[i] =
+                load_window_sched_desc(gmem_param, v3_window_sched_offset(s_header) + i * WINDOW_SCHED_DESC_BLOB_BYTES);
+        }
+    }
+    for (int i = 0; i < MAX_WINDOW_PACK_CMD_COUNT; ++i) {
+#pragma HLS PIPELINE off
+        if (i < static_cast<int>(v3_window_pack_cmd_count(s_header).to_uint())) {
+            s_window_pack_cmd[i] =
+                load_window_pack_cmd(gmem_param, v3_window_pack_cmd_offset(s_header) + i * WINDOW_PACK_CMD_BLOB_BYTES);
+        }
+    }
+    for (int i = 0; i < MAX_ROW_CONSUMER_DESC_COUNT; ++i) {
+#pragma HLS PIPELINE off
+        if (i < static_cast<int>(v3_row_consumer_count(s_header).to_uint())) {
+            s_row_consumer_desc[i] =
+                load_row_consumer_desc(gmem_param, v3_row_consumer_offset(s_header) + i * ROW_CONSUMER_DESC_BLOB_BYTES);
+        }
+    }
+    for (int i = 0; i < MAX_EXEC_PLAN_COUNT; ++i) {
+#pragma HLS PIPELINE off
+        if (i < static_cast<int>(v3_exec_entry_count(s_header).to_uint())) {
+            s_exec_plan[i] =
+                load_exec_plan_entry(gmem_param, v3_exec_plan_offset(s_header) + i * EXEC_PLAN_ENTRY_BLOB_BYTES);
+        }
+    }
     for (int i = 0; i < MAX_CONV_PARAM_DESC_COUNT; ++i) {
 #pragma HLS PIPELINE off
         if (i < static_cast<int>(s_header.conv_desc_count.to_uint())) {
-            s_conv_desc[i] = load_conv_desc(gmem_param, s_header.conv_desc_offset + i * 16);
+            s_conv_qparam[i] =
+                load_conv_qparam_wordwise(gmem_param, s_header.conv_qparam_offset + i * sizeof(conv_qparam_t));
         }
     }
-    for (int i = 0; i < MAX_AFFINE_PARAM_DESC_COUNT; ++i) {
-#pragma HLS PIPELINE off
-        if (i < static_cast<int>(s_header.affine_desc_count.to_uint())) {
-            s_affine_desc[i] = load_affine_desc(gmem_param, s_header.affine_desc_offset + i * 16);
-        }
-    }
-    for (int i = 0; i < MAX_ADD_PARAM_DESC_COUNT; ++i) {
-#pragma HLS PIPELINE off
-        if (i < static_cast<int>(s_header.add_desc_count.to_uint())) {
-            s_add_desc[i] = load_add_desc(gmem_param, s_header.add_desc_offset + i * 16);
-        }
-    }
-    for (int i = 0; i < MAX_POOL_PARAM_DESC_COUNT; ++i) {
-#pragma HLS PIPELINE off
-        if (i < static_cast<int>(s_header.pool_desc_count.to_uint())) {
-            s_pool_desc[i] = load_pool_desc(gmem_param, s_header.pool_desc_offset + i * 16);
-        }
-    }
-    for (int i = 0; i < MAX_CONV_PARAM_DESC_COUNT; ++i) {
-#pragma HLS PIPELINE off
-        if (i < static_cast<int>(s_header.conv_desc_count.to_uint())) {
-            s_conv_qparam[i] = load_conv_qparam(gmem_param, s_conv_desc[i].requant_offset);
-        }
-    }
+    u32_t affine_cursor = s_header.affine_qparam_offset;
     for (int i = 0; i < MAX_AFFINE_PARAM_DESC_COUNT; ++i) {
         if (i < static_cast<int>(s_header.affine_desc_count.to_uint())) {
-            const u32_t start = s_affine_desc[i].affine_offset;
-            const u32_t end = (i + 1 < static_cast<int>(s_header.affine_desc_count.to_uint()))
-                                  ? s_affine_desc[i + 1].affine_offset
-                                  : s_header.add_qparam_offset;
-            const unsigned byte_count = (end > start) ? static_cast<unsigned>((end - start).to_uint()) : 0U;
-            const unsigned blocks = byte_count / sizeof(affine_qparam_t);
-            const unsigned capped_blocks = (blocks > 8U) ? 8U : blocks;
-            s_affine_qparam_count[i] = static_cast<u8_t>(capped_blocks);
+            const unsigned blocks = k_v3_affine_blocks[i];
+            s_affine_qparam_count[i] = static_cast<u8_t>((blocks > 8U) ? 8U : blocks);
             for (int block = 0; block < 8; ++block) {
 #pragma HLS PIPELINE off
-                if (static_cast<unsigned>(block) < capped_blocks) {
+                if (static_cast<unsigned>(block) < blocks && block < 8) {
                     s_affine_qparam[i][block] =
-                        load_affine_qparam(gmem_param, start + block * sizeof(affine_qparam_t));
+                        load_affine_qparam_wordwise(gmem_param, affine_cursor + block * sizeof(affine_qparam_t));
                 }
             }
+            affine_cursor += static_cast<u32_t>(blocks * sizeof(affine_qparam_t));
         }
     }
     for (int i = 0; i < MAX_ADD_PARAM_DESC_COUNT; ++i) {
 #pragma HLS PIPELINE off
         if (i < static_cast<int>(s_header.add_desc_count.to_uint())) {
-            s_add_qparam[i] = load_add_qparam(gmem_param, s_add_desc[i].add_offset);
+            s_add_qparam[i] =
+                load_add_qparam(gmem_param, s_header.add_qparam_offset + i * sizeof(add_qparam_t));
         }
     }
     for (int i = 0; i < MAX_POOL_PARAM_DESC_COUNT; ++i) {
 #pragma HLS PIPELINE off
         if (i < static_cast<int>(s_header.pool_desc_count.to_uint())) {
-            s_pool_qparam[i] = load_pool_qparam(gmem_param, s_pool_desc[i].pool_offset);
+            s_pool_qparam[i] =
+                load_pool_qparam(gmem_param, s_header.pool_qparam_offset + i * sizeof(pool_qparam_t));
         }
     }
     s_ready = true;
@@ -377,6 +544,11 @@ void param_dma_init(const axi_vec_t* gmem_param) {
 bool param_dma_ready() {
 #pragma HLS INLINE
     return s_ready;
+}
+
+bool param_dma_is_schedule_blob() {
+#pragma HLS INLINE
+    return s_ready && param_blob_is_v3();
 }
 
 bool param_dma_get_tensor_desc(u8_t tensor_id, tensor_desc_t& desc) {
@@ -409,78 +581,77 @@ bool param_dma_get_conv_qparam(u8_t param_id, conv_q_t& qparam) {
     return true;
 }
 
-bool param_dma_get_weight_vec(u8_t param_id,
-                              u16_t oc,
-                              u16_t kt,
-                              const conv_cfg_t& cfg,
-                               wgt_vec_t& word) {
-#pragma HLS INLINE off
-    const int idx = static_cast<int>(param_id.to_uint());
-    if (!s_ready || idx < 0 || idx >= static_cast<int>(s_header.conv_desc_count.to_uint())) {
-        word = 0;
+bool param_dma_get_conv_exec_desc(u8_t id, conv_exec_desc_t& desc) {
+#pragma HLS INLINE
+    const int idx = static_cast<int>(id.to_uint());
+    if (!s_ready || !param_blob_is_v3() ||
+        idx < 0 || idx >= static_cast<int>(s_header.conv_desc_count.to_uint())) {
         return false;
     }
-    if (s_conv_desc[idx].weight_offset < s_header.weight_data_offset) {
-        word = 0;
-        return false;
-    }
-
-    const u16_t kernel = effective_kernel(cfg);
-    const u16_t k_total = static_cast<u16_t>(cfg.in_c * kernel * kernel);
-    const u32_t local_base = s_conv_desc[idx].weight_offset - s_header.weight_data_offset;
-    const int in_c_i = static_cast<int>(cfg.in_c.to_uint());
-    const int kernel_i = static_cast<int>(kernel.to_uint());
-    const int k_idx_start = static_cast<int>(kt.to_uint()) * TK;
-    int cin_i = k_idx_start;
-    int spatial_i = 0;
-    if (kernel_i != 1 && in_c_i != 0) {
-        spatial_i = k_idx_start / in_c_i;
-        cin_i = k_idx_start - spatial_i * in_c_i;
-    }
-    word = 0;
-
-    for (int lane = 0; lane < TK; ++lane) {
-#pragma HLS PIPELINE II=1
-        const int k_idx_i = k_idx_start + lane;
-        i8_t value = 0;
-        bool valid = false;
-
-        if (oc < cfg.out_c && k_idx_i < static_cast<int>(k_total.to_uint())) {
-            u32_t weight_offset = local_base;
-            if (kernel_i == 1) {
-                weight_offset +=
-                    static_cast<u32_t>(oc) * static_cast<u32_t>(cfg.in_c) +
-                    static_cast<u32_t>(cin_i);
-            } else {
-                const int kh_i = spatial_i / kernel_i;
-                const int kw_i = spatial_i - kh_i * kernel_i;
-                weight_offset +=
-                    ((static_cast<u32_t>(oc) * static_cast<u32_t>(cfg.in_c) +
-                      static_cast<u32_t>(cin_i)) *
-                         static_cast<u32_t>(kernel_i) +
-                     static_cast<u32_t>(kh_i)) *
-                        static_cast<u32_t>(kernel_i) +
-                    static_cast<u32_t>(kw_i);
-            }
-            valid = read_wbuf_i8(weight_offset, value);
-        }
-
-        if (!valid) {
-            value = 0;
-        }
-        set_wgt_vec_lane_dynamic(word, lane, value);
-
-        if (kernel_i == 1) {
-            ++cin_i;
-        } else {
-            ++cin_i;
-            if (cin_i >= in_c_i) {
-                cin_i = 0;
-                ++spatial_i;
-            }
-        }
-    }
+    desc = s_conv_exec_desc[idx];
     return true;
+}
+
+bool param_dma_get_window_sched(u8_t id, window_sched_desc_t& desc) {
+#pragma HLS INLINE
+    const int idx = static_cast<int>(id.to_uint());
+    if (!s_ready || !param_blob_is_v3() ||
+        idx < 0 || idx >= static_cast<int>(v3_window_sched_count(s_header).to_uint())) {
+        return false;
+    }
+    desc = s_window_sched_desc[idx];
+    return true;
+}
+
+bool param_dma_get_pack_cmd(u16_t cmd_idx, window_pack_cmd_t& cmd) {
+#pragma HLS INLINE
+    const int idx = static_cast<int>(cmd_idx.to_uint());
+    if (!s_ready || !param_blob_is_v3() ||
+        idx < 0 || idx >= static_cast<int>(v3_window_pack_cmd_count(s_header).to_uint())) {
+        return false;
+    }
+    cmd = s_window_pack_cmd[idx];
+    return true;
+}
+
+bool param_dma_get_row_consumer(u8_t id, row_consumer_desc_t& desc) {
+#pragma HLS INLINE
+    const int idx = static_cast<int>(id.to_uint());
+    if (!s_ready || !param_blob_is_v3() ||
+        idx < 0 || idx >= static_cast<int>(v3_row_consumer_count(s_header).to_uint())) {
+        return false;
+    }
+    desc = s_row_consumer_desc[idx];
+    return true;
+}
+
+bool param_dma_get_exec_entry(u8_t pc, exec_plan_entry_t& entry) {
+#pragma HLS INLINE
+    const int idx = static_cast<int>(pc.to_uint());
+    if (!s_ready || !param_blob_is_v3() ||
+        idx < 0 || idx >= static_cast<int>(v3_exec_entry_count(s_header).to_uint())) {
+        return false;
+    }
+    entry = s_exec_plan[idx];
+    return true;
+}
+
+bool param_dma_get_packed_weight_vec(const conv_exec_desc_t& desc,
+                                     u16_t tm,
+                                     u16_t kt,
+                                     wgt_vec_t& word) {
+#pragma HLS INLINE off
+    if (!s_ready || !param_blob_is_v3() ||
+        tm >= desc.out_c ||
+        kt >= desc.k_tiles) {
+        word = 0;
+        return false;
+    }
+    const u32_t local_word =
+        desc.packed_weight_word_offset +
+        static_cast<u32_t>(tm) * static_cast<u32_t>(desc.k_tiles) +
+        static_cast<u32_t>(kt);
+    return read_wbuf_word(local_word, word);
 }
 
 bool param_dma_get_affine_qparam(u8_t param_id, u8_t block_id, aff_q_t& qparam) {

@@ -14,7 +14,9 @@ inline i32_t round_shift(i64_t x, u8_t shift) {
   if (x >= 0) {
     return static_cast<i32_t>((x + bias) >> shift);
   }
-  return static_cast<i32_t>((x - bias) >> shift);
+  // Round-away-from-zero for negative: ceil((x - bias) / 2^shift)
+  const i64_t S = i64_t(1) << shift;
+  return static_cast<i32_t>(((x - bias) + S - 1) >> shift);
 }
 
 inline i8_t clamp_i8(i32_t x) {

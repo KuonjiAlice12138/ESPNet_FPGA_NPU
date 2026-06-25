@@ -49,6 +49,18 @@ static void set_psum_i32(psum_vec_t& word, int lane, i32_t value) {
     word.range(lane * 32 + 31, lane * 32) = value.range(31, 0);
 }
 
+static void compute_k_valid_lanes(u16_t kt,
+                                  u16_t k_total,
+                                  bool k_valid[TK]) {
+#pragma HLS INLINE
+#pragma HLS ARRAY_PARTITION variable=k_valid complete dim=1
+    const u16_t k_base = static_cast<u16_t>(kt * TK);
+    for (int tk = 0; tk < TK; ++tk) {
+#pragma HLS UNROLL
+        k_valid[tk] = static_cast<u16_t>(k_base + tk) < k_total;
+    }
+}
+
 template <int BASE_TM>
 static void mac_tile_segment(const i8_t act_lane[TK],
                              const wgt_vec_t weight_buf[TM][MAX_SA_K_TILES],
@@ -56,6 +68,10 @@ static void mac_tile_segment(const i8_t act_lane[TK],
                              u16_t kt,
                              u16_t k_total) {
 #pragma HLS INLINE
+    bool k_valid[TK];
+#pragma HLS ARRAY_PARTITION variable=k_valid complete dim=1
+    compute_k_valid_lanes(kt, k_total, k_valid);
+
     for (int lane = 0; lane < SA_SEGMENT_TM; ++lane) {
 #pragma HLS UNROLL
         const int tm = BASE_TM + lane;
@@ -63,8 +79,7 @@ static void mac_tile_segment(const i8_t act_lane[TK],
         const wgt_vec_t wgt_word = weight_buf[tm][kt];
         for (int tk = 0; tk < TK; ++tk) {
 #pragma HLS UNROLL
-            const u16_t k_idx = static_cast<u16_t>(kt * TK + tk);
-            if (k_idx < k_total) {
+            if (k_valid[tk]) {
                 partial += static_cast<i32_t>(act_lane[tk]) *
                            static_cast<i32_t>(get_vec_i8(wgt_word, tk));
             }

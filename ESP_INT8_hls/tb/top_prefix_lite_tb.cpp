@@ -46,9 +46,9 @@ static void pack_bytes(const std::vector<std::uint8_t>& bytes,
 
 int main() {
   const char* param_path =
-      "D:/ESP_INT8/hw_artifacts/hw_constrained_qat_3ep_single/param_blob.bin";
+      "D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623/PARAM.BIN";
   const char* input_path =
-      "D:/ESP_INT8/hw_artifacts/hw_constrained_qat_3ep_single/input_q.bin";
+      "D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623/input_q.bin";
 
   std::vector<std::uint8_t> param_bytes;
   std::vector<std::uint8_t> input_bytes;
@@ -64,17 +64,17 @@ int main() {
   const std::size_t param_words =
       (param_bytes.size() + esp_int8::AXI_WORD_BYTES - 1U) /
       esp_int8::AXI_WORD_BYTES;
-  if (param_words > 4096U) {
+  if (param_words > 8192U) {
     std::printf("[FAIL] param blob too large: words=%zu\n", param_words);
     return 1;
   }
 
   static esp_int8::axi_vec_t frame_in[esp_int8::INPUT_FRAME_AXI_WORDS];
   static esp_int8::axi_vec_t frame_out[esp_int8::OUTPUT_FRAME_AXI_WORDS];
-  static esp_int8::axi_vec_t param[4096];
+  static esp_int8::axi_vec_t param[8192];
 
   pack_bytes(input_bytes, frame_in, esp_int8::INPUT_FRAME_AXI_WORDS);
-  pack_bytes(param_bytes, param, 4096U);
+  pack_bytes(param_bytes, param, 8192U);
   for (int i = 0; i < esp_int8::OUTPUT_FRAME_AXI_WORDS; ++i) {
     frame_out[i] = 0;
   }
@@ -96,6 +96,31 @@ int main() {
                            param,
                            esp_int8::MODE_RUN,
                            esp_int8::UOP_COUNT_ENCODER);
+
+#ifdef ESP_INT8_CSIM_DUMP_UPSAMPLE_INPUT
+  {
+    std::vector<std::uint8_t> lowres_logits(esp_int8::ENCODER_LOGITS_BYTES);
+    for (std::size_t i = 0; i < lowres_logits.size(); ++i) {
+      lowres_logits[i] =
+          get_byte(frame_out[i / esp_int8::AXI_WORD_BYTES],
+                   static_cast<int>(i % esp_int8::AXI_WORD_BYTES));
+    }
+
+    std::ofstream out("hls_output_lowres_logits.bin", std::ios::binary);
+    if (!out) {
+      std::printf("[FAIL] failed to write hls_output_lowres_logits.bin\n");
+      return 1;
+    }
+    out.write(reinterpret_cast<const char*>(lowres_logits.data()),
+              static_cast<std::streamsize>(lowres_logits.size()));
+    if (!out) {
+      std::printf("[FAIL] incomplete write hls_output_lowres_logits.bin\n");
+      return 1;
+    }
+    std::printf("[CSIM-DUMP] wrote hls_output_lowres_logits.bin bytes=%zu\n",
+                lowres_logits.size());
+  }
+#endif
 
   unsigned checksum = 0;
   int nonzero = 0;

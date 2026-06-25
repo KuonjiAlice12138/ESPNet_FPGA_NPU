@@ -63,8 +63,15 @@ static void decode_logit_diff_row(const act_vec_t row_buf[MAX_FM_W], i16_t diff_
   }
 }
 
-static u8_t interpolate_argmax_label(const i16_t row0[ENCODER_OUT_W],
-                                     const i16_t row1[ENCODER_OUT_W],
+static i16_t row0_value(const i16_t curr_row[ENCODER_OUT_W],
+                        int idx,
+                        bool use_prev_row) {
+#pragma HLS INLINE
+  return use_prev_row ? s_prev_diff_row[idx] : curr_row[idx];
+}
+
+static u8_t interpolate_argmax_label(const i16_t curr_row[ENCODER_OUT_W],
+                                     bool use_prev_row,
                                      int col,
                                      int wy0,
                                      int wy1) {
@@ -76,19 +83,19 @@ static u8_t interpolate_argmax_label(const i16_t row0[ENCODER_OUT_W],
   bilinear_axis_map(col, ENCODER_OUT_W, x0, x1, wx0, wx1);
 
   const i32_t top =
-      static_cast<i32_t>(row0[x0]) * static_cast<i32_t>(wx0) +
-      static_cast<i32_t>(row0[x1]) * static_cast<i32_t>(wx1);
+      static_cast<i32_t>(row0_value(curr_row, x0, use_prev_row)) * static_cast<i32_t>(wx0) +
+      static_cast<i32_t>(row0_value(curr_row, x1, use_prev_row)) * static_cast<i32_t>(wx1);
   const i32_t bottom =
-      static_cast<i32_t>(row1[x0]) * static_cast<i32_t>(wx0) +
-      static_cast<i32_t>(row1[x1]) * static_cast<i32_t>(wx1);
+      static_cast<i32_t>(curr_row[x0]) * static_cast<i32_t>(wx0) +
+      static_cast<i32_t>(curr_row[x1]) * static_cast<i32_t>(wx1);
   const i32_t interp =
       top * static_cast<i32_t>(wy0) + bottom * static_cast<i32_t>(wy1);
 
   return (interp >= 0) ? static_cast<u8_t>(0) : static_cast<u8_t>(1);
 }
 
-static axi_vec_t pack_mask_word(const i16_t row0[ENCODER_OUT_W],
-                                const i16_t row1[ENCODER_OUT_W],
+static axi_vec_t pack_mask_word(const i16_t curr_row[ENCODER_OUT_W],
+                                bool use_prev_row,
                                 int out_col_base,
                                 int wy0,
                                 int wy1) {
@@ -97,15 +104,15 @@ static axi_vec_t pack_mask_word(const i16_t row0[ENCODER_OUT_W],
   for (int lane = 0; lane < AXI_WORD_BYTES; ++lane) {
 #pragma HLS PIPELINE II=1
     const int out_col = out_col_base + lane;
-    const u8_t label = interpolate_argmax_label(row0, row1, out_col, wy0, wy1);
+    const u8_t label = interpolate_argmax_label(curr_row, use_prev_row, out_col, wy0, wy1);
     word.range(lane * 8 + 7, lane * 8) = label;
   }
   return word;
 }
 
 static void emit_fullres_rows(axi_vec_t* gmem_frame_out,
-                              const i16_t row0[ENCODER_OUT_W],
-                              const i16_t row1[ENCODER_OUT_W],
+                              const i16_t curr_row[ENCODER_OUT_W],
+                              bool use_prev_row,
                               int out_row_begin,
                               int row_count) {
 #pragma HLS INLINE off
@@ -125,7 +132,7 @@ static void emit_fullres_rows(axi_vec_t* gmem_frame_out,
       const int out_col_base = word_col * AXI_WORD_BYTES;
       const u32_t word_idx =
           static_cast<u32_t>(out_row * (FULLRES_MASK_W / AXI_WORD_BYTES) + word_col);
-      gmem_frame_out[word_idx] = pack_mask_word(row0, row1, out_col_base, wy0, wy1);
+      gmem_frame_out[word_idx] = pack_mask_word(curr_row, use_prev_row, out_col_base, wy0, wy1);
     }
   }
 }
@@ -145,20 +152,34 @@ void upsample_fused_consume_logits_row(axi_vec_t* gmem_frame_out,
   decode_logit_diff_row(row_buf, curr_diff_row);
 
   const unsigned row = encoder_row.to_uint();
-  if (row == 0U) {
-    emit_fullres_rows(gmem_frame_out, curr_diff_row, curr_diff_row, 0, UPSAMPLE_SCALE / 2);
-  } else if (s_prev_diff_valid) {
-    const int out_row_begin = (UPSAMPLE_SCALE / 2) +
-                              static_cast<int>((row - 1U) * static_cast<unsigned>(UPSAMPLE_SCALE));
-    emit_fullres_rows(gmem_frame_out, s_prev_diff_row, curr_diff_row, out_row_begin, UPSAMPLE_SCALE);
-  }
+  for (int emit_case = 0; emit_case < 2; ++emit_case) {
+#pragma HLS PIPELINE off
+    bool emit = false;
+    bool use_prev_row = false;
+    int out_row_begin = 0;
+    int row_count = 0;
 
-  if (row == static_cast<unsigned>(ENCODER_OUT_H - 1)) {
-    emit_fullres_rows(gmem_frame_out,
-                      curr_diff_row,
-                      curr_diff_row,
-                      FULLRES_MASK_H - (UPSAMPLE_SCALE / 2),
-                      UPSAMPLE_SCALE / 2);
+    if (emit_case == 0) {
+      if (row == 0U) {
+        emit = true;
+        out_row_begin = 0;
+        row_count = UPSAMPLE_SCALE / 2;
+      } else if (s_prev_diff_valid) {
+        emit = true;
+        use_prev_row = true;
+        out_row_begin = (UPSAMPLE_SCALE / 2) +
+                        static_cast<int>((row - 1U) * static_cast<unsigned>(UPSAMPLE_SCALE));
+        row_count = UPSAMPLE_SCALE;
+      }
+    } else if (row == static_cast<unsigned>(ENCODER_OUT_H - 1)) {
+      emit = true;
+      out_row_begin = FULLRES_MASK_H - (UPSAMPLE_SCALE / 2);
+      row_count = UPSAMPLE_SCALE / 2;
+    }
+
+    if (emit) {
+      emit_fullres_rows(gmem_frame_out, curr_diff_row, use_prev_row, out_row_begin, row_count);
+    }
   }
 
   copy_logit_diff_row(curr_diff_row, s_prev_diff_row);

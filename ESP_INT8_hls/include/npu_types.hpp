@@ -64,12 +64,12 @@ enum error_code_t : std::uint16_t {
 struct tensor_desc_t {
   u8_t bank_id;
   u8_t elem_bytes;
-  u16_t reserved0;
+  u16_t reserved0;     // physical channel stride when non-zero
   u32_t base_offset;
   u16_t h;
   u16_t w;
   u16_t c;
-  u16_t reserved1;
+  u16_t reserved1;     // channel offset inside physical row
 };
 
 struct scale_desc_t {
@@ -149,24 +149,35 @@ struct param_blob_header_t {
   u32_t version;
   u32_t tensor_desc_count;
   u32_t scale_desc_count;
-  u32_t conv_desc_count;
+  u32_t conv_desc_count;       // v1: conv_param_desc_count; v3: conv_exec_desc_count
   u32_t affine_desc_count;
   u32_t add_desc_count;
   u32_t pool_desc_count;
   u32_t uop_count;
-  u32_t reserved0;
+  u32_t reserved0;             // v3: exec_entry_count
   u32_t tensor_desc_offset;
   u32_t scale_desc_offset;
-  u32_t conv_desc_offset;
-  u32_t affine_desc_offset;
-  u32_t add_desc_offset;
-  u32_t pool_desc_offset;
+  u32_t conv_desc_offset;      // v1 only
+  u32_t affine_desc_offset;    // v1 only
+  u32_t add_desc_offset;       // v1 only
+  u32_t pool_desc_offset;      // v1 only
   u32_t uop_offset;
-  u32_t weight_data_offset;
+  u32_t weight_data_offset;    // v1: logical weights; v3: active-OC packed weights
   u32_t conv_qparam_offset;
   u32_t affine_qparam_offset;
   u32_t add_qparam_offset;
   u32_t pool_qparam_offset;
+  // v3 reserved1 mapping:
+  // [0] conv_exec_desc_offset
+  // [1] window_sched_desc_offset
+  // [2] window_pack_cmd_offset
+  // [3] row_consumer_desc_offset
+  // [4] reserved/store/fusion offset
+  // [5] exec_plan_offset
+  // [6] window_sched_count
+  // [7] window_pack_cmd_count
+  // [8] reserved/store/fusion count
+  // [9] row_consumer_count
   u32_t reserved1[10];
 };
 

@@ -39,7 +39,7 @@ OPCODE_NAME = {
     UOP_END: "END",
 }
 
-DEFAULT_ARTIFACT_DIR = Path("D:/ESP_INT8/hw_artifacts/hw_constrained_qat_3ep_single")
+DEFAULT_ARTIFACT_DIR = Path("D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623")
 
 # Latest board profile captured on 2026-05-13 after packed-read hardware update.
 # These are cumulative prefix runs from the app, not one full MODE_RUN.

@@ -109,8 +109,8 @@ static void pack_bytes(const std::vector<std::uint8_t>& bytes,
 }
 
 int main() {
-    const char* param_path = "D:/ESP_INT8/hw_artifacts/hw_constrained_qat_3ep_single/param_blob.bin";
-    const char* input_path = "D:/ESP_INT8/hw_artifacts/hw_constrained_qat_3ep_single/input_q.bin";
+    const char* param_path = "D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623/PARAM.BIN";
+    const char* input_path = "D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623/input_q.bin";
 
     std::vector<std::uint8_t> param_bytes;
     std::vector<std::uint8_t> input_bytes;
@@ -130,7 +130,7 @@ int main() {
         (param_bytes.size() + esp_int8::AXI_WORD_BYTES - 1U) / esp_int8::AXI_WORD_BYTES;
     static esp_int8::axi_vec_t frame_in[esp_int8::INPUT_FRAME_AXI_WORDS];
     static esp_int8::axi_vec_t frame_out[kDumpWords];
-    static esp_int8::axi_vec_t param[4096];
+    static esp_int8::axi_vec_t param[8192];
     volatile std::uint32_t dbg_status = 0;
     volatile std::uint32_t dbg_heartbeat = 0;
     volatile std::uint32_t dbg_act_words = 0;
@@ -170,13 +170,13 @@ int main() {
     volatile std::uint32_t prof5_conv_model_cycles = 0;
     volatile std::uint32_t prof5_total_work_units = 0;
 
-    if (param_words > 4096U) {
+    if (param_words > 8192U) {
         std::printf("[FAIL] param blob too large: words=%zu\n", param_words);
         return 1;
     }
 
     pack_bytes(input_bytes, frame_in, esp_int8::INPUT_FRAME_AXI_WORDS);
-    pack_bytes(param_bytes, param, 4096U);
+    pack_bytes(param_bytes, param, 8192U);
     for (std::size_t i = 0; i < kDumpWords; ++i) {
         frame_out[i] = 0;
     }

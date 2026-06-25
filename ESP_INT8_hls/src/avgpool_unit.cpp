@@ -329,31 +329,6 @@ static bool avgpool_c3_group32_generic_pack_write(const tensor_desc_t& src,
     return write_c3_group32(dst.bank_id, word_offset, pixels);
 }
 
-static bool avgpool_c3_group32_first_col_pack_write(const tensor_desc_t& src,
-                                                    const tensor_desc_t& dst,
-                                                    const pool_q_t& qparam,
-                                                    int oh_i,
-                                                    u32_t word_offset) {
-#pragma HLS INLINE off
-    act_vec_t pixels[32];
-#pragma HLS ARRAY_PARTITION variable=pixels complete dim=1
-
-    if (!avgpool_pixel_c3_generic_pack(src, qparam, oh_i, 0, pixels[0])) {
-        return false;
-    }
-
-    for (int pix = 1; pix < 32; ++pix) {
-#pragma HLS PIPELINE II=24
-        act_vec_t out_packed = 0;
-        if (!avgpool_pixel_c3_inner_fast_pack(src, qparam, oh_i, pix, out_packed)) {
-            return false;
-        }
-        pixels[pix] = out_packed;
-    }
-
-    return write_c3_group32(dst.bank_id, word_offset, pixels);
-}
-
 static bool avgpool_c3_group32_inner_fast_pack_write(const tensor_desc_t& src,
                                                      const tensor_desc_t& dst,
                                                      const pool_q_t& qparam,
@@ -422,11 +397,12 @@ static bool avgpool_unit_c3_fast(const tensor_desc_t& src,
         const u16_t oh = static_cast<u16_t>(oh_i);
         const u32_t row_base = pool_row_base(dst, oh);
 
-        if (!avgpool_c3_group32_first_col_pack_write(src,
-                                                     dst,
-                                                     qparam,
-                                                     oh_i,
-                                                     row_base)) {
+        if (!avgpool_c3_group32_generic_pack_write(src,
+                                                   dst,
+                                                   qparam,
+                                                   oh_i,
+                                                   0,
+                                                   row_base)) {
             return false;
         }
 
