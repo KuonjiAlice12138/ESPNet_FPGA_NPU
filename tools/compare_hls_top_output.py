@@ -103,7 +103,7 @@ def main() -> int:
     parser.add_argument(
         "--artifact-dir",
         type=Path,
-        default=Path("D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623"),
+        default=Path("D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702"),
     )
     parser.add_argument(
         "--hls-output",

@@ -172,7 +172,7 @@ def main() -> None:
     parser.add_argument("--cached-data-file", default=r"D:\ESPNet\city.p")
     parser.add_argument(
         "--out-json",
-        default=r"D:\ESP_INT8\hw_artifacts\sched_v3_single_p7_hwconv_0623\int8_baseline_metrics_fullres.json",
+        default=r"D:\ESP_INT8\hw_artifacts\sched_v4_p7_0702\int8_baseline_metrics_fullres.json",
     )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)

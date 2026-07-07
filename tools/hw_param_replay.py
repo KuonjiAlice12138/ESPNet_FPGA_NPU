@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Offline replay of P7 PARAM.BIN using HLS-equivalent integer math.
 
-Reads PARAM v3 blob, packed weights, window schedule, exec plan,
+Reads PARAM v4 blob, packed weights, window schedule, exec plan,
 and replays the full encoder forward pass using only INT8/INT32
 fixed-point arithmetic aligned with ``include/npu_q.hpp``.
 
 Usage:
     python tools/hw_param_replay.py \\
-        --param D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623/PARAM.BIN \\
-        --input D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623/input_q.bin \\
+        --param D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/PARAM.BIN \\
+        --input D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/input_q.bin \\
         --dump-dir D:/ESP_INT8/ESP_INT8_hls/hls_work_p7_hwqat_fullres_dump_u39_0623/hls/csim/build \\
         --layer U40
 """
@@ -40,26 +40,74 @@ TM = 32
 SECTION_ALIGN = 64
 FMBUF_BYTES = 0x598000
 FMBUF_URAM_BYTES = 0x380000
+MAX_BLOCK5_SCHED_COUNT = 8
 
 # ── enums ──────────────────────────────────────────────────
 UOP_NOP, UOP_LOAD_FM, UOP_CONV, UOP_POOL = 0, 1, 2, 3
 UOP_ADD, UOP_AFFINE, UOP_STORE, UOP_END = 4, 5, 6, 15
 
-EXEC_NOP, EXEC_CONV, EXEC_POOL, EXEC_AFFINE = 0, 1, 2, 3
-EXEC_STORE, EXEC_END = 4, 255
-EXEC_ADD_AFFINE = 5
+EXEC_NOP, EXEC_CONV, EXEC_POOL = 0, 1, 2
+EXEC_BLOCK_AFFINE = 6
+EXEC_BLOCK_ADD_AFFINE = 7
+EXEC_END = 255
+REMOVED_P6_EXEC_KINDS = {3, 4, 5}
+
+FIXED_FLAG_BLOCK5_AFFINE = 1 << 0
+FIXED_FLAG_BLOCK5_ADD_AFFINE = 1 << 1
+FIXED_FLAG_BLOCK5_ROW_GROUP = 1 << 2
+FIXED_FLAG_ROW_CONTIGUOUS_STORE = 1 << 7
+
+BLOCK5_ADD_TENSOR_NONE = 0xFF
+BLOCK5_PATTERN_INVALID = 0
+BLOCK5_PATTERN_L2_C16_4C12 = 1
+BLOCK5_PATTERN_L3_C28_4C25 = 2
+BLOCK5_FINALIZER_INVALID = 0
+BLOCK5_FINALIZER_L2 = 1
+BLOCK5_FINALIZER_L3 = 2
 
 ROW_CONSUMER_NONE, ROW_CONSUMER_STORE = 0, 1
-ROW_CONSUMER_ADD_STORE, ROW_CONSUMER_UPSAMPLE_OUT = 2, 4
+ROW_CONSUMER_ADD_STORE, ROW_CONSUMER_ADD_AFFINE_STORE = 2, 3
+ROW_CONSUMER_UPSAMPLE_OUT, ROW_CONSUMER_AFFINE_STORE = 4, 5
+ROW_CONSUMER_CAT_AFFINE_STORE = 6
+ROW_CONSUMER_ADD_STORE_BLOCK_ADD_AFFINE = 7
 
-WIN_MODE_SMALLC_3X3_STAGED = 1
-WIN_MODE_LARGEC_3X3_SEGMENT = 2
-WIN_MODE_1X1_ALIGNED = 3
-WIN_MODE_1X1_PACKED = 4
-WIN_MODE_FIRST_C3 = 5
+WIN_MODE_3X3_RESERVED = 1
+WIN_MODE_1X1_ALIGNED = 2
+WIN_MODE_1X1_PACKED = 3
+WIN_MODE_3X3_STAGED_C3 = 4
+WIN_MODE_3X3_STAGED_C12 = 5
+WIN_MODE_3X3_STAGED_C19 = 6
+WIN_MODE_3X3_STAGED_C25 = 7
+WIN_MODE_3X3_STAGED_C131 = 8
+WIN_MODE_3X3_STAGED_C28 = 9
+WIN_MODE_3X3_STAGED_C64 = 10
+WIN_MODE_3X3_STAGED_C128 = 11
+STAGED_3X3_MODES = {
+    WIN_MODE_3X3_STAGED_C3,
+    WIN_MODE_3X3_STAGED_C12,
+    WIN_MODE_3X3_STAGED_C19,
+    WIN_MODE_3X3_STAGED_C25,
+    WIN_MODE_3X3_STAGED_C28,
+    WIN_MODE_3X3_STAGED_C64,
+    WIN_MODE_3X3_STAGED_C128,
+    WIN_MODE_3X3_STAGED_C131,
+}
 
 ACT_NONE, ACT_RELU = 0, 1
 FLAG_RELU_EN = 1 << 1
+
+
+def unpack_block5_reserved1(reserved1: int) -> Tuple[int, int, int, int]:
+    raw = int(reserved1) & 0xFFFFFFFF
+    return raw & 0xFF, (raw >> 8) & 0xFF, (raw >> 16) & 0xFF, (raw >> 24) & 0xFF
+
+
+def block5_source_channels(pattern: int) -> Tuple[int, int, int, int, int]:
+    if pattern == BLOCK5_PATTERN_L2_C16_4C12:
+        return (16, 12, 12, 12, 12)
+    if pattern == BLOCK5_PATTERN_L3_C28_4C25:
+        return (28, 25, 25, 25, 25)
+    raise ValueError(f"unsupported BLOCK5 source pattern: {pattern}")
 
 # ── dataclasses ────────────────────────────────────────────
 @dataclass
@@ -96,12 +144,16 @@ class WindowSchedDesc:
     kernel: int = 1
     stride: int = 1
     dilation: int = 1
+    padding: int = 0
+    cache_chunks: int = 0
+    cache_col_slots: int = 0
+    flags: int = 0
     in_c: int = 0
+    out_w: int = 0
     k_tiles: int = 0
     cmd_base: int = 0
     cmd_count: int = 0
     kt_cmd_base: List[int] = None
-    flags: int = 0
     def __post_init__(self):
         if self.kt_cmd_base is None:
             self.kt_cmd_base = []
@@ -144,6 +196,7 @@ class RowConsumerDesc:
     affine_block_base: int = 0
     act_type: int = 0
     store_layout: int = 0
+    affine_c_offset: int = 0
 
 
 @dataclass
@@ -152,6 +205,55 @@ class ExecPlanEntry:
     desc_id: int = 0
     logical_uop_id: int = 0
     flags: int = 0
+
+
+@dataclass
+class FixedExecDesc:
+    kind: int = 0
+    src0_tensor: int = 255
+    src1_tensor: int = 255
+    dst_tensor: int = 255
+    param_id: int = 0
+    add_param_id: int = 0
+    act_type: int = 0
+    flags: int = 0
+    in_h: int = 0
+    in_w: int = 0
+    in_c: int = 0
+    out_c: int = 0
+    kernel: int = 0
+    stride: int = 0
+    dilation: int = 0
+    padding: int = 0
+    c_offset: int = 0
+    valid_c: int = 0
+    qparam_id: int = 0
+    reserved0: int = 0
+    reserved1: int = 0
+
+
+@dataclass
+class Block5SchedDesc:
+    pattern: int = 0
+    branch_count: int = 0
+    first_branch_conv_id: int = 0
+    first_window_sched_id: int = 0
+    first_conv_qparam_id: int = 0
+    src_tensor: int = 255
+    dst_tensor: int = 255
+    add_tensor: int = 255
+    chain_add_qparam_id0: int = 0
+    chain_add_qparam_id1: int = 0
+    chain_add_qparam_id2: int = 0
+    residual_add_qparam_id: int = 0
+    affine_param_id: int = 0
+    affine_block_count: int = 0
+    finalizer_kind: int = 0
+    scratch_region: int = 0
+    out_h: int = 0
+    out_w: int = 0
+    row_group_h: int = 0
+    valid_c: int = 0
 
 
 @dataclass
@@ -213,14 +315,16 @@ class ParamBlob:
             "window_sched_offset": words[23],
             "window_cmd_offset": words[24],
             "row_consumer_offset": words[25],
+            "fixed_exec_offset": words[26],
             "exec_plan_offset": words[27],
             "window_sched_count": words[28],
             "window_cmd_count": words[29],
+            "block5_sched_offset": words[30],
             "row_consumer_count": words[31],
         }
         if self.header["magic"] != PARAM_BLOB_MAGIC:
             raise ValueError(f"bad PARAM magic: 0x{self.header['magic']:08x}")
-        if self.header["version"] != 3:
+        if self.header["version"] != 4:
             raise ValueError(f"unsupported PARAM version: {self.header['version']}")
 
         # Read tensor descriptors. Section order defines tensor_id.
@@ -248,6 +352,67 @@ class ParamBlob:
                 kind=self._u8(bo), desc_id=self._u8(bo + 1),
                 logical_uop_id=self._u8(bo + 2), flags=self._u8(bo + 3),
             ))
+        # Read fixed exec descriptors. PARAM v4 places this section directly before exec_plan.
+        self.fixed_exec: List[FixedExecDesc] = []
+        fx_off = self.header.get("fixed_exec_offset", 0)
+        if fx_off == 0 or ep_off < fx_off or (ep_off - fx_off) % 32 != 0:
+            raise ValueError("bad fixed_exec_desc section")
+        for i in range((ep_off - fx_off) // 32):
+            bo = fx_off + i * 32
+            self.fixed_exec.append(FixedExecDesc(
+                kind=self._u8(bo),
+                src0_tensor=self._u8(bo + 1),
+                src1_tensor=self._u8(bo + 2),
+                dst_tensor=self._u8(bo + 3),
+                param_id=self._u8(bo + 4),
+                add_param_id=self._u8(bo + 5),
+                act_type=self._u8(bo + 6),
+                flags=self._u8(bo + 7),
+                in_h=self._u16(bo + 8),
+                in_w=self._u16(bo + 10),
+                in_c=self._u16(bo + 12),
+                out_c=self._u16(bo + 14),
+                kernel=self._u8(bo + 16),
+                stride=self._u8(bo + 17),
+                dilation=self._u8(bo + 18),
+                padding=self._u8(bo + 19),
+                c_offset=self._u16(bo + 20),
+                valid_c=self._u16(bo + 22),
+                qparam_id=self._u16(bo + 24),
+                reserved0=self._u16(bo + 26),
+                reserved1=self._u32(bo + 28),
+            ))
+        # Read fixed-size BLOCK5 schedule records. PARAM v4 stores the offset in header word 30.
+        self.block5_sched: List[Block5SchedDesc] = []
+        bs_off = self.header.get("block5_sched_offset", 0)
+        if bs_off == 0:
+            raise ValueError("PARAM v4 is missing block5_sched_desc section")
+        for i in range(MAX_BLOCK5_SCHED_COUNT):
+            bo = bs_off + i * 32
+            self.block5_sched.append(
+                Block5SchedDesc(
+                    pattern=self._u8(bo),
+                    branch_count=self._u8(bo + 1),
+                    first_branch_conv_id=self._u8(bo + 2),
+                    first_window_sched_id=self._u8(bo + 3),
+                    first_conv_qparam_id=self._u8(bo + 4),
+                    src_tensor=self._u8(bo + 5),
+                    dst_tensor=self._u8(bo + 6),
+                    add_tensor=self._u8(bo + 7),
+                    chain_add_qparam_id0=self._u8(bo + 8),
+                    chain_add_qparam_id1=self._u8(bo + 9),
+                    chain_add_qparam_id2=self._u8(bo + 10),
+                    residual_add_qparam_id=self._u8(bo + 11),
+                    affine_param_id=self._u8(bo + 12),
+                    affine_block_count=self._u8(bo + 13),
+                    finalizer_kind=self._u8(bo + 14),
+                    scratch_region=self._u8(bo + 15),
+                    out_h=self._u16(bo + 16),
+                    out_w=self._u16(bo + 18),
+                    row_group_h=self._u16(bo + 20),
+                    valid_c=self._u16(bo + 22),
+                )
+            )
         # Read conv exec descs
         self.conv_exec: Dict[int, ConvExecDesc] = {}
         ce_count = self.header.get("conv_exec_desc_count", 0)
@@ -278,17 +443,19 @@ class ParamBlob:
         ws_off = self.header.get("window_sched_offset", 0)
         self.window_sched_by_index: List[WindowSchedDesc] = []
         for i in range(ws_count):
-            bo = ws_off + i * 96
+            bo = ws_off + i * 128
             kt_bases = []
             for k in range(41):
-                kt_bases.append(self._u16(bo + 12 + k * 2))
+                kt_bases.append(self._u16(bo + 18 + k * 2))
             desc = WindowSchedDesc(
                 mode=self._u8(bo), kernel=self._u8(bo + 1),
                 stride=self._u8(bo + 2), dilation=self._u8(bo + 3),
-                in_c=self._u16(bo + 4), k_tiles=self._u16(bo + 6),
-                cmd_base=self._u16(bo + 8), cmd_count=self._u16(bo + 10),
+                padding=self._u8(bo + 4), cache_chunks=self._u8(bo + 5),
+                cache_col_slots=self._u8(bo + 6), flags=self._u8(bo + 7),
+                in_c=self._u16(bo + 8), out_w=self._u16(bo + 10),
+                k_tiles=self._u16(bo + 12),
+                cmd_base=self._u16(bo + 14), cmd_count=self._u16(bo + 16),
                 kt_cmd_base=kt_bases,
-                flags=self._u16(bo + 94),
             )
             self.window_sched[i] = desc
             self.window_sched_by_index.append(desc)
@@ -316,6 +483,7 @@ class ParamBlob:
                 alias_tensor=self._u8(bo + 8), affine_param_id=self._u8(bo + 9),
                 affine_block_base=self._u8(bo + 10), act_type=self._u8(bo + 11),
                 store_layout=self._u16(bo + 12),
+                affine_c_offset=self._u16(bo + 14),
             )
         # Read conv qparams (param_id=0..25)
         self.conv_qparam: Dict[int, tuple] = {}
@@ -514,19 +682,138 @@ def replay_conv_array(blob: ParamBlob, param_id: int, src: np.ndarray) -> np.nda
     return fmem.dump_tensor(dst_desc)
 
 
-def replay_affine_array(blob: ParamBlob, param_id: int, src: np.ndarray, act_type: int = ACT_NONE) -> np.ndarray:
+def replay_affine_array(blob: ParamBlob,
+                        param_id: int,
+                        src: np.ndarray,
+                        act_type: int = ACT_NONE,
+                        c_offset: int = 0) -> np.ndarray:
     blocks = blob.affine_qparam.get(param_id)
     if not blocks:
         raise KeyError(f"affine qparam not found for param_id={param_id}")
     dst = np.zeros_like(src, dtype=np.int8)
     for ch in range(src.shape[2]):
-        block_idx = ch // 32
-        lane = ch % 32
+        absolute_ch = int(c_offset) + ch
+        block_idx = absolute_ch // 32
+        lane = absolute_ch % 32
         if block_idx >= len(blocks):
             raise ValueError(f"affine param_id={param_id} missing block {block_idx} for channel {ch}")
         mul, bias, shift = blocks[block_idx]
         dst[:, :, ch] = affine_i8_to_i8_np(src[:, :, ch], mul[lane], bias[lane], shift[lane], act_type)
     return dst
+
+
+def _read_block5_sources(tensors: Dict[int, np.ndarray], fixed: FixedExecDesc, logical: int) -> List[np.ndarray]:
+    src2, src3, src4, add_tensor = unpack_block5_reserved1(fixed.reserved1)
+    if add_tensor != BLOCK5_ADD_TENSOR_NONE:
+        raise ValueError(
+            f"BLOCK5 source unpack logical={logical} unexpectedly carries add tensor {add_tensor}; "
+            "use replay_block5_add_affine for add-affine descriptors"
+        )
+    parts: List[np.ndarray] = []
+    for tid in (fixed.src0_tensor, fixed.src1_tensor, src2, src3, src4):
+        src = tensors.get(tid)
+        if src is None:
+            raise KeyError(f"BLOCK5 logical={logical} missing source tensor {tid}")
+        parts.append(src)
+    base_hw = parts[0].shape[:2]
+    for src in parts[1:]:
+        if src.shape[:2] != base_hw:
+            raise ValueError(f"BLOCK5 logical={logical} spatial mismatch: {[p.shape for p in parts]}")
+    return parts
+
+
+def replay_block5_affine(tensors: Dict[int, np.ndarray], blob: ParamBlob, fixed: FixedExecDesc, logical: int) -> np.ndarray:
+    parts = _read_block5_sources(tensors, fixed, logical)
+    cat = np.concatenate(parts, axis=2)
+    expected_channels = block5_source_channels(int(fixed.reserved0) & 0xFF) if fixed.reserved0 else None
+    if expected_channels is not None and [p.shape[2] for p in parts] != list(expected_channels):
+        raise ValueError(
+            f"BLOCK5_AFFINE logical={logical} source channel mismatch: "
+            f"{[p.shape[2] for p in parts]} vs {list(expected_channels)}"
+        )
+    if int(fixed.valid_c) and cat.shape[2] != int(fixed.valid_c):
+        raise ValueError(f"BLOCK5_AFFINE logical={logical} channel mismatch: cat={cat.shape}, fixed={fixed}")
+    return replay_affine_array(blob, int(fixed.param_id), cat, fixed.act_type)
+
+
+def replay_block5_add_affine(tensors: Dict[int, np.ndarray], blob: ParamBlob, fixed: FixedExecDesc, logical: int) -> np.ndarray:
+    src2, src3, src4, add_tensor = unpack_block5_reserved1(fixed.reserved1)
+    parts: List[np.ndarray] = []
+    for tid in (fixed.src0_tensor, fixed.src1_tensor, src2, src3, src4):
+        src = tensors.get(tid)
+        if src is None:
+            raise KeyError(f"BLOCK5_ADD_AFFINE logical={logical} missing source tensor {tid}")
+        parts.append(src)
+    expected_channels = block5_source_channels(int(fixed.reserved0) & 0xFF) if fixed.reserved0 else None
+    if expected_channels is not None and [p.shape[2] for p in parts] != list(expected_channels):
+        raise ValueError(
+            f"BLOCK5_ADD_AFFINE logical={logical} source channel mismatch: "
+            f"{[p.shape[2] for p in parts]} vs {list(expected_channels)}"
+        )
+    cat = np.concatenate(parts, axis=2)
+    residual = tensors.get(add_tensor)
+    if residual is None:
+        raise KeyError(f"BLOCK5_ADD_AFFINE logical={logical} missing residual tensor {add_tensor}")
+    if cat.shape != residual.shape:
+        raise ValueError(
+            f"BLOCK5_ADD_AFFINE logical={logical} shape mismatch: cat={cat.shape}, residual={residual.shape}"
+        )
+    if int(fixed.valid_c) and cat.shape[2] != int(fixed.valid_c):
+        raise ValueError(f"BLOCK5_ADD_AFFINE logical={logical} channel mismatch: cat={cat.shape}, fixed={fixed}")
+    added = add_i8_array(cat, residual, blob.add_qparam[fixed.add_param_id])
+    return replay_affine_array(blob, int(fixed.param_id), added, fixed.act_type)
+
+
+def replay_block5_row_group(tensors: Dict[int, np.ndarray], blob: ParamBlob, fixed: FixedExecDesc, logical: int) -> np.ndarray:
+    sched_id = (int(fixed.reserved0) >> 8) & 0xFF
+    if sched_id >= len(blob.block5_sched):
+        raise ValueError(f"BLOCK5 row-group logical={logical} bad sched_id={sched_id}")
+    bs = blob.block5_sched[sched_id]
+    pattern = int(fixed.reserved0) & 0xFF
+    if bs.pattern != pattern:
+        raise ValueError(f"BLOCK5 row-group logical={logical} pattern mismatch: fixed={pattern} schedule={bs.pattern}")
+    if bs.branch_count != 5:
+        raise ValueError(f"BLOCK5 row-group logical={logical} branch_count={bs.branch_count}, expected 5")
+    base_desc = int(bs.first_branch_conv_id)
+    if base_desc < 0 or base_desc + 4 >= len(blob.conv_exec_by_index):
+        raise ValueError(f"BLOCK5 row-group logical={logical} bad base conv desc id {base_desc}")
+    src = tensors.get(bs.src_tensor)
+    if src is None:
+        raise KeyError(f"BLOCK5 row-group logical={logical} missing source tensor {bs.src_tensor}")
+
+    raw: List[np.ndarray] = []
+    for offset in range(5):
+        conv = blob.conv_exec_by_index[base_desc + offset]
+        if conv.src_tensor != bs.src_tensor:
+            raise ValueError(
+                f"BLOCK5 row-group logical={logical} branch {offset} source mismatch: "
+                f"{conv.src_tensor} vs {bs.src_tensor}"
+            )
+        raw.append(replay_conv_array(blob, int(conv.param_id), src))
+
+    expected_channels = block5_source_channels(pattern)
+    if [x.shape[2] for x in raw] != list(expected_channels):
+        raise ValueError(
+            f"BLOCK5 row-group logical={logical} raw channel mismatch: "
+            f"{[x.shape[2] for x in raw]} vs {list(expected_channels)}"
+        )
+    branch1 = raw[1]
+    chain0 = add_i8_array(branch1, raw[2], blob.add_qparam[int(bs.chain_add_qparam_id0)])
+    chain1 = add_i8_array(chain0, raw[3], blob.add_qparam[int(bs.chain_add_qparam_id1)])
+    chain2 = add_i8_array(chain1, raw[4], blob.add_qparam[int(bs.chain_add_qparam_id2)])
+    cat = np.concatenate([raw[0], branch1, chain0, chain1, chain2], axis=2)
+    if int(bs.valid_c) and cat.shape[2] != int(bs.valid_c):
+        raise ValueError(f"BLOCK5 row-group logical={logical} concat channel mismatch: cat={cat.shape}, fixed={fixed}")
+    if bs.add_tensor != BLOCK5_ADD_TENSOR_NONE:
+        residual = tensors.get(bs.add_tensor)
+        if residual is None:
+            raise KeyError(f"BLOCK5 row-group logical={logical} missing residual tensor {bs.add_tensor}")
+        if residual.shape != cat.shape:
+            raise ValueError(
+                f"BLOCK5 row-group logical={logical} residual shape mismatch: cat={cat.shape}, residual={residual.shape}"
+            )
+        cat = add_i8_array(cat, residual, blob.add_qparam[int(bs.residual_add_qparam_id)])
+    return replay_affine_array(blob, int(bs.affine_param_id), cat, fixed.act_type)
 
 
 def _trunc_div(num: int, den: int) -> int:
@@ -601,21 +888,14 @@ class PrefixReplayResult:
 
 
 def replay_prefix(blob: ParamBlob, input_bin: Path, stop_logical_uop: int) -> PrefixReplayResult:
-    """Closed-loop PARAM v3 replay through ``stop_logical_uop``.
+    """Closed-loop PARAM v4 replay through ``stop_logical_uop``.
 
     This follows the compiled exec_plan and row-consumer descriptors. It is
     intentionally array-level: the goal is to isolate fixed-point execution
     semantics from the physical memory banking policy.
     """
-    from export_int8_hw_blob import (
-        TID_INVALID,
-        UOP_AFFINE,
-        UOP_POOL,
-        UOP_STORE,
-        build_uops,
-    )
+    from export_int8_hw_blob import TID_INVALID
 
-    uops = build_uops()
     tensors: Dict[int, np.ndarray] = {}
     executed: List[int] = []
 
@@ -639,9 +919,6 @@ def replay_prefix(blob: ParamBlob, input_bin: Path, stop_logical_uop: int) -> Pr
         logical = int(entry.logical_uop_id)
         if logical > stop_logical_uop:
             break
-        if logical < 0 or logical >= len(uops):
-            raise ValueError(f"exec entry has invalid logical_uop_id={logical}")
-        uop = uops[logical]
 
         if entry.kind == EXEC_CONV:
             desc = blob.conv_exec_by_index[int(entry.desc_id)]
@@ -664,6 +941,62 @@ def replay_prefix(blob: ParamBlob, input_bin: Path, stop_logical_uop: int) -> Pr
                 store_to_tensor(consumer.store_dst_tensor, added, consumer.store_c_offset, consumer.valid_c)
                 if consumer.alias_tensor != TID_INVALID:
                     tensors[consumer.alias_tensor] = added
+            elif consumer.mode == ROW_CONSUMER_ADD_STORE_BLOCK_ADD_AFFINE:
+                other = tensors.get(consumer.add_other_tensor)
+                if other is None:
+                    raise KeyError(f"conv param_id={desc.param_id} missing add tensor {consumer.add_other_tensor}")
+                added = add_i8_array(out, other, blob.add_qparam[consumer.add_qparam_id])
+                store_to_tensor(consumer.store_dst_tensor, added, consumer.store_c_offset, consumer.valid_c)
+                cat = tensors.get(consumer.store_dst_tensor)
+                residual = None if consumer.affine_c_offset == TID_INVALID else tensors.get(consumer.affine_c_offset)
+                if cat is None or (consumer.affine_c_offset != TID_INVALID and residual is None):
+                    raise KeyError(
+                        f"conv param_id={desc.param_id} missing block tensors "
+                        f"{consumer.store_dst_tensor}/{consumer.affine_c_offset}"
+                    )
+                block_added = (
+                    add_i8_array(cat, residual, blob.add_qparam[consumer.affine_block_base])
+                    if residual is not None
+                    else cat
+                )
+                affined = replay_affine_array(blob, consumer.affine_param_id, block_added, consumer.act_type)
+                tensors[consumer.alias_tensor] = affined
+            elif consumer.mode == ROW_CONSUMER_AFFINE_STORE:
+                affined = replay_affine_array(blob,
+                                              consumer.affine_param_id,
+                                              out,
+                                              consumer.act_type,
+                                              consumer.affine_c_offset)
+                store_to_tensor(consumer.store_dst_tensor, affined, consumer.store_c_offset, consumer.valid_c)
+                if consumer.alias_tensor != TID_INVALID:
+                    tensors[consumer.alias_tensor] = affined
+            elif consumer.mode == ROW_CONSUMER_ADD_AFFINE_STORE:
+                other = tensors.get(consumer.add_other_tensor)
+                if other is None:
+                    raise KeyError(f"conv param_id={desc.param_id} missing add tensor {consumer.add_other_tensor}")
+                added = add_i8_array(out, other, blob.add_qparam[consumer.add_qparam_id])
+                affined = replay_affine_array(blob,
+                                              consumer.affine_param_id,
+                                              added,
+                                              consumer.act_type,
+                                              consumer.affine_c_offset)
+                store_to_tensor(consumer.store_dst_tensor, affined, consumer.store_c_offset, consumer.valid_c)
+                if consumer.alias_tensor != TID_INVALID:
+                    tensors[consumer.alias_tensor] = affined
+            elif consumer.mode == ROW_CONSUMER_CAT_AFFINE_STORE:
+                tail = tensors.get(consumer.add_other_tensor)
+                if tail is None:
+                    raise KeyError(f"conv param_id={desc.param_id} missing cat tensor {consumer.add_other_tensor}")
+                needed_tail = int(consumer.valid_c) - out.shape[2]
+                if needed_tail <= 0:
+                    raise ValueError(f"conv param_id={desc.param_id} invalid cat width: out={out.shape} consumer={consumer}")
+                cat = np.concatenate([out, tail[:, :, :needed_tail]], axis=2)
+                affined = replay_affine_array(blob,
+                                              consumer.affine_param_id,
+                                              cat,
+                                              consumer.act_type,
+                                              consumer.affine_c_offset)
+                store_to_tensor(consumer.store_dst_tensor, affined, consumer.store_c_offset, consumer.valid_c)
             elif consumer.mode == ROW_CONSUMER_UPSAMPLE_OUT:
                 tensors[desc.dst_tensor] = out
             else:
@@ -672,46 +1005,81 @@ def replay_prefix(blob: ParamBlob, input_bin: Path, stop_logical_uop: int) -> Pr
             continue
 
         if entry.kind == EXEC_POOL:
-            if uop.opcode != UOP_POOL:
-                raise ValueError(f"exec pool logical {logical} maps to opcode {uop.opcode}")
-            src = tensors.get(uop.src0)
+            fixed = blob.fixed_exec[int(entry.desc_id)]
+            if fixed.kind != entry.kind:
+                raise ValueError(f"exec pool desc kind mismatch: {fixed.kind} != {entry.kind}")
+            src = tensors.get(fixed.src0_tensor)
             if src is None:
-                raise KeyError(f"pool param_id={entry.desc_id} missing src tensor {uop.src0}")
-            tensors[uop.dst] = replay_pool_array(blob, int(entry.desc_id), src)
+                raise KeyError(f"pool param_id={fixed.param_id} missing src tensor {fixed.src0_tensor}")
+            tensors[fixed.dst_tensor] = replay_pool_array(blob, int(fixed.param_id), src)
             executed.append(logical)
             continue
 
-        if entry.kind == EXEC_AFFINE:
-            if uop.opcode != UOP_AFFINE:
-                raise ValueError(f"exec affine logical {logical} maps to opcode {uop.opcode}")
-            src = tensors.get(uop.src0)
-            if src is None:
-                raise KeyError(f"affine param_id={entry.desc_id} missing src tensor {uop.src0}")
-            tensors[uop.dst] = replay_affine_array(blob, int(entry.desc_id), src, uop.act_type)
+        if entry.kind in REMOVED_P6_EXEC_KINDS:
+            raise ValueError(
+                f"removed P6 fixed-op kind={entry.kind} reached replay at logical={logical}; "
+                "PARAM v4 must fuse affine/store/add-affine into row consumers or block fixed ops"
+            )
+
+        if entry.kind == EXEC_BLOCK_AFFINE:
+            fixed = blob.fixed_exec[int(entry.desc_id)]
+            if fixed.kind != entry.kind:
+                raise ValueError(f"exec block-affine desc kind mismatch: {fixed.kind} != {entry.kind}")
+            if fixed.flags & FIXED_FLAG_BLOCK5_ROW_GROUP:
+                tensors[fixed.dst_tensor] = replay_block5_row_group(tensors, blob, fixed, logical)
+                executed.append(logical)
+                continue
+            if fixed.flags & FIXED_FLAG_BLOCK5_AFFINE:
+                tensors[fixed.dst_tensor] = replay_block5_affine(tensors, blob, fixed, logical)
+                executed.append(logical)
+                continue
+            parts = []
+            for tid in (fixed.src0_tensor, fixed.src1_tensor, fixed.reserved0):
+                if tid == TID_INVALID:
+                    continue
+                src = tensors.get(tid)
+                if src is None:
+                    raise KeyError(f"block-affine logical={logical} missing src tensor {tid}")
+                parts.append(src)
+            if not parts:
+                raise ValueError(f"block-affine logical={logical} has no source tensors")
+            cat = np.concatenate(parts, axis=2)
+            if int(fixed.valid_c) and cat.shape[2] != int(fixed.valid_c):
+                raise ValueError(f"block-affine channel mismatch logical={logical}: cat={cat.shape}, fixed={fixed}")
+            tensors[fixed.dst_tensor] = replay_affine_array(blob, int(fixed.param_id), cat, fixed.act_type)
             executed.append(logical)
             continue
 
-        if entry.kind == EXEC_STORE:
-            if uop.opcode != UOP_STORE:
-                raise ValueError(f"exec store logical {logical} maps to opcode {uop.opcode}")
-            src = tensors.get(uop.src0)
-            if src is None:
-                raise KeyError(f"store logical={logical} missing src tensor {uop.src0}")
-            store_to_tensor(uop.dst, src, uop.c_offset, uop.valid_c)
-            executed.append(logical)
-            continue
-
-        if entry.kind == EXEC_ADD_AFFINE:
-            if logical == 0 or uop.opcode != UOP_AFFINE:
-                raise ValueError(f"exec add-affine logical {logical} does not map to affine")
-            add_uop = uops[logical - 1]
-            a = tensors.get(add_uop.src0)
-            b = tensors.get(add_uop.src1)
-            if a is None or b is None:
-                raise KeyError(f"add-affine logical={logical} missing tensors {add_uop.src0}/{add_uop.src1}")
-            added = add_i8_array(a, b, blob.add_qparam[add_uop.param_id])
-            tensors[add_uop.dst] = added
-            tensors[uop.dst] = replay_affine_array(blob, int(entry.desc_id), added, uop.act_type)
+        if entry.kind == EXEC_BLOCK_ADD_AFFINE:
+            fixed = blob.fixed_exec[int(entry.desc_id)]
+            if fixed.kind != entry.kind:
+                raise ValueError(f"exec block-add-affine desc kind mismatch: {fixed.kind} != {entry.kind}")
+            if fixed.flags & FIXED_FLAG_BLOCK5_ROW_GROUP:
+                tensors[fixed.dst_tensor] = replay_block5_row_group(tensors, blob, fixed, logical)
+                executed.append(logical)
+                continue
+            if fixed.flags & FIXED_FLAG_BLOCK5_ADD_AFFINE:
+                tensors[fixed.dst_tensor] = replay_block5_add_affine(tensors, blob, fixed, logical)
+                executed.append(logical)
+                continue
+            parts = []
+            for tid in (fixed.src0_tensor, fixed.src1_tensor):
+                src = tensors.get(tid)
+                if src is None:
+                    raise KeyError(f"block-add-affine logical={logical} missing cat src tensor {tid}")
+                parts.append(src)
+            cat = np.concatenate(parts, axis=2)
+            residual = tensors.get(fixed.reserved0)
+            if residual is None:
+                raise KeyError(f"block-add-affine logical={logical} missing residual tensor {fixed.reserved0}")
+            if cat.shape != residual.shape:
+                raise ValueError(
+                    f"block-add-affine shape mismatch logical={logical}: cat={cat.shape}, residual={residual.shape}"
+                )
+            if int(fixed.valid_c) and cat.shape[2] != int(fixed.valid_c):
+                raise ValueError(f"block-add-affine channel mismatch logical={logical}: cat={cat.shape}, fixed={fixed}")
+            added = add_i8_array(cat, residual, blob.add_qparam[fixed.add_param_id])
+            tensors[fixed.dst_tensor] = replay_affine_array(blob, int(fixed.param_id), added, fixed.act_type)
             executed.append(logical)
             continue
 
@@ -796,15 +1164,15 @@ def replay_conv(fmem: FeatureMemory, blob: ParamBlob, param_id: int, src_desc: T
     sched = blob.window_sched.get(sched_id)
     bias, mult, shift = blob.conv_qparam.get(desc.qparam_id, ([0] * 32, [0] * 32, [0] * 32))
 
-    stride_val = desc.stride if desc.stride else 1
-    dilation_val = desc.dilation if desc.dilation else 1
-    padding_val = desc.padding
+    stride_val = sched.stride if sched and sched.stride else (desc.stride if desc.stride else 1)
+    dilation_val = sched.dilation if sched and sched.dilation else (desc.dilation if desc.dilation else 1)
+    padding_val = sched.padding if sched is not None else desc.padding
     out_h = math.ceil(desc.in_h / stride_val)
-    out_w = math.ceil(desc.in_w / stride_val)
-    kernel_val = desc.kernel
-    in_c = desc.in_c
+    out_w = sched.out_w if sched and sched.out_w else math.ceil(desc.in_w / stride_val)
+    kernel_val = sched.kernel if sched and sched.kernel else desc.kernel
+    in_c = sched.in_c if sched and sched.in_c else desc.in_c
     out_c = desc.out_c
-    k_tiles = desc.k_tiles
+    k_tiles = sched.k_tiles if sched and sched.k_tiles else desc.k_tiles
     act_type = ACT_RELU if (desc.flags & FLAG_RELU_EN) else ACT_NONE
 
     for oh in range(out_h):
@@ -812,36 +1180,20 @@ def replay_conv(fmem: FeatureMemory, blob: ParamBlob, param_id: int, src_desc: T
             # Build activation words for all K tiles
             act_words = []
             for kt in range(k_tiles):
-                if sched is not None:
-                    begin = sched.kt_cmd_base[kt]
-                    end = sched.kt_cmd_base[kt + 1]
-                else:
-                    begin, end = 0, 0
                 word = np.zeros(TK, dtype=np.int8)
-                if sched is not None:
-                    for ci in range(begin, end):
-                        cmd = blob.pack_cmds[sched.cmd_base + ci] if sched.cmd_base + ci < len(blob.pack_cmds) else None
-                        if cmd is None or cmd.byte_count <= 0:
-                            continue
-                        spatial_id = cmd.spatial_id
-                        kh = spatial_id // kernel_val
-                        kw = spatial_id % kernel_val
-                        ih = oh * stride_val + kh * dilation_val - padding_val
-                        iw = ow * stride_val + kw * dilation_val - padding_val
-                        tile = fmem.load_tile(src_desc, ih, iw, cmd.src_c_begin, cmd.byte_count)
-                        word[cmd.dst_lane_begin:cmd.dst_lane_begin + cmd.byte_count] = tile[:cmd.byte_count]
-                else:
-                    # no schedule — use generic linear K ordering
-                    for lane in range(TK):
-                        k = kt * TK + lane
-                        k_total = kernel_val * kernel_val * in_c
-                        if k >= k_total:
-                            break
-                        spatial, kh, kw, cin = linear_k_to_spatial_c(k, in_c, kernel_val)
-                        ih = oh * stride_val + kh * dilation_val - padding_val
-                        iw = ow * stride_val + kw * dilation_val - padding_val
-                        tile = fmem.load_tile(src_desc, ih, iw, cin, 1)
-                        word[lane] = tile[0]
+                # P7 HLS WinGen no longer executes window_pack_cmd at runtime.
+                # Replay uses the same linear-K ordering as the staged hardware
+                # builders and the SA-ready weight packer.
+                for lane in range(TK):
+                    k = kt * TK + lane
+                    k_total = kernel_val * kernel_val * in_c
+                    if k >= k_total:
+                        break
+                    spatial, kh, kw, cin = linear_k_to_spatial_c(k, in_c, kernel_val)
+                    ih = oh * stride_val + kh * dilation_val - padding_val
+                    iw = ow * stride_val + kw * dilation_val - padding_val
+                    tile = fmem.load_tile(src_desc, ih, iw, cin, 1)
+                    word[lane] = tile[0]
                 act_words.append(word)
 
             # SA: for each OC within TM tile, accumulate over KT

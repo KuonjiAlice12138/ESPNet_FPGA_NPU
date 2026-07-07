@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export PARAM-v3 closed-loop replay tensors for P7 precision debugging.
+"""Export PARAM-v4 closed-loop replay tensors for P7 precision debugging.
 
 The generated tensors are hardware-ISA goldens: they come from PARAM.BIN,
 packed weights, qparams, exec_plan, and row_consumer descriptors, not from
@@ -22,9 +22,9 @@ from hw_param_replay import ParamBlob, compare_i8_arrays, replay_prefix
 
 
 DEFAULT_ROOT = Path(r"D:\ESP_INT8")
-DEFAULT_ARTIFACT_DIR = DEFAULT_ROOT / "hw_artifacts" / "sched_v3_single_p7_hwconv_0623"
+DEFAULT_ARTIFACT_DIR = DEFAULT_ROOT / "hw_artifacts" / "sched_v4_p7_0702"
 DEFAULT_QAT_DIR = DEFAULT_ROOT / "quantized_artifacts_hw_constrained_qat_p7_hwconv_0623"
-DEFAULT_OUT_DIR = DEFAULT_ROOT / "hw_artifacts" / "p7_param_replay_prefix_hwconv_0623"
+DEFAULT_OUT_DIR = DEFAULT_ROOT / "hw_artifacts" / "p7_param_v4_replay_prefix"
 
 
 TENSOR_GOLDEN_PATHS = {

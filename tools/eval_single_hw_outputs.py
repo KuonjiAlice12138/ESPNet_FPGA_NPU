@@ -312,15 +312,15 @@ def print_summary(result: dict[str, Any]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--artifact-dir", default=r"D:\ESP_INT8\hw_artifacts\sched_v3_single")
+    parser.add_argument("--artifact-dir", default=r"D:\ESP_INT8\hw_artifacts\sched_v4_p7_0702")
     parser.add_argument("--espnet-dir", default=r"D:\ESPNet")
     parser.add_argument("--cached-data-file", default=r"D:\ESPNet\city.p")
-    parser.add_argument("--val-smoke-dir", default=r"D:\ESP_INT8\hw_artifacts\sched_v3_val_smoke")
+    parser.add_argument("--val-smoke-dir", default=r"D:\ESP_INT8\hw_artifacts\sched_v4_val_smoke")
     parser.add_argument("--lowres-logits", default="")
     parser.add_argument("--fullres-mask", default="")
     parser.add_argument(
         "--out-json",
-        default=r"D:\ESP_INT8\hw_artifacts\sched_v3_single\single_hw_output_metrics.json",
+        default=r"D:\ESP_INT8\hw_artifacts\sched_v4_p7_0702\single_hw_output_metrics.json",
     )
     args = parser.parse_args()
 

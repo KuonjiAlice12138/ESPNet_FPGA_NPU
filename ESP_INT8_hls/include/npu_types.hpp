@@ -20,6 +20,7 @@ using axi_vec_t = ap_uint<256>;
 using act_vec_t = ap_uint<256>;
 using wgt_vec_t = ap_uint<256>;
 using psum_vec_t = ap_uint<32 * 32>;
+using psum_half_vec_t = ap_uint<16 * 32>;
 using acc_t = ap_int<32>;
 
 enum mode_t : std::uint32_t {
@@ -31,12 +32,6 @@ enum mode_t : std::uint32_t {
 enum act_t : std::uint8_t {
   ACT_NONE = 0,
   ACT_RELU = 1,
-};
-
-enum post_mode_t : std::uint8_t {
-  POST_CONV = 0,
-  POST_ADD = 1,
-  POST_AFFINE = 2,
 };
 
 enum bank_id_t : std::uint8_t {
@@ -70,40 +65,6 @@ struct tensor_desc_t {
   u16_t w;
   u16_t c;
   u16_t reserved1;     // channel offset inside physical row
-};
-
-struct scale_desc_t {
-  i32_t mult;
-  u8_t shift;
-  u8_t reserved[3];
-};
-
-struct conv_param_desc_t {
-  u32_t weight_offset;
-  u32_t bias_offset;
-  u32_t requant_offset;
-  u32_t reserved;
-};
-
-struct affine_param_desc_t {
-  u32_t affine_offset;
-  u32_t reserved0;
-  u32_t reserved1;
-  u32_t reserved2;
-};
-
-struct add_param_desc_t {
-  u32_t add_offset;
-  u32_t reserved0;
-  u32_t reserved1;
-  u32_t reserved2;
-};
-
-struct pool_param_desc_t {
-  u32_t pool_offset;
-  u32_t reserved0;
-  u32_t reserved1;
-  u32_t reserved2;
 };
 
 struct conv_qparam_t {
@@ -172,11 +133,11 @@ struct param_blob_header_t {
   // [1] window_sched_desc_offset
   // [2] window_pack_cmd_offset
   // [3] row_consumer_desc_offset
-  // [4] reserved/store/fusion offset
+  // [4] fixed_exec_desc_offset
   // [5] exec_plan_offset
   // [6] window_sched_count
   // [7] window_pack_cmd_count
-  // [8] reserved/store/fusion count
+  // [8] block5_sched_desc_offset (fixed MAX_BLOCK5_SCHED_COUNT records)
   // [9] row_consumer_count
   u32_t reserved1[10];
 };
@@ -192,24 +153,12 @@ struct conv_cfg_t {
   ap_uint<1> bias_en;
 };
 
-struct post_cfg_t {
-  ap_uint<2> mode;
-  ap_uint<2> act_type;
-  ap_uint<1> requant_bypass;
-  ap_uint<6> valid_tm;
-};
-
 using conv_q_t = conv_qparam_t;
 using aff_q_t = affine_qparam_t;
 using add_q_t = add_qparam_t;
 using pool_q_t = pool_qparam_t;
 
 static_assert(sizeof(tensor_desc_t) == 16, "tensor_desc_t must be 16 bytes");
-static_assert(sizeof(scale_desc_t) == 8, "scale_desc_t must be 8 bytes");
-static_assert(sizeof(conv_param_desc_t) == 16, "conv_param_desc_t must be 16 bytes");
-static_assert(sizeof(affine_param_desc_t) == 16, "affine_param_desc_t must be 16 bytes");
-static_assert(sizeof(add_param_desc_t) == 16, "add_param_desc_t must be 16 bytes");
-static_assert(sizeof(pool_param_desc_t) == 16, "pool_param_desc_t must be 16 bytes");
 static_assert(sizeof(param_blob_header_t) == 128, "param_blob_header_t must be 128 bytes");
 
 }  // namespace esp_int8

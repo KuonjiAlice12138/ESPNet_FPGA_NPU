@@ -1,8 +1,8 @@
 # ESPNet INT8 Data Export Workflow
 
 > Historical note: this document records the older P6/P7 pre-hwconv export flow.
-> For the current P7 PARAM v3 + hardware-Conv2d-QAT baseline, use
-> `tools/README.md` and the `*_p7_hwconv_0623` artifact directories.
+> For the current P7 PARAM v4 + scheduled cached-WinGen baseline, use
+> `tools/README.md` and `D:\ESP_INT8\hw_artifacts\sched_v4_p7ef_0629`.
 
 本文档说明从“带硬件约束的 QAT”到生成 FPGA/NPU 可用 `hw_artifacts` 的完整数据处理流程。
 

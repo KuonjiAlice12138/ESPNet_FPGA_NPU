@@ -1,9 +1,9 @@
 # ESP INT8 Tools
 
-本目录只保留当前 P7/PARAM v3 工作流需要的脚本。默认基线为：
+本目录只保留当前 P7/PARAM v4 工作流需要的脚本。默认基线为：
 
 - 模型 artifact：`D:\ESP_INT8\quantized_artifacts_hw_constrained_qat_p7_hwconv_0623`
-- 硬件 artifact：`D:\ESP_INT8\hw_artifacts\sched_v3_single_p7_hwconv_0623`
+- 硬件 artifact：`D:\ESP_INT8\hw_artifacts\sched_v4_p7_0702`
 
 ## 数据与模型导出
 
@@ -24,8 +24,8 @@ D:\ESPNet\.venv\Scripts\python.exe tools\export_quantized_artifacts.py `
 ```powershell
 D:\ESPNet\.venv\Scripts\python.exe tools\export_int8_hw_blob.py `
   --artifact-dir D:\ESP_INT8\quantized_artifacts_hw_constrained_qat_p7_hwconv_0623 `
-  --out-dir D:\ESP_INT8\hw_artifacts\sched_v3_single_p7_hwconv_0623 `
-  --param-version 3 --strict-zp --strict-schedule
+  --out-dir D:\ESP_INT8\hw_artifacts\sched_v4_p7_0702 `
+  --param-version 4 --strict-zp --strict-schedule
 ```
 
 `export_val_hw_dataset.py`
@@ -40,7 +40,7 @@ Python 侧 HLS 等价 INT8 算术定义，包括 round、ADD bypass、Conv2d INT
 
 `hw_param_replay.py`
 
-解析 PARAM v3 并按 exec plan 做离线整数 replay，用于判断 golden 与硬件 ISA 是否一致。
+解析 PARAM v4 并按 exec plan 做离线整数 replay，用于判断 golden 与硬件 ISA 是否一致。
 
 `audit_p7_precision_contract.py`
 
@@ -92,4 +92,4 @@ D:\ESPNet\.venv\Scripts\python.exe tools\audit_p7_precision_contract.py `
 python tools\test_p7_contracts.py
 ```
 
-覆盖内容包括 HLS 等价 INT8 算术、PARAM v3 parser、prefix replay、Conv2d forward、prefix export smoke、precision-contract audit、WinGen schedule/weight pack 合同，以及 fullres 输出评估输入合同。旧的 HLS CSim dump 单算子测试已删除；当前以 PARAM replay vs hardware-QAT golden 作为默认对齐检查。
+覆盖内容包括 HLS 等价 INT8 算术、PARAM v4 parser、prefix replay、Conv2d forward、prefix export smoke、precision-contract audit、WinGen schedule/weight pack 合同，以及 fullres 输出评估输入合同。旧的 HLS CSim dump 单算子测试已删除；当前以 PARAM replay vs hardware-QAT golden 作为默认对齐检查。

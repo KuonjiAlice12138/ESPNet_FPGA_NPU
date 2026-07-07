@@ -43,7 +43,7 @@ INPUT_BYTES = 512 * 1024 * 3
 OUTPUT_BYTES = 64 * 128 * 2
 TARGET_BYTES = 64 * 128
 PARAM_BLOB_MAGIC = 0x544E4945
-PARAM_BLOB_VERSION_SCHED = 3
+PARAM_BLOB_VERSION_SCHED = 4
 
 
 def sha256_file(path: Path) -> str:
@@ -63,15 +63,14 @@ def read_param_header_words(path: Path) -> tuple[int, ...]:
     return struct.unpack("<32I", data)
 
 
-def check_param_blob_for_sd(param_path: Path, allow_param_v1: bool = False) -> dict[str, Any]:
+def check_param_blob_for_sd(param_path: Path) -> dict[str, Any]:
     header = read_param_header_words(param_path)
     magic, version = header[0], header[1]
     if magic != PARAM_BLOB_MAGIC:
         raise ValueError(f"bad PARAM magic in {param_path}: 0x{magic:08x}")
-    if version != PARAM_BLOB_VERSION_SCHED and not allow_param_v1:
+    if version != PARAM_BLOB_VERSION_SCHED:
         raise ValueError(
-            f"{param_path} is PARAM version {version}; P7 SD export requires v3 "
-            "unless --allow-param-v1 is set."
+            f"{param_path} is PARAM version {version}; P7 SD export requires v4 "
         )
     return {
         "file": "PARAM.BIN",
@@ -228,7 +227,7 @@ def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
         param_src = Path(args.param_src)
         if not param_src.exists():
             raise FileNotFoundError(f"param blob not found: {param_src}")
-        param_info = check_param_blob_for_sd(param_src, allow_param_v1=args.allow_param_v1)
+        param_info = check_param_blob_for_sd(param_src)
         shutil.copy2(param_src, out_dir / "PARAM.BIN")
         audit_src = Path(args.param_audit) if args.param_audit else param_src.parent / "param_audit.json"
         if audit_src.exists():
@@ -485,15 +484,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cached-data-file", default=r"D:\ESPNet\city.p")
     parser.add_argument(
         "--param-src",
-        default=r"D:\ESP_INT8\hw_artifacts\sched_v3_single\PARAM.BIN",
+        default=r"D:\ESP_INT8\hw_artifacts\sched_v4_p7_0702\PARAM.BIN",
     )
     parser.add_argument(
         "--single-hw-dir",
-        default=r"D:\ESP_INT8\hw_artifacts\sched_v3_single",
+        default=r"D:\ESP_INT8\hw_artifacts\sched_v4_p7_0702",
     )
     parser.add_argument(
         "--out-dir",
-        default=r"D:\ESP_INT8\hw_artifacts\sched_v3_val",
+        default=r"D:\ESP_INT8\hw_artifacts\sched_v4_val",
     )
     parser.add_argument("--param-audit", default="")
     parser.add_argument("--scale-table", default="")
@@ -516,7 +515,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clean-board-outputs", action="store_true")
     parser.add_argument("--write-npy", action="store_true")
     parser.add_argument("--no-copy-param", dest="copy_param", action="store_false")
-    parser.add_argument("--allow-param-v1", action="store_true")
     parser.add_argument("--check-single", action="store_true")
     parser.set_defaults(copy_param=True)
     args = parser.parse_args()

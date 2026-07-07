@@ -4,13 +4,10 @@
 namespace esp_int8 {
 
 constexpr int MAX_SA_K_TILES = MAX_K_TILE_COUNT;
-constexpr int SA_GROUP_COUNT = 2;
-constexpr int SA_GROUP_TM = TM / SA_GROUP_COUNT;
-constexpr int SA_SEGMENT_TM = 8;
-static_assert(TM == 32 && TK == 32 && SA_GROUP_TM == 16,
-              "Grouped SA assumes the P6 2x16x32 organization");
-static_assert(SA_GROUP_TM % SA_SEGMENT_TM == 0,
-              "SA group must split into equal physical segments");
+constexpr int SA_ACTIVE_TM = 16;
+constexpr int SA_GROUP_COUNT = TM / SA_ACTIVE_TM;
+static_assert(TM == 32 && TK == 32 && SA_ACTIVE_TM == 16,
+              "Time-mux SA assumes the P7 2x16x32 organization");
 
 static i8_t get_vec_i8(ap_uint<256> word, int lane) {
 #pragma HLS INLINE
@@ -18,22 +15,6 @@ static i8_t get_vec_i8(ap_uint<256> word, int lane) {
     i8_t value;
     value.range(7, 0) = bits;
     return value;
-}
-
-static void load_weight_buffer(hls::stream<wgt_vec_t>& wgt_stream,
-                               wgt_vec_t weight_buf[TM][MAX_SA_K_TILES],
-                               u16_t k_tiles) {
-#pragma HLS INLINE off
-    const int k_tiles_i = static_cast<int>(k_tiles.to_uint());
-    for (int kt_i = 0; kt_i < MAX_SA_K_TILES; ++kt_i) {
-        if (kt_i >= k_tiles_i) {
-            break;
-        }
-        for (int tm = 0; tm < TM; ++tm) {
-#pragma HLS PIPELINE II=1
-            weight_buf[tm][kt_i] = wgt_stream.read();
-        }
-    }
 }
 
 static void unpack_act(act_vec_t act_word, i8_t act_lane[TK]) {
@@ -44,7 +25,7 @@ static void unpack_act(act_vec_t act_word, i8_t act_lane[TK]) {
     }
 }
 
-static void set_psum_i32(psum_vec_t& word, int lane, i32_t value) {
+static void set_psum_half_i32(psum_half_vec_t& word, int lane, i32_t value) {
 #pragma HLS INLINE
     word.range(lane * 32 + 31, lane * 32) = value.range(31, 0);
 }
@@ -61,20 +42,21 @@ static void compute_k_valid_lanes(u16_t kt,
     }
 }
 
-template <int BASE_TM>
-static void mac_tile_segment(const i8_t act_lane[TK],
-                             const wgt_vec_t weight_buf[TM][MAX_SA_K_TILES],
-                             i32_t psum[TM],
-                             u16_t kt,
-                             u16_t k_total) {
+static void mac_tile_active_lanes(const i8_t act_lane[TK],
+                                  const wgt_vec_t weight_buf[TM][MAX_SA_K_TILES],
+                                  i32_t psum[TM],
+                                  u16_t kt,
+                                  u16_t k_total,
+                                  u8_t tm_base) {
 #pragma HLS INLINE
     bool k_valid[TK];
 #pragma HLS ARRAY_PARTITION variable=k_valid complete dim=1
     compute_k_valid_lanes(kt, k_total, k_valid);
 
-    for (int lane = 0; lane < SA_SEGMENT_TM; ++lane) {
+    const int base = static_cast<int>(tm_base.to_uint());
+    for (int lane = 0; lane < SA_ACTIVE_TM; ++lane) {
 #pragma HLS UNROLL
-        const int tm = BASE_TM + lane;
+        const int tm = base + lane;
         i32_t partial = 0;
         const wgt_vec_t wgt_word = weight_buf[tm][kt];
         for (int tk = 0; tk < TK; ++tk) {
@@ -88,24 +70,13 @@ static void mac_tile_segment(const i8_t act_lane[TK],
     }
 }
 
-static void mac_tile_all_lanes(const i8_t act_lane[TK],
-                               const wgt_vec_t weight_buf[TM][MAX_SA_K_TILES],
-                               i32_t psum[TM],
-                               u16_t kt,
-                               u16_t k_total) {
-#pragma HLS INLINE
-    mac_tile_segment<0>(act_lane, weight_buf, psum, kt, k_total);
-    mac_tile_segment<SA_SEGMENT_TM>(act_lane, weight_buf, psum, kt, k_total);
-    mac_tile_segment<SA_GROUP_TM>(act_lane, weight_buf, psum, kt, k_total);
-    mac_tile_segment<SA_GROUP_TM + SA_SEGMENT_TM>(act_lane, weight_buf, psum, kt, k_total);
-}
-
 void systolic_array_core_row(
     hls::stream<act_vec_t>& act_stream,
-    hls::stream<wgt_vec_t>& wgt_stream,
-    hls::stream<psum_vec_t>& psum_stream,
+    const wgt_vec_t weight_buf[TM][MAX_SA_K_TILES],
+    hls::stream<psum_half_vec_t>& psum_stream,
     const conv_cfg_t& cfg) {
 #pragma HLS INLINE off
+#pragma HLS ARRAY_PARTITION variable=weight_buf cyclic factor=SA_ACTIVE_TM dim=1
     const u16_t stride = (cfg.stride == 0)
                              ? static_cast<u16_t>(1)
                              : static_cast<u16_t>(cfg.stride);
@@ -120,19 +91,13 @@ void systolic_array_core_row(
                                ? TM
                                : static_cast<int>(cfg.out_c.to_uint());
 
-    wgt_vec_t weight_buf[TM][MAX_SA_K_TILES];
-#pragma HLS ARRAY_PARTITION variable=weight_buf complete dim=1
-#pragma HLS BIND_STORAGE variable=weight_buf type=ram_1p impl=bram
-
-    load_weight_buffer(wgt_stream, weight_buf, k_tiles);
-
     for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
         if (ow_i >= out_w_i) {
             break;
         }
 
         i32_t psum[TM];
-#pragma HLS ARRAY_PARTITION variable=psum complete dim=1
+#pragma HLS ARRAY_PARTITION variable=psum cyclic factor=SA_ACTIVE_TM dim=1
         for (int tm = 0; tm < TM; ++tm) {
 #pragma HLS UNROLL
             psum[tm] = 0;
@@ -148,20 +113,29 @@ void systolic_array_core_row(
 #pragma HLS ARRAY_PARTITION variable=act_lane complete dim=1
 
             unpack_act(act_word, act_lane);
-            mac_tile_all_lanes(act_lane,
-                               weight_buf,
-                               psum,
-                               static_cast<u16_t>(kt_i),
-                               k_total);
+            for (int group = 0; group < SA_GROUP_COUNT; ++group) {
+#pragma HLS PIPELINE II=1
+                mac_tile_active_lanes(act_lane,
+                                      weight_buf,
+                                      psum,
+                                      static_cast<u16_t>(kt_i),
+                                      k_total,
+                                      static_cast<u8_t>(group * SA_ACTIVE_TM));
+            }
         }
 
-        psum_vec_t psum_word = 0;
-        for (int tm = 0; tm < TM; ++tm) {
+        // Output psum in 2 half-words (16 lanes each) to break 1024-bit combinational path
+        for (int group = 0; group < SA_GROUP_COUNT; ++group) {
+#pragma HLS PIPELINE II=1
+            psum_half_vec_t group_word = 0;
+            for (int lane = 0; lane < SA_ACTIVE_TM; ++lane) {
 #pragma HLS UNROLL
-            const i32_t lane_psum = (tm < valid_tm_i) ? psum[tm] : i32_t(0);
-            set_psum_i32(psum_word, tm, lane_psum);
+                const int tm = group * SA_ACTIVE_TM + lane;
+                const i32_t lane_psum = (tm < valid_tm_i) ? psum[tm] : i32_t(0);
+                set_psum_half_i32(group_word, lane, lane_psum);
+            }
+            psum_stream.write(group_word);
         }
-        psum_stream.write(psum_word);
     }
 }
 

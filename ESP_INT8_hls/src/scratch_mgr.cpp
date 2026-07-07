@@ -1,9 +1,16 @@
 #include "../include/npu_config.hpp"
+#include "../include/npu_schedule.hpp"
 #include "../include/npu_uop.hpp"
 
 namespace esp_int8 {
 
 bool param_dma_get_tensor_desc(u8_t tensor_id, tensor_desc_t& desc);
+bool on_chip_memory_read_fmbuf_abs_word(u8_t bank_id,
+                                        u32_t byte_offset,
+                                        axi_vec_t& packed);
+bool on_chip_memory_write_fmbuf_abs_word(u8_t bank_id,
+                                         u32_t byte_offset,
+                                         axi_vec_t packed);
 
 static tensor_desc_t s_scratch_desc[4];
 static bool s_scratch_valid[4] = {false, false, false, false};
@@ -117,11 +124,8 @@ static void set_scratch_region(unsigned region) {
       next_slot = FMBUF_L30_SCRATCH_SLOT_BYTES;
       break;
     case SCRATCH_REGION_L3B0:
-      next_base = 0x000000U;
-      next_phys_c = 256;
-      next_ch_base = 0;
-      next_ch_slot = 32;
-      next_view = true;
+      next_base = FMBUF_L3B0_SCRATCH_BASE;
+      next_slot = FMBUF_L3B0_SCRATCH_SLOT_BYTES;
       break;
     default:
       next_base = 0;
@@ -201,9 +205,156 @@ static bool make_channel_view_scratch_desc(unsigned idx,
   return true;
 }
 
-static unsigned conv_scratch_region(const uop_t& uop, u16_t out_h) {
+static u8_t block5_source_channels(u16_t pattern, int src_idx) {
 #pragma HLS INLINE
-  const unsigned pid = uop.param_id.to_uint();
+  const unsigned pat = pattern.to_uint();
+  if (pat == static_cast<unsigned>(BLOCK5_PATTERN_L2_C16_4C12)) {
+    return static_cast<u8_t>(src_idx == 0 ? 16 : 12);
+  }
+  if (pat == static_cast<unsigned>(BLOCK5_PATTERN_L3_C28_4C25)) {
+    return static_cast<u8_t>(src_idx == 0 ? 28 : 25);
+  }
+  return static_cast<u8_t>(0);
+}
+
+static u32_t block5_scratch_base(u16_t pattern, u8_t first_branch_param) {
+#pragma HLS INLINE
+  if (pattern.to_uint() == static_cast<unsigned>(BLOCK5_PATTERN_L2_C16_4C12)) {
+    return static_cast<u32_t>(FMBUF_L2_BLOCK5_BASE);
+  }
+  return (first_branch_param.to_uint() < 19U)
+             ? static_cast<u32_t>(FMBUF_L30_BLOCK5_BASE)
+             : static_cast<u32_t>(FMBUF_L3B0_BLOCK5_BASE);
+}
+
+static tensor_desc_t make_block5_scratch_desc(u32_t base_offset,
+                                              u16_t rows,
+                                              u16_t out_w,
+                                              u8_t channels) {
+#pragma HLS INLINE
+  tensor_desc_t desc;
+  desc.bank_id = static_cast<u8_t>(static_cast<unsigned>(BANK_FMEM0));
+  desc.elem_bytes = static_cast<u8_t>(1);
+  desc.reserved0 = static_cast<u16_t>(channels.to_uint());
+  desc.base_offset = base_offset;
+  desc.h = rows;
+  desc.w = out_w;
+  desc.c = static_cast<u16_t>(channels.to_uint());
+  desc.reserved1 = static_cast<u16_t>(0);
+  return desc;
+}
+
+bool resolve_block5_scratch_descs(u16_t pattern,
+                                  u8_t first_branch_param,
+                                  u16_t rows,
+                                  u16_t out_w,
+                                  tensor_desc_t& s0,
+                                  tensor_desc_t& s1,
+                                  tensor_desc_t& s2,
+                                  tensor_desc_t& s3,
+                                  tensor_desc_t& s4) {
+#pragma HLS INLINE off
+  const u8_t c0 = block5_source_channels(pattern, 0);
+  const u8_t c1 = block5_source_channels(pattern, 1);
+  const u8_t c2 = block5_source_channels(pattern, 2);
+  const u8_t c3 = block5_source_channels(pattern, 3);
+  const u8_t c4 = block5_source_channels(pattern, 4);
+  if (c0.to_uint() == 0U || c1.to_uint() == 0U || c2.to_uint() == 0U ||
+      c3.to_uint() == 0U || c4.to_uint() == 0U) {
+    return false;
+  }
+  const u32_t row_pixels = static_cast<u32_t>(rows.to_uint() * out_w.to_uint());
+  u32_t cursor = block5_scratch_base(pattern, first_branch_param);
+  s0 = make_block5_scratch_desc(cursor, rows, out_w, c0);
+  cursor += row_pixels * static_cast<u32_t>(c0);
+  s1 = make_block5_scratch_desc(cursor, rows, out_w, c1);
+  cursor += row_pixels * static_cast<u32_t>(c1);
+  s2 = make_block5_scratch_desc(cursor, rows, out_w, c2);
+  cursor += row_pixels * static_cast<u32_t>(c2);
+  s3 = make_block5_scratch_desc(cursor, rows, out_w, c3);
+  cursor += row_pixels * static_cast<u32_t>(c3);
+  s4 = make_block5_scratch_desc(cursor, rows, out_w, c4);
+  return true;
+}
+
+static bool copy_src1_row_to_b2_backup(const tensor_desc_t& src1, u16_t row) {
+#pragma HLS INLINE off
+  const unsigned row_u = row.to_uint();
+  const unsigned slot = row_u & static_cast<unsigned>(B2_SRC1_BACKUP_ROWS - 1);
+  const u32_t src_base = src1.base_offset +
+                         static_cast<u32_t>(row_u * static_cast<unsigned>(B2_SRC1_BACKUP_ROW_BYTES));
+  const u32_t dst_base = static_cast<u32_t>(B2_SRC1_BACKUP_BASE) +
+                         static_cast<u32_t>(slot * static_cast<unsigned>(B2_SRC1_BACKUP_ROW_BYTES));
+
+  for (int word_idx = 0; word_idx < B2_SRC1_BACKUP_ROW_WORDS; ++word_idx) {
+#pragma HLS PIPELINE off
+    const u32_t offset = static_cast<u32_t>(word_idx * AXI_WORD_BYTES);
+    axi_vec_t word = 0;
+    if (!on_chip_memory_read_fmbuf_abs_word(src1.bank_id, src_base + offset, word)) {
+      return false;
+    }
+    if (!on_chip_memory_write_fmbuf_abs_word(static_cast<u8_t>(static_cast<unsigned>(BANK_FMEM0)),
+                                             dst_base + offset,
+                                             word)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool backup_b2_src1_rows_before_write(const tensor_desc_t& src1,
+                                      int write_row,
+                                      bool src1_saved[MAX_FM_H]) {
+#pragma HLS INLINE off
+  const unsigned out_row_begin =
+      static_cast<unsigned>(write_row) * static_cast<unsigned>(ROW_CONTIG_MAX_BYTES);
+  const unsigned out_row_end =
+      out_row_begin + static_cast<unsigned>(ROW_CONTIG_MAX_BYTES);
+  const unsigned src_base = src1.base_offset.to_uint();
+
+  for (int row = 0; row < MAX_FM_H; ++row) {
+#pragma HLS PIPELINE off
+    if (row >= write_row) {
+      break;
+    }
+    const unsigned src_row_begin =
+        src_base + static_cast<unsigned>(row) * static_cast<unsigned>(B2_SRC1_BACKUP_ROW_BYTES);
+    const unsigned src_row_end = src_row_begin + static_cast<unsigned>(B2_SRC1_BACKUP_ROW_BYTES);
+    const bool overlaps = (out_row_begin < src_row_end) && (src_row_begin < out_row_end);
+    if (overlaps && !src1_saved[row]) {
+      if (!copy_src1_row_to_b2_backup(src1, static_cast<u16_t>(row))) {
+        return false;
+      }
+      src1_saved[row] = true;
+    }
+  }
+  return true;
+}
+
+bool read_b2_backup_src1_tile(u16_t h,
+                              u16_t w,
+                              u16_t c,
+                              u8_t lanes,
+                              act_vec_t& packed) {
+#pragma HLS INLINE
+  packed = 0;
+  if (lanes.to_uint() != static_cast<unsigned>(AXI_WORD_BYTES) ||
+      c.to_uint() + static_cast<unsigned>(AXI_WORD_BYTES) > 64U) {
+    return false;
+  }
+  const unsigned slot = h.to_uint() & static_cast<unsigned>(B2_SRC1_BACKUP_ROWS - 1);
+  const u32_t byte_offset =
+      static_cast<u32_t>(B2_SRC1_BACKUP_BASE) +
+      static_cast<u32_t>(slot * static_cast<unsigned>(B2_SRC1_BACKUP_ROW_BYTES)) +
+      static_cast<u32_t>(w.to_uint() * 64U + c.to_uint());
+  return on_chip_memory_read_fmbuf_abs_word(static_cast<u8_t>(static_cast<unsigned>(BANK_FMEM0)),
+                                            byte_offset,
+                                            packed);
+}
+
+static unsigned conv_scratch_region_fields(u8_t param_id, u8_t src0_tensor, u16_t out_h) {
+#pragma HLS INLINE
+  const unsigned pid = param_id.to_uint();
   if (pid >= 1U && pid <= 6U) {
     return SCRATCH_REGION_L20;
   }
@@ -217,18 +368,18 @@ static unsigned conv_scratch_region(const uop_t& uop, u16_t out_h) {
     return SCRATCH_REGION_L3B0;
   }
   if (out_h.to_uint() >= 128U) {
-    return (uop.src0_tensor.to_uint() == static_cast<unsigned>(TID_B1_ACT))
+    return (src0_tensor.to_uint() == static_cast<unsigned>(TID_B1_ACT))
                ? SCRATCH_REGION_L20
                : SCRATCH_REGION_L2B0;
   }
-  return (uop.src0_tensor.to_uint() == static_cast<unsigned>(TID_B2_ACT))
+  return (src0_tensor.to_uint() == static_cast<unsigned>(TID_B2_ACT))
              ? SCRATCH_REGION_L30
              : SCRATCH_REGION_L3B0;
 }
 
-static unsigned add_scratch_region(const uop_t& uop) {
+static unsigned add_scratch_region_fields(u8_t param_id) {
 #pragma HLS INLINE
-  const unsigned pid = uop.param_id.to_uint();
+  const unsigned pid = param_id.to_uint();
   if (pid <= 2U) {
     return SCRATCH_REGION_L20;
   }
@@ -241,9 +392,9 @@ static unsigned add_scratch_region(const uop_t& uop) {
   return SCRATCH_REGION_L3B0;
 }
 
-static unsigned store_scratch_region(const uop_t& uop) {
+static unsigned store_scratch_region_fields(u8_t dst_tensor, u16_t in_h) {
 #pragma HLS INLINE
-  switch (uop.dst_tensor.to_uint()) {
+  switch (dst_tensor.to_uint()) {
     case static_cast<unsigned>(TID_L20_CAT):
       return SCRATCH_REGION_L20;
     case static_cast<unsigned>(TID_L2B0_CAT):
@@ -255,23 +406,28 @@ static unsigned store_scratch_region(const uop_t& uop) {
     default:
       break;
   }
-  if (uop.in_h.to_uint() >= 128U) {
+  if (in_h.to_uint() >= 128U) {
     return (s_scratch_region == SCRATCH_REGION_L20) ? SCRATCH_REGION_L20 : SCRATCH_REGION_L2B0;
   }
   return (s_scratch_region == SCRATCH_REGION_L30) ? SCRATCH_REGION_L30 : SCRATCH_REGION_L3B0;
 }
 
-static unsigned scratch_region_for_uop(const uop_t& uop, u16_t out_h) {
+static unsigned scratch_region_for_fields(u8_t opcode,
+                                          u8_t param_id,
+                                          u8_t src0_tensor,
+                                          u8_t dst_tensor,
+                                          u16_t in_h,
+                                          u16_t out_h) {
 #pragma HLS INLINE
-  const unsigned opcode = uop.opcode.to_uint();
-  if (opcode == static_cast<unsigned>(UOP_CONV)) {
-    return conv_scratch_region(uop, out_h);
+  const unsigned op = opcode.to_uint();
+  if (op == static_cast<unsigned>(UOP_CONV)) {
+    return conv_scratch_region_fields(param_id, src0_tensor, out_h);
   }
-  if (opcode == static_cast<unsigned>(UOP_ADD)) {
-    return add_scratch_region(uop);
+  if (op == static_cast<unsigned>(UOP_ADD)) {
+    return add_scratch_region_fields(param_id);
   }
-  if (opcode == static_cast<unsigned>(UOP_STORE)) {
-    return store_scratch_region(uop);
+  if (op == static_cast<unsigned>(UOP_STORE)) {
+    return store_scratch_region_fields(dst_tensor, in_h);
   }
   if (out_h.to_uint() >= 128U) {
     return s_scratch_region == SCRATCH_REGION_L2B0 ? SCRATCH_REGION_L2B0 : SCRATCH_REGION_L20;
@@ -279,17 +435,28 @@ static unsigned scratch_region_for_uop(const uop_t& uop, u16_t out_h) {
   return s_scratch_region == SCRATCH_REGION_L3B0 ? SCRATCH_REGION_L3B0 : SCRATCH_REGION_L30;
 }
 
-static bool uop_uses_scratch(const uop_t& uop) {
+static bool fields_use_scratch(u8_t src0_tensor, u8_t src1_tensor, u8_t dst_tensor) {
 #pragma HLS INLINE
-  return tensor_is_scratch(uop.src0_tensor) ||
-         tensor_is_scratch(uop.src1_tensor) ||
-         tensor_is_scratch(uop.dst_tensor);
+  return tensor_is_scratch(src0_tensor) ||
+         tensor_is_scratch(src1_tensor) ||
+         tensor_is_scratch(dst_tensor);
 }
 
-void select_scratch_region(const uop_t& uop, u16_t out_h) {
+void select_scratch_region_for_fields(u8_t opcode,
+                                      u8_t param_id,
+                                      u8_t src0_tensor,
+                                      u8_t src1_tensor,
+                                      u8_t dst_tensor,
+                                      u16_t in_h,
+                                      u16_t out_h) {
 #pragma HLS INLINE
-  if (uop_uses_scratch(uop)) {
-    set_scratch_region(scratch_region_for_uop(uop, out_h));
+  if (fields_use_scratch(src0_tensor, src1_tensor, dst_tensor)) {
+    set_scratch_region(scratch_region_for_fields(opcode,
+                                                 param_id,
+                                                 src0_tensor,
+                                                 dst_tensor,
+                                                 in_h,
+                                                 out_h));
   }
 }
 
@@ -302,28 +469,14 @@ static bool make_scratch_desc(u8_t tensor_id, u16_t h, u16_t w, u16_t c, tensor_
   }
 
   if (s_scratch_region == SCRATCH_REGION_L20) {
-    if (idx == 0U) {
-      if (!make_contiguous_scratch_desc(0,
-                                        FMBUF_L2_SCRATCH_BASE,
-                                        FMBUF_L2_SCRATCH_SLOT_BYTES,
-                                        h,
-                                        w,
-                                        c,
-                                        desc)) {
-        return false;
-      }
-    } else {
-      if (!make_channel_view_scratch_desc(idx - 1U,
-                                          FMBUF_L20_BASE,
-                                          FMBUF_L20_PHYS_C,
-                                          0,
-                                          16,
-                                          h,
-                                          w,
-                                          c,
-                                          desc)) {
-        return false;
-      }
+    if (!make_contiguous_scratch_desc(idx,
+                                      FMBUF_L2_SCRATCH_BASE,
+                                      FMBUF_L2_SCRATCH_SLOT_BYTES,
+                                      h,
+                                      w,
+                                      c,
+                                      desc)) {
+      return false;
     }
     s_scratch_desc[idx] = desc;
     s_scratch_valid[idx] = true;

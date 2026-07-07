@@ -2,7 +2,7 @@
 """Aggregated lightweight P7 Python-side contract tests.
 
 This replaces the older one-test-per-file scripts and keeps the active
-PARAM v3 / hardware-QAT checks in a single entry point.
+PARAM v4 / hardware-QAT checks in a single entry point.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import torch
 
 TOOL_DIR = Path(__file__).resolve().parent
 ROOT = TOOL_DIR.parent
-ARTIFACT_DIR = ROOT / "hw_artifacts" / "sched_v3_single_p7_hwconv_0623"
+ARTIFACT_DIR = ROOT / "hw_artifacts" / "sched_v4_p7_0702"
 QAT_DIR = ROOT / "quantized_artifacts_hw_constrained_qat_p7_hwconv_0623"
 
 sys.path.insert(0, str(TOOL_DIR))
@@ -75,15 +75,19 @@ def test_param_parser_contract() -> None:
 
     expected_offsets = audit["section_offsets"]
     expected_sizes = audit["section_sizes"]
+    hard_checks = audit["hard_checks"]
+    memory_lifetime = audit["memory_lifetime"]
 
     assert blob.header["magic"] == 0x544E4945
-    assert blob.header["version"] == 3
+    assert blob.header["version"] == 4
     assert blob.header["tensor_desc_count"] == expected_sizes["tensor_desc"] // 16
     assert blob.header["conv_exec_desc_count"] == expected_sizes["conv_exec_desc"] // 36
     assert blob.header["exec_plan_count"] == expected_sizes["exec_plan"] // 4
-    assert blob.header["window_sched_count"] == expected_sizes["window_sched_desc"] // 96
+    assert blob.header["window_sched_count"] == expected_sizes["window_sched_desc"] // 128
     assert blob.header["window_cmd_count"] == audit["window_pack_cmd_count"]
+    assert blob.header["window_cmd_count"] == 0
     assert blob.header["row_consumer_count"] == expected_sizes["row_consumer_desc"] // 16
+    assert blob.header["block5_sched_offset"] == expected_offsets["block5_sched_desc"]
 
     for key, expected in expected_offsets.items():
         header_key = {
@@ -99,6 +103,19 @@ def test_param_parser_contract() -> None:
     assert len(blob.pack_cmds) == blob.header["window_cmd_count"]
     assert len(blob.row_consumer) == blob.header["row_consumer_count"]
     assert len(blob.exec_plan) == blob.header["exec_plan_count"]
+
+    assert audit["packed_weights"]["wbuf_bytes"] == 120 * 1024
+    assert hard_checks["packed_weight_fits_wbuf"] is True
+    assert hard_checks["pool2_alias_lifetime_safe"] is True
+    assert hard_checks["pool2_alias_safe"] is True
+    alias = memory_lifetime["aliases"][0]
+    assert alias["name"] == "POOL2_OVER_POOL1_FMBUF"
+    assert alias["virtual_bank"] == "BANK_BRAM_SCR1"
+    assert alias["target_bank"] == "BANK_FMEM0"
+    assert alias["base_offset"] == blob_tools.FMBUF_POOL2_ALIAS_BASE
+    pool1_lifetime = memory_lifetime["tensor_lifetimes"]["1"]
+    pool2_lifetime = memory_lifetime["tensor_lifetimes"]["8"]
+    assert pool1_lifetime["last_read"] < pool2_lifetime["first_write"]
 
 
 def test_prefix_replay_contract() -> None:
@@ -118,26 +135,9 @@ def test_prefix_replay_contract() -> None:
 
 def test_conv_forward_contract() -> None:
     blob = ParamBlob(ARTIFACT_DIR / "PARAM.BIN")
-    input_nhwc = np.fromfile(ARTIFACT_DIR / "input_q.bin", dtype=np.int8).reshape(512, 1024, 3)
-    input_nchw = torch.from_numpy(np.transpose(input_nhwc, (2, 0, 1))[None, ...].copy())
-
-    weight = torch.from_numpy(np.load(QAT_DIR / "layers" / "level1_conv" / "weight_int8.npy").astype(np.int8))
-    bias, mult, shift = blob.conv_qparam[0]
-    got = hls_conv2d_i8_nchw(
-        input_i8=input_nchw,
-        weight_i8=weight,
-        bias_i32=torch.tensor(bias[:16], dtype=torch.int64),
-        mult_i32=torch.tensor(mult[:16], dtype=torch.int64),
-        shift_u8=torch.tensor(shift[:16], dtype=torch.int64),
-        stride=(2, 2),
-        padding=(1, 1),
-        dilation=(1, 1),
-        relu=True,
-    )
-
-    expected_nhwc = replay_prefix(blob, ARTIFACT_DIR / "input_q.bin", stop_logical_uop=3).read_tensor(2)[:, :, :16]
-    expected = np.ascontiguousarray(np.transpose(expected_nhwc, (2, 0, 1))[None, ...]).astype(np.int8)
-    result = compare_i8_arrays(got.numpy().astype(np.int8), expected)
+    got = replay_prefix(blob, ARTIFACT_DIR / "input_q.bin", stop_logical_uop=2).read_tensor(3)
+    expected = load_golden_nhwc(QAT_DIR / "golden_sample" / "b1_bn" / "output_int.npy")
+    result = compare_i8_arrays(got, expected)
     assert result["mismatches"] == 0, result
 
 
@@ -148,17 +148,15 @@ def test_prefix_export_smoke() -> None:
             artifact_dir=ARTIFACT_DIR,
             qat_dir=QAT_DIR,
             out_dir=out_dir,
-            stop_logical_uop=4,
-            tensor_ids=[2, 3],
+            stop_logical_uop=2,
+            tensor_ids=[3],
         )
-        assert report["stop_logical_uop"] == 4
-        assert (out_dir / "T02_replay_nhwc.npy").exists()
-        assert (out_dir / "T02_replay_nhwc.bin").exists()
+        assert report["stop_logical_uop"] == 2
         assert (out_dir / "T03_replay_nhwc.npy").exists()
+        assert (out_dir / "T03_replay_nhwc.bin").exists()
         manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
-        assert manifest["tensors"]["2"]["shape"] == [256, 512, 19]
         assert manifest["tensors"]["3"]["shape"] == [256, 512, 19]
-        assert "qat_golden_compare" in manifest["tensors"]["2"]
+        assert "qat_golden_compare" in manifest["tensors"]["3"]
 
 
 def test_precision_audit_contract() -> None:
@@ -175,9 +173,18 @@ def test_precision_audit_contract() -> None:
 
 
 def test_window_schedule_contracts() -> None:
-    for in_c in (12, 19, 25):
-        desc, commands = blob_tools.make_window_pack_schedule(in_c=in_c, kernel=3)
-        assert desc.mode == blob_tools.WIN_MODE_SMALLC_3X3_STAGED
+    for in_c in (3, 12, 19, 25, 28, 64, 128, 131):
+        desc, commands = blob_tools.make_window_pack_schedule(
+            in_c=in_c,
+            kernel=3,
+            stride=1,
+            dilation=1,
+            padding=1,
+            out_w=128,
+        )
+        assert desc.mode == blob_tools.window_mode_for(in_c, 3)
+        assert desc.cache_chunks == (in_c + blob_tools.TK - 1) // blob_tools.TK
+        assert desc.cache_col_slots == 3
         assert desc.k_tiles == (in_c * 9 + blob_tools.TK - 1) // blob_tools.TK
         assert len(commands) < desc.k_tiles * blob_tools.TK
         for kt in range(desc.k_tiles):
@@ -190,9 +197,18 @@ def test_window_schedule_contracts() -> None:
 
     uops = blob_tools.build_uops()
     schedules, _commands, schedule_ids, _audit = blob_tools.build_window_schedule_sections(uops)
-    # U21 reads T_L20_ACT as a slice inside a 131-channel physical row. It is
-    # not 32-byte aligned for most pixels, so PARAM must not select aligned 1x1.
-    assert schedules[schedule_ids[7]].mode == blob_tools.WIN_MODE_1X1_PACKED
+    for uop in uops:
+        if uop.opcode == blob_tools.UOP_CONV and uop.kernel == 3:
+            sched = schedules[schedule_ids[uop.param_id]]
+            assert sched.mode == blob_tools.window_mode_for(uop.in_c, 3)
+            assert sched.stride == uop.stride
+            assert sched.dilation == uop.dilation
+            assert sched.padding == uop.padding
+            assert sched.out_w == blob_tools.conv_out_dim(uop.in_w, uop.stride)
+    # P7F keeps L20/L2B0 materialized as compact C64 tensors. U21 therefore
+    # should use the fast aligned 1x1 path instead of the old wide-slice packed
+    # reader.
+    assert schedules[schedule_ids[7]].mode == blob_tools.WIN_MODE_1X1_ALIGNED
     # Later 1x1 stages read fully aligned physical layouts and should keep the
     # faster aligned mode.
     assert schedules[schedule_ids[19]].mode == blob_tools.WIN_MODE_1X1_ALIGNED
@@ -226,22 +242,93 @@ def test_store_layout_schedule_contracts() -> None:
         for uop in conv_uops
     ]
 
-    conv_exec, row_consumers, _exec_plan, _coverage = blob_tools.build_exec_plan_sections(
+    conv_exec, row_consumers, fixed_exec, exec_plan, block5_sched, _coverage = blob_tools.build_exec_plan_sections(
         uops, schedule_ids, weight_offsets, weight_report
     )
+    assert fixed_exec
+    assert block5_sched
+    for sched in block5_sched:
+        assert sched.branch_count == 5
+        assert sched.pattern in (blob_tools.BLOCK5_PATTERN_L2_C16_4C12, blob_tools.BLOCK5_PATTERN_L3_C28_4C25)
+        assert sched.first_branch_conv_id + 4 < len(conv_exec)
+        assert sched.row_group_h == 64
+    for entry in exec_plan:
+        if entry.kind in (
+            blob_tools.EXEC_POOL,
+            blob_tools.EXEC_BLOCK_AFFINE,
+            blob_tools.EXEC_BLOCK_ADD_AFFINE,
+        ):
+            assert entry.desc_id < len(fixed_exec)
+            assert fixed_exec[entry.desc_id].kind == entry.kind
+            if entry.kind in (blob_tools.EXEC_BLOCK_AFFINE, blob_tools.EXEC_BLOCK_ADD_AFFINE):
+                fixed = fixed_exec[entry.desc_id]
+                dst = blob_tools.TENSOR_DESC_BY_ID[fixed.dst_tensor]
+                row_contig = fixed.flags & blob_tools.FIXED_FLAG_ROW_CONTIGUOUS_STORE
+                if row_contig:
+                    assert fixed.valid_c == dst.c == dst.phys_c, (
+                        entry,
+                        fixed,
+                        dst,
+                        "row-contiguous fixed output must materialize a full compact row",
+                    )
+                    assert dst.c_offset == 0, (entry, fixed, dst, "row-contiguous fixed output cannot be a slice")
+                    assert dst.base_offset % blob_tools.TM == 0, (
+                        entry,
+                        fixed,
+                        dst,
+                        "row-contiguous fixed output base must be 32B aligned",
+                    )
+                    assert (dst.w * fixed.valid_c) % blob_tools.TM == 0, (
+                        entry,
+                        fixed,
+                        dst,
+                        "row-contiguous fixed output row bytes must be 32B aligned",
+                    )
+                else:
+                    assert fixed.valid_c % blob_tools.TM == 0, (
+                        entry,
+                        fixed,
+                        "fixed output channel count is not full-tile",
+                    )
+                    assert dst.phys_c % blob_tools.TM == 0, (
+                        entry,
+                        fixed,
+                        dst,
+                        "fixed output row stride is not 32B aligned",
+                    )
+                    assert (dst.base_offset + dst.c_offset) % blob_tools.TM == 0, (
+                        entry,
+                        fixed,
+                        dst,
+                        "fixed output first tile is not 32B aligned",
+                    )
+                    assert fixed.valid_c <= dst.c, (entry, fixed, dst, "fixed output exceeds tensor logical channels")
 
-    for desc in conv_exec:
+    executed_conv_desc_ids = {
+        int(entry.desc_id)
+        for entry in exec_plan
+        if entry.kind == blob_tools.EXEC_CONV
+    }
+    for desc_id, desc in enumerate(conv_exec):
         consumer = row_consumers[desc.row_consumer_id]
+        if desc_id not in executed_conv_desc_ids and consumer.mode == blob_tools.ROW_CONSUMER_NONE:
+            assert consumer.reserved0 == blob_tools.STORE_LAYOUT_NONE, (desc.param_id, consumer)
+            continue
         if consumer.mode == blob_tools.ROW_CONSUMER_UPSAMPLE_OUT:
             assert consumer.reserved0 == blob_tools.STORE_LAYOUT_NONE, (desc.param_id, consumer)
             continue
         assert consumer.mode in (
             blob_tools.ROW_CONSUMER_NONE,
-            blob_tools.ROW_CONSUMER_STORE,
-            blob_tools.ROW_CONSUMER_ADD_STORE,
+            blob_tools.ROW_CONSUMER_CAT_AFFINE_STORE,
         )
-        assert consumer.reserved0 != blob_tools.STORE_LAYOUT_NONE, (desc.param_id, consumer)
-        assert consumer.reserved0 in blob_tools.STORE_LAYOUT_NAMES, (desc.param_id, consumer)
+        assert consumer.reserved0 in (
+            blob_tools.STORE_LAYOUT_NONE,
+            blob_tools.STORE_LAYOUT_COMPACT_C12,
+            blob_tools.STORE_LAYOUT_COMPACT_C19,
+            blob_tools.STORE_LAYOUT_COMPACT_C25,
+        ), (desc.param_id, consumer)
+        if desc_id in executed_conv_desc_ids:
+            assert consumer.reserved0 != blob_tools.STORE_LAYOUT_NONE, (desc.param_id, consumer)
 
 
 def test_weight_pack_contract() -> None:

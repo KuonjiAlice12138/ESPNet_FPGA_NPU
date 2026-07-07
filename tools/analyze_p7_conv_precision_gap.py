@@ -102,7 +102,7 @@ def parse_layers(value: str) -> Iterable[int]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact-dir", type=Path, default=Path(r"D:\ESP_INT8\quantized_artifacts_hw_constrained_qat_p7_hwconv_0623"))
-    parser.add_argument("--param", type=Path, default=Path(r"D:\ESP_INT8\hw_artifacts\sched_v3_single_p7_hwconv_0623\PARAM.BIN"))
+    parser.add_argument("--param", type=Path, default=Path(r"D:\ESP_INT8\hw_artifacts\sched_v4_p7_0702\PARAM.BIN"))
     parser.add_argument("--layers", default="0,1,7,13,19,25",
                         help="Comma-separated conv param ids, or 'all'.")
     parser.add_argument("--out-json", type=Path, default=Path(r"D:\ESP_INT8\report_and_workplans\p7_conv_precision_gap_0623.json"))

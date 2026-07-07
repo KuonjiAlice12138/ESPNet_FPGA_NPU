@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit that P7 model artifacts, PARAM v3 files, and golden dumps share one model state.
+"""Audit that P7 model artifacts, PARAM v4 files, and golden dumps share one model state.
 
 The artifact directory stores PyTorch hook outputs in NCHW order. Hardware-facing
 BIN files store frame/logit tensors in NHWC order.
