@@ -27,6 +27,11 @@ enum pack_cmd_flags_t : std::uint8_t {
   PACK_CMD_ALIGNED_READ = 1 << 3,
 };
 
+enum window_sched_flags_t : std::uint8_t {
+  WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2 = 1 << 0,
+  WINDOW_SCHED_FLAG_ODD_TAIL = 1 << 1,
+};
+
 enum row_consumer_mode_t : std::uint8_t {
   ROW_CONSUMER_NONE = 0,
   ROW_CONSUMER_STORE = 1,
@@ -50,7 +55,6 @@ enum store_layout_mode_t : std::uint8_t {
   STORE_LAYOUT_NARROW_FIXED = 8,
   STORE_LAYOUT_COMPACT_C19 = 9,
   STORE_LAYOUT_PREFIX_ZERO_PAD = 10,
-  STORE_LAYOUT_COLD_RMW_FALLBACK = 15,
 };
 
 enum exec_kind_t : std::uint8_t {

@@ -173,27 +173,35 @@ def test_precision_audit_contract() -> None:
 
 
 def test_window_schedule_contracts() -> None:
-    for in_c in (3, 12, 19, 25, 28, 64, 128, 131):
-        desc, commands = blob_tools.make_window_pack_schedule(
-            in_c=in_c,
-            kernel=3,
-            stride=1,
-            dilation=1,
-            padding=1,
-            out_w=128,
-        )
-        assert desc.mode == blob_tools.window_mode_for(in_c, 3)
-        assert desc.cache_chunks == (in_c + blob_tools.TK - 1) // blob_tools.TK
-        assert desc.cache_col_slots == 3
-        assert desc.k_tiles == (in_c * 9 + blob_tools.TK - 1) // blob_tools.TK
-        assert len(commands) < desc.k_tiles * blob_tools.TK
-        for kt in range(desc.k_tiles):
-            begin = desc.kt_cmd_base[kt]
-            end = desc.kt_cmd_base[kt + 1]
-            assert end - begin <= blob_tools.MAX_PACK_CMDS_PER_KT
-            assert sum(cmd.byte_count for cmd in commands[begin:end]) == min(
-                blob_tools.TK, in_c * 9 - kt * blob_tools.TK
+    for dilation in (1, 2, 4, 8, 16):
+        for in_c in (3, 12, 19, 25):
+            desc, commands = blob_tools.make_window_pack_schedule(
+                in_c=in_c,
+                kernel=3,
+                stride=1,
+                dilation=dilation,
+                padding=dilation,
+                out_w=128,
             )
+            assert desc.mode == blob_tools.window_mode_for(in_c, 3)
+            assert desc.cache_chunks == 1
+            assert desc.cache_col_slots == 4 * dilation
+            assert desc.k_tiles == (in_c * 9 + blob_tools.TK - 1) // blob_tools.TK
+            assert len(commands) < desc.k_tiles * blob_tools.TK
+            for kt in range(desc.k_tiles):
+                begin = desc.kt_cmd_base[kt]
+                end = desc.kt_cmd_base[kt + 1]
+                assert end - begin <= blob_tools.MAX_PACK_CMDS_PER_KT
+                assert sum(cmd.byte_count for cmd in commands[begin:end]) == min(
+                    blob_tools.TK, in_c * 9 - kt * blob_tools.TK
+                )
+
+    for in_c in (28, 64, 128, 131):
+        desc, _commands = blob_tools.make_window_pack_schedule(
+            in_c=in_c, kernel=3, stride=1, dilation=1, padding=1, out_w=128
+        )
+        assert desc.cache_chunks == (in_c + blob_tools.TK - 1) // blob_tools.TK
+        assert desc.cache_col_slots == 4
 
     uops = blob_tools.build_uops()
     schedules, _commands, schedule_ids, _audit = blob_tools.build_window_schedule_sections(uops)
@@ -205,6 +213,30 @@ def test_window_schedule_contracts() -> None:
             assert sched.dilation == uop.dilation
             assert sched.padding == uop.padding
             assert sched.out_w == blob_tools.conv_out_dim(uop.in_w, uop.stride)
+
+    paired_params = {
+        uop.param_id
+        for uop in uops
+        if uop.opcode == blob_tools.UOP_CONV
+        and uop.out_c <= 16
+        and uop.out_c > 0
+        and blob_tools.window_mode_supports_pixel_parallel(
+            blob_tools.window_mode_for(
+                uop.in_c,
+                uop.kernel,
+                blob_tools.tensor_supports_aligned_1x1_read(uop.src0),
+            )
+        )
+    }
+    assert paired_params
+    for uop in uops:
+        if uop.opcode != blob_tools.UOP_CONV:
+            continue
+        sched = schedules[schedule_ids[uop.param_id]]
+        paired = bool(sched.flags & blob_tools.WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
+        assert paired == (uop.param_id in paired_params), (uop.param_id, uop.out_c, sched.flags)
+        odd_tail = bool(sched.flags & blob_tools.WINDOW_SCHED_FLAG_ODD_TAIL)
+        assert odd_tail == (paired and (sched.out_w & 1) != 0)
     # P7F keeps L20/L2B0 materialized as compact C64 tensors. U21 therefore
     # should use the fast aligned 1x1 path instead of the old wide-slice packed
     # reader.

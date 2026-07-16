@@ -13,7 +13,6 @@ bool param_dma_ready();
 bool param_dma_get_tensor_desc(u8_t tensor_id, tensor_desc_t& desc);
 bool param_dma_get_conv_exec_desc(u8_t id, conv_exec_desc_t& desc);
 bool param_dma_get_window_sched(u8_t id, window_sched_desc_t& desc);
-bool param_dma_get_pack_cmd(u16_t cmd_idx, window_pack_cmd_t& cmd);
 bool param_dma_get_row_consumer(u8_t id, row_consumer_desc_t& desc);
 bool param_dma_get_exec_entry(u8_t pc, exec_plan_entry_t& entry);
 bool param_dma_get_packed_weight_vec(const conv_exec_desc_t& desc, u16_t tm, u16_t kt, wgt_vec_t& word);
@@ -53,14 +52,14 @@ static bool load_blob(const char* path, std::vector<esp_int8::axi_vec_t>& param,
     return true;
 }
 
-static bool validate_v3_schedule_contract() {
+static bool validate_v4_schedule_contract() {
     using namespace esp_int8;
     bool ok = true;
 
     tensor_desc_t input_desc;
     ok &= expect(param_dma_get_tensor_desc(TID_INPUT, input_desc), "input tensor desc loaded");
     ok &= expect(input_desc.h == 512 && input_desc.w == 1024 && input_desc.c == 3,
-                 "input tensor shape matches PARAM v3 contract");
+                 "input tensor shape matches PARAM v4 contract");
 
     conv_exec_desc_t conv0;
     ok &= expect(param_dma_get_conv_exec_desc(0, conv0), "conv exec desc 0 loaded");
@@ -73,28 +72,25 @@ static bool validate_v3_schedule_contract() {
 
     window_sched_desc_t sched0;
     ok &= expect(param_dma_get_window_sched(conv0.window_sched_id, sched0), "conv0 schedule loaded");
-    ok &= expect(sched0.mode == WIN_MODE_FIRST_C3, "first layer C3 schedule mode");
+    ok &= expect(sched0.mode == WIN_MODE_3X3_STAGED_C3, "first layer staged C3 schedule mode");
     ok &= expect(sched0.in_c == 3 && sched0.k_tiles == 1, "first layer schedule shape");
+    ok &= expect(sched0.stride == 2 && sched0.dilation == 1 && sched0.padding == 1, "first layer window geometry");
+    ok &= expect(sched0.out_w == 512 && sched0.cache_chunks == 1, "first layer staged window descriptor");
     ok &= expect(sched0.cmd_count == 9, "first layer has 9 spatial pack commands");
     ok &= expect(sched0.kt_cmd_base[0] == 0 && sched0.kt_cmd_base[1] == 9, "first layer kt command range");
 
-    window_pack_cmd_t cmd0;
-    ok &= expect(param_dma_get_pack_cmd(sched0.cmd_base, cmd0), "first pack command loaded");
-    ok &= expect(cmd0.spatial_id == 0 && cmd0.src_c_begin == 0 &&
-                 cmd0.dst_lane_begin == 0 && cmd0.byte_count == 3,
-                 "first pack command copies C3 spatial segment");
-    ok &= expect((cmd0.flags & PACK_CMD_VALID) != 0, "first pack command valid flag");
-
     window_sched_desc_t c12_sched;
     ok &= expect(param_dma_get_window_sched(2, c12_sched), "C12 schedule loaded");
-    ok &= expect(c12_sched.mode == WIN_MODE_SMALLC_3X3_STAGED, "C12 scheduled small-C mode");
+    ok &= expect(c12_sched.mode == WIN_MODE_3X3_STAGED_C12, "C12 staged schedule mode");
     ok &= expect(c12_sched.in_c == 12 && c12_sched.k_tiles == 4, "C12 schedule shape");
+    ok &= expect(c12_sched.cache_chunks == 1 && c12_sched.cache_col_slots == 3, "C12 cache descriptor");
     ok &= expect(c12_sched.cmd_count == 11, "C12 schedule is segment-level, not lane-level");
 
     window_sched_desc_t c25_sched;
     ok &= expect(param_dma_get_window_sched(5, c25_sched), "C25 schedule loaded");
-    ok &= expect(c25_sched.mode == WIN_MODE_SMALLC_3X3_STAGED, "C25 scheduled small-C mode");
+    ok &= expect(c25_sched.mode == WIN_MODE_3X3_STAGED_C25, "C25 staged schedule mode");
     ok &= expect(c25_sched.in_c == 25 && c25_sched.k_tiles == 8, "C25 schedule shape");
+    ok &= expect(c25_sched.cache_chunks == 1 && c25_sched.cache_col_slots == 3, "C25 cache descriptor");
     ok &= expect(c25_sched.cmd_count == 16, "C25 schedule is segment-level, not lane-level");
 
     row_consumer_desc_t row3;
@@ -125,7 +121,7 @@ static bool validate_v3_schedule_contract() {
 }
 
 int main() {
-    const char* blob_path = "D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623/PARAM.BIN";
+    const char* blob_path = "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/PARAM.BIN";
     std::vector<esp_int8::axi_vec_t> param;
     std::size_t byte_count = 0;
     if (!load_blob(blob_path, param, byte_count)) {
@@ -134,13 +130,13 @@ int main() {
 
     esp_int8::param_dma_init(param.data());
     if (!esp_int8::param_dma_ready()) {
-        std::printf("param_dma_init rejected PARAM v3 blob\n");
+        std::printf("param_dma_init rejected PARAM v4 blob\n");
         return 1;
     }
-    if (!validate_v3_schedule_contract()) {
+    if (!validate_v4_schedule_contract()) {
         return 1;
     }
 
-    std::printf("blob_v3_tb passed: bytes=%zu\n", byte_count);
+    std::printf("blob_v4_tb passed: bytes=%zu\n", byte_count);
     return 0;
 }

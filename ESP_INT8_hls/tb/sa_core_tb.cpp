@@ -1,4 +1,5 @@
 #include "../include/npu_config.hpp"
+#include "../include/npu_schedule.hpp"
 #include "../include/npu_types.hpp"
 
 #include <cstdint>
@@ -6,10 +7,12 @@
 
 namespace esp_int8 {
 void systolic_array_core_row(
-    hls::stream<act_vec_t>& act_stream,
-    hls::stream<wgt_vec_t>& wgt_stream,
-    hls::stream<psum_vec_t>& psum_stream,
-    const conv_cfg_t& cfg);
+    hls::stream<act_vec_t>& act_stream0,
+    hls::stream<act_vec_t>& act_stream1,
+    const wgt_vec_t weight_buf[TM][MAX_K_TILE_COUNT],
+    hls::stream<psum_half_vec_t>& psum_stream,
+    hls::stream<conv_cfg_t>& cfg_stream,
+    hls::stream<u8_t>& sched_flags_stream);
 }  // namespace esp_int8
 
 static int g_failures = 0;
@@ -44,7 +47,7 @@ static std::int32_t dot_ref(const std::int8_t* act, const std::int8_t* wgt, int 
     return sum;
 }
 
-static esp_int8::i32_t get_psum_i32(const esp_int8::psum_vec_t& word, int lane) {
+static esp_int8::i32_t get_psum_i32(const esp_int8::psum_half_vec_t& word, int lane) {
     esp_int8::i32_t value;
     value.range(31, 0) = word.range(lane * 32 + 31, lane * 32);
     return value;
@@ -63,10 +66,14 @@ static void run_case(const char* tag,
                      const std::int8_t* act_by_pixel,
                      const std::int8_t* wgt_by_oc,
                      int k_total,
-                     int out_pixels) {
-    hls::stream<esp_int8::act_vec_t> act_stream;
-    hls::stream<esp_int8::wgt_vec_t> wgt_stream;
-    hls::stream<esp_int8::psum_vec_t> psum_stream;
+                     int out_pixels,
+                     bool paired = false) {
+    hls::stream<esp_int8::act_vec_t> act_stream0;
+    hls::stream<esp_int8::act_vec_t> act_stream1;
+    hls::stream<esp_int8::psum_half_vec_t> psum_stream;
+    hls::stream<esp_int8::conv_cfg_t> cfg_stream;
+    hls::stream<esp_int8::u8_t> sched_flags_stream;
+    esp_int8::wgt_vec_t weight_buf[esp_int8::TM][esp_int8::MAX_K_TILE_COUNT] = {};
 
     const int k_tiles = (k_total + esp_int8::TK - 1) / esp_int8::TK;
     for (int kt = 0; kt < k_tiles; ++kt) {
@@ -75,30 +82,65 @@ static void run_case(const char* tag,
             const std::int8_t* wgt = (oc < cfg.out_c.to_int())
                 ? (wgt_by_oc + oc * k_total)
                 : (wgt_by_oc);
-            wgt_stream.write(pack_wgt(wgt, k_total, kt));
+            weight_buf[tm][kt] = pack_wgt(wgt, k_total, kt);
         }
     }
 
-    for (int pix = 0; pix < out_pixels; ++pix) {
-        const std::int8_t* act = act_by_pixel + pix * k_total;
+    const int issue_count = paired ? (out_pixels + 1) / 2 : out_pixels;
+    for (int issue = 0; issue < issue_count; ++issue) {
+        const int pix0 = paired ? issue * 2 : issue;
+        const std::int8_t* act0 = act_by_pixel + pix0 * k_total;
         for (int kt = 0; kt < k_tiles; ++kt) {
-            act_stream.write(pack_act(act, k_total, kt));
+            act_stream0.write(pack_act(act0, k_total, kt));
+            if (paired) {
+                const std::int8_t* act1 = (pix0 + 1 < out_pixels)
+                                              ? act_by_pixel + (pix0 + 1) * k_total
+                                              : act0;
+                act_stream1.write(pack_act(act1, k_total, kt));
+            }
         }
     }
 
-    esp_int8::systolic_array_core_row(act_stream, wgt_stream, psum_stream, cfg);
+    const esp_int8::u8_t flags = paired
+                                     ? static_cast<esp_int8::u8_t>(
+                                           static_cast<unsigned>(esp_int8::WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2))
+                                     : static_cast<esp_int8::u8_t>(0);
+    cfg_stream.write(cfg);
+    sched_flags_stream.write(flags);
+    esp_int8::systolic_array_core_row(
+        act_stream0,
+        act_stream1,
+        weight_buf,
+        psum_stream,
+        cfg_stream,
+        sched_flags_stream);
 
     int out_idx = 0;
     for (int pix = 0; pix < out_pixels; ++pix) {
-        const std::int8_t* act = act_by_pixel + pix * k_total;
-        const esp_int8::psum_vec_t psum_word = psum_stream.read();
-        for (int tm = 0; tm < esp_int8::TM; ++tm) {
-            const int oc = tm;
+        if (paired && (pix & 1) != 0) {
+            continue;
+        }
+        const esp_int8::psum_half_vec_t psum_word0 = psum_stream.read();
+        esp_int8::psum_half_vec_t psum_word1 = 0;
+        if (paired || cfg.out_c.to_int() > esp_int8::TM / 2) {
+            psum_word1 = psum_stream.read();
+        }
+        const int pixel_count = paired && pix + 1 < out_pixels ? 2 : 1;
+        for (int pixel_lane = 0; pixel_lane < pixel_count; ++pixel_lane) {
+          const std::int8_t* pixel_act = act_by_pixel + (pix + pixel_lane) * k_total;
+          for (int oc = 0; oc < cfg.out_c.to_int(); ++oc) {
             if (oc < cfg.out_c.to_int()) {
+                const bool second_group = paired ? (pixel_lane != 0) : (oc >= esp_int8::TM / 2);
+                const esp_int8::psum_half_vec_t& psum_word = second_group ? psum_word1 : psum_word0;
+                const int psum_lane = paired ? oc : (oc % (esp_int8::TM / 2));
                 const std::int8_t* wgt = wgt_by_oc + oc * k_total;
-                expect_eq(tag, out_idx, get_psum_i32(psum_word, tm), dot_ref(act, wgt, k_total));
+                expect_eq(tag,
+                          out_idx,
+                          get_psum_i32(psum_word, psum_lane),
+                          dot_ref(pixel_act, wgt, k_total));
                 ++out_idx;
             }
+          }
         }
     }
 
@@ -183,10 +225,36 @@ static void test_3x3_flatten() {
     run_case("SA_3X3_FLATTEN", cfg, act, wgt, 18, 1);
 }
 
+static void test_two_pixel_mapping() {
+    static std::int8_t act[4 * 12];
+    static std::int8_t wgt[12 * 12];
+    for (int pix = 0; pix < 4; ++pix) {
+        for (int k = 0; k < 12; ++k) {
+            act[pix * 12 + k] = static_cast<std::int8_t>(((pix + 2) * (k + 1)) % 9 - 4);
+        }
+    }
+    for (int oc = 0; oc < 12; ++oc) {
+        for (int k = 0; k < 12; ++k) {
+            wgt[oc * 12 + k] = static_cast<std::int8_t>((oc + 3 * k) % 7 - 3);
+        }
+    }
+    esp_int8::conv_cfg_t cfg;
+    cfg.in_h = 1;
+    cfg.in_w = 4;
+    cfg.in_c = 12;
+    cfg.out_c = 12;
+    cfg.kernel = 1;
+    cfg.stride = 1;
+    cfg.dilation = 1;
+    cfg.bias_en = 0;
+    run_case("SA_TWO_PIXEL", cfg, act, wgt, 12, 4, true);
+}
+
 int main() {
     test_1x1_basic();
     test_tail_and_multi_ktile();
     test_3x3_flatten();
+    test_two_pixel_mapping();
 
     if (g_failures != 0) {
         std::printf("sa_core_tb failed: %d failure(s)\n", g_failures);

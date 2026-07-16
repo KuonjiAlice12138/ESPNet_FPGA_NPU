@@ -46,19 +46,6 @@ static bool row_contiguous_write_plan_ok(const tensor_desc_t& dst,
          static_cast<unsigned>(ROW_CONTIG_MAX_WORDS);
 }
 
-static void row_contiguous_set_byte(axi_vec_t row_words[ROW_CONTIG_MAX_WORDS],
-                                    u32_t byte_idx,
-                                    i8_t value) {
-#pragma HLS INLINE
-  const unsigned word_idx = byte_idx.to_uint() >> 5;
-  const int lane = static_cast<int>(byte_idx.to_uint() & static_cast<unsigned>(AXI_WORD_BYTES - 1));
-  u8_t raw = 0;
-  raw.range(7, 0) = value.range(7, 0);
-  axi_vec_t word = row_words[word_idx];
-  word.range(lane * 8 + 7, lane * 8) = raw;
-  row_words[word_idx] = word;
-}
-
 static bool write_row_contiguous_abs_word(const tensor_desc_t& dst,
                                           u32_t byte_offset,
                                           axi_vec_t word) {
@@ -83,13 +70,6 @@ bool conv_store_write_row_contiguous_word(const tensor_desc_t& dst,
                                           const axi_vec_t& word) {
 #pragma HLS INLINE off
   return write_row_contiguous_abs_word(dst, abs_offset, word);
-}
-
-void conv_store_row_contiguous_set_byte(axi_vec_t row_words[ROW_CONTIG_MAX_WORDS],
-                                        u32_t byte_idx,
-                                        i8_t value) {
-#pragma HLS INLINE
-  row_contiguous_set_byte(row_words, byte_idx, value);
 }
 
 bool conv_store_row_contiguous_plan_ok(const tensor_desc_t& dst,

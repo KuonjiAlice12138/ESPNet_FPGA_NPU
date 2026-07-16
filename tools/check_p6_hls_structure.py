@@ -40,6 +40,10 @@ SCHEDULE = INC_DIR / "npu_schedule.hpp"
 CTRL = INC_DIR / "npu_ctrl.hpp"
 VEC_ALU = SRC_DIR / "vec_alu_engine.cpp"
 CONV_ENGINE = SRC_DIR / "conv_engine.cpp"
+APP_SRC = ROOT / "ESP_INT8_app" / "src"
+APP_MAIN = APP_SRC / "main.c"
+APP_NPU_C = APP_SRC / "hal" / "int8_npu.c"
+APP_NPU_H = APP_SRC / "hal" / "int8_npu.h"
 
 
 def fail(msg: str) -> int:
@@ -207,12 +211,10 @@ def check_mainctrl_structure(core: str, main_ctrl: str, ctrl: str, vec_alu: str,
         "enum npu_engine_t",
         "enum npu_issue_kind_t",
         "struct npu_issue_t",
-        "struct main_ctrl_ctx_t",
         "main_ctrl_run",
         "conv_engine_exec",
         "vec_alu_engine_exec",
         "pool_engine_exec",
-        "upsample_engine_exec",
     )
     for token in required_ctrl:
         if token not in ctrl:
@@ -222,11 +224,23 @@ def check_mainctrl_structure(core: str, main_ctrl: str, ctrl: str, vec_alu: str,
         if token not in main_ctrl:
             return fail(f"main_ctrl.cpp missing {token}")
 
+    for token in (
+        "NPU_ENGINE_UPSAMPLE",
+        "ISSUE_UPSAMPLE_ROW",
+        "upsample_engine_exec",
+        "struct main_ctrl_ctx_t",
+    ):
+        if token in ctrl or token in main_ctrl or token in core:
+            return fail(f"dead standalone-upsample/control placeholder remains: {token}")
+
     mode_run = function_body(core, "core_mode_run")
     if not mode_run:
         return fail("core_mode_run body not found")
-    if "main_ctrl_run(gmem_frame_out, profile_ctrl)" not in mode_run:
+    if "main_ctrl_run(gmem_frame_out," not in mode_run:
         return fail("core_mode_run must enter scheduled execution through main_ctrl_run")
+    for token in ("PROF_STAGE_FRAME_LOAD", "PROF_STAGE_MAIN_CTRL", "prof_stage_id", "prof_pc", "prof_issue_kind"):
+        if token not in mode_run:
+            return fail(f"core_mode_run missing stage-counter token: {token}")
     if "run_scheduled_graph(" in mode_run:
         return fail("core_mode_run still calls legacy run_scheduled_graph")
     for token in ("param_dma_is_schedule_blob()", "reset_scratch_state()", "frame_dma_load"):
@@ -240,7 +254,6 @@ def check_mainctrl_structure(core: str, main_ctrl: str, ctrl: str, vec_alu: str,
         "conv_engine_exec": 1,
         "vec_alu_engine_exec": 1,
         "pool_engine_exec": 1,
-        "upsample_engine_exec": 1,
     }
     for name, expected in expected_calls.items():
         actual = count_call_sites(exec_body, name)
@@ -259,7 +272,6 @@ def check_mainctrl_structure(core: str, main_ctrl: str, ctrl: str, vec_alu: str,
         "conv_engine_exec": 3,
         "vec_alu_engine_exec": 3,
         "pool_engine_exec": 3,
-        "upsample_engine_exec": 3,
     }
     for name, expected in total_expected.items():
         actual = count_call_sites(combined_decl, name)
@@ -281,8 +293,6 @@ def check_mainctrl_structure(core: str, main_ctrl: str, ctrl: str, vec_alu: str,
             return fail(f"main_ctrl_run missing {token}")
     for token in (
         "param_dma_get_exec_entry",
-        "main_ctrl_record_exec_fetch",
-        "main_ctrl_profile_record_exec_entry",
         "build_fixed_issue",
     ):
         if token not in main_ctrl:
@@ -312,6 +322,101 @@ def check_mainctrl_structure(core: str, main_ctrl: str, ctrl: str, vec_alu: str,
     print("  row_group_count = ceil(sched.out_h / BLOCK5_ROW_BLOCK_ROWS)")
     print("  branch_count = sched.branch_count")
     print("  estimated branch issue count = row_group_count * branch_count")
+    return 0
+
+
+def check_stage_counter_interfaces(core: str, ctrl: str, main_ctrl: str, conv_engine: str) -> int:
+    required_stages = (
+        "PROF_STAGE_IDLE = 0",
+        "PROF_STAGE_PARAM_INIT = 1",
+        "PROF_STAGE_FRAME_LOAD = 2",
+        "PROF_STAGE_MAIN_CTRL = 3",
+        "PROF_STAGE_CONV_WEIGHT_LOAD = 4",
+        "PROF_STAGE_CONV_ROW_DATAPATH = 5",
+        "PROF_STAGE_PPU_ROW_CONSUME = 6",
+        "PROF_STAGE_PPU_BLOCK5_FINAL = 7",
+        "PROF_STAGE_VEC_FIXED = 8",
+        "PROF_STAGE_AVGPOOL = 9",
+        "PROF_STAGE_UPSAMPLE_OUT = 10",
+        "PROF_STAGE_FRAME_STORE = 11",
+        "PROF_STAGE_ERROR = 12",
+        "PROF_STAGE_COUNT = 13",
+    )
+    for token in required_stages:
+        if token not in ctrl:
+            return fail(f"npu_ctrl.hpp missing stable profile stage enum token: {token}")
+    for token in ("prof_stage_id", "prof_active", "prof_pc", "prof_issue_kind"):
+        if token not in core:
+            return fail(f"top signature missing profile pin: {token}")
+        expected_iface = "ap_vld" if token == "prof_stage_id" else "ap_none"
+        if f"#pragma HLS INTERFACE {expected_iface} port={token}" not in core:
+            return fail(f"profile pin must be {expected_iface}, not AXI-Lite: {token}")
+        if f"s_axilite port={token}" in core:
+            return fail(f"profile pin incorrectly exposed as AXI-Lite: {token}")
+    for token in (
+        "PROF_STAGE_CONV_WEIGHT_LOAD",
+        "PROF_STAGE_CONV_ROW_DATAPATH",
+        "PROF_STAGE_PPU_ROW_CONSUME",
+        "PROF_STAGE_PPU_BLOCK5_FINAL",
+    ):
+        if token not in conv_engine:
+            return fail(f"conv_engine.cpp missing stage token: {token}")
+    for token in ("prof_pc = ctx.pc", "prof_issue_kind = issue.kind"):
+        if token not in main_ctrl:
+            return fail(f"main_ctrl.cpp missing issue profile assignment: {token}")
+    hot_loop_patterns = (
+        r"for\s*\([^)]*ow",
+        r"for\s*\([^)]*kt",
+        r"for\s*\([^)]*lane",
+        r"for\s*\([^)]*pixel",
+        r"for\s*\([^)]*byte",
+        r"for\s*\([^)]*kh",
+        r"for\s*\([^)]*kw",
+    )
+    for source_name, source in (("conv_engine.cpp", conv_engine), ("main_ctrl.cpp", main_ctrl)):
+        for match in re.finditer(r"npu_profile_set_stage\s*\(", source):
+            prefix = source[: match.start()]
+            line_start = prefix.rfind("\n")
+            nearby = source[max(0, line_start - 240) : match.start()]
+            if any(re.search(pattern, nearby) for pattern in hot_loop_patterns):
+                return fail(f"profile stage update appears near hot loop in {source_name}")
+    return 0
+
+
+def check_app_stage_counter() -> int:
+    if not APP_MAIN.exists() or not APP_NPU_C.exists() or not APP_NPU_H.exists():
+        return fail("app source files for stage counter check are missing")
+    app_main = read(APP_MAIN)
+    app_npu_c = read(APP_NPU_C)
+    app_npu_h = read(APP_NPU_H)
+    for token in (
+        "stage_counter_clear",
+        "stage_counter_enable",
+        "stage_counter_freeze",
+        "stage_counter_read_total",
+        "stage_counter_read_active",
+        "stage_counter_read_stage",
+        "stage_counter_dump_csv",
+    ):
+        if token not in app_npu_h:
+            return fail(f"int8_npu.h missing stage counter API: {token}")
+        if token not in app_npu_c:
+            return fail(f"int8_npu.c missing stage counter implementation: {token}")
+    for token in (
+        "RTL_STAGE_CYCLES_BEGIN",
+        "RTL_STAGE_CYCLES_END",
+        "STAGE_COUNTER_STAGE_BASE_OFFSET",
+    ):
+        if token not in app_npu_c:
+            return fail(f"int8_npu.c missing stage counter output/register token: {token}")
+    for token in (
+        "stage_counter_clear();",
+        "stage_counter_enable(1U);",
+        "stage_counter_freeze(1U);",
+        "stage_counter_dump_csv();",
+    ):
+        if token not in app_main:
+            return fail(f"main.c MODE_RUN path missing stage counter call: {token}")
     return 0
 
 
@@ -382,6 +487,20 @@ def check_executor_gateways(
         return fail("shared_conv_row_engine body not found")
     if count_call_sites(row_engine_body, "systolic_array_core_row") != 1:
         return fail("shared_conv_row_engine must call systolic_array_core_row exactly once")
+    for token in ("sa_cfg_stream", "sa_sched_flags_stream"):
+        if token not in row_engine_body:
+            return fail(f"Round 3 DATAFLOW control stream missing from shared_conv_row_engine: {token}")
+    if "sched.flags" in row_engine_body:
+        return fail("Round 3 DATAFLOW stages must not read sched.flags directly from the caller")
+
+    post_body = function_body(conv_engine, "post_process_row_to_buffer")
+    if post_body is None:
+        return fail("post_process_row_to_buffer body not found")
+    if "set_act_vec_i8_dynamic" in post_body:
+        return fail("Round 3 postprocess still performs dynamic packed-word RMW")
+    for token in ("POST_LANES_PER_CYCLE", "out_lanes", "POST_REQUANT_GROUPS"):
+        if token not in post_body:
+            return fail(f"Round 3 shared lane postprocess structure missing: {token}")
 
     for token in (
         "run_scheduled_conv_op",
@@ -414,8 +533,16 @@ def check_executor_gateways(
             return fail(f"standalone Vec BLOCK5 finalizer remains after PPU-2: {token}")
     if "run_fixed_aligned_affine_family_op" in core or "run_fixed_aligned_affine_family_op" in vec_alu:
         return fail("run_fixed_aligned_affine_family_op remains; split affine-only and add-affine paths")
-    if function_body(vec_alu, "run_fixed_aligned_affine_only_op") is None:
-        return fail("vec_alu_engine.cpp missing fixed aligned affine-only path")
+    if function_body(vec_alu, "run_fixed_affine_common") is None:
+        return fail("vec_alu_engine.cpp missing Round5 common fixed-affine path")
+    for legacy_runner in (
+        "run_fixed_aligned_affine_only_op",
+        "run_fixed_row_contiguous_datapath",
+        "run_fixed_row_contiguous_op",
+        "run_b2_c131_row_contiguous_backup_op",
+    ):
+        if function_body(vec_alu, legacy_runner) is not None:
+            return fail(f"Round5 duplicate fixed-affine runner remains: {legacy_runner}")
     if function_body(vec_alu, "run_fixed_aligned_add_affine_op") is not None:
         return fail("PPU-3 narrowing failed: standalone fixed add-affine path remains in Vec")
 
@@ -452,8 +579,8 @@ def check_executor_gateways(
         "ppu_block5_l3_tile1_to_word",
         "ppu_block5_l3_tile2_to_word",
         "ppu_block5_l3_tile3_to_word",
-        "ppu_finalize_block5_l2_row",
-        "ppu_finalize_block5_l3_row",
+        "ppu_finalize_block5_emit_tiles",
+        "ppu_finalize_block5_static_row",
     ):
         if function_body(ppu, token) is None:
             return fail(f"PPU-5 local datapath helper missing: {token}")
@@ -468,15 +595,21 @@ def check_executor_gateways(
             return fail(f"PPU BLOCK5 runtime composer must not remain: {token}")
     if "vec_alu_apply_" in ppu:
         return fail("PPU-5 failed: ppu.cpp still calls or declares vec_alu_apply_*")
-    fixed_affine_body = function_body(vec_alu, "run_fixed_aligned_affine_only_op") or ""
+    fixed_affine_body = function_body(vec_alu, "run_fixed_affine_common") or ""
     if re.search(r"\bvec_alu_apply_affine_only\s*\(", fixed_affine_body):
-        return fail("fixed aligned affine-only path still calls generic vec_alu_apply_affine_only")
+        return fail("common fixed-affine path still calls generic vec_alu_apply_affine_only")
     if "vec_alu_apply_affine_block" not in fixed_affine_body:
-        return fail("fixed aligned affine-only path must use vec_alu_apply_affine_block")
+        return fail("common fixed-affine path must use vec_alu_apply_affine_block")
     combined_vec_users = "\n".join([core, conv_engine, ppu, vec_alu])
     affine_block_lines = call_site_lines(combined_vec_users, "vec_alu_apply_affine_block")
     print("[MC-CHECK] AUDIT: Vec ALU arithmetic call-site audit:")
     print(f"  vec_alu_apply_affine_block users: {len(affine_block_lines)} call sites {affine_block_lines}")
+    if len(affine_block_lines) != 1:
+        return fail("Round5 requires one source call site for the fixed affine datapath")
+    if "s_shared_row_contig_words[packed_word_idx] = packed_row_word" not in fixed_affine_body:
+        return fail("Round5 row-contiguous path must assemble sequential packed words")
+    if "conv_store_row_contiguous_set_byte" in vec_alu:
+        return fail("Round5 row-contiguous path still uses the legacy random byte setter")
 
     if "consume_conv_output_row" in core:
         return fail("legacy consume_conv_output_row remains in int8_core.cpp")
@@ -513,28 +646,21 @@ def check_executor_gateways(
                 f"ppu.cpp reintroduced unsupported generic row-consumer path {token}"
             )
     for token in (
-        "ppu_add_other_row_to_buffer",
+        "ppu_preadd_row",
         "ppu_apply_row_affine",
         "ppu_cat_other_row_to_buffer",
         "ppu_consume_upsample_out",
-        "ppu_store_compact_row",
+        "ppu_store_compact_layout_row",
     ):
         if function_body(ppu, token) is None:
             return fail(f"ppu.cpp missing {token}")
-    ppu_compact_body = function_body(ppu, "ppu_store_compact_row") or ""
     for token in ("STORE_LAYOUT_COMPACT_C16", "STORE_LAYOUT_COMPACT_C28"):
-        if token in ppu_compact_body:
-            return fail(f"PPU artifact-facing compact writer still accepts internal BLOCK5 layout: {token}")
-    ppu_block5_scratch_body = function_body(ppu, "ppu_store_block5_scratch_row")
-    if ppu_block5_scratch_body is None:
-        return fail("ppu.cpp missing bounded BLOCK5 scratch transition writer")
-    for token in ("STORE_LAYOUT_COMPACT_C16", "STORE_LAYOUT_COMPACT_C28"):
-        if token not in ppu_block5_scratch_body:
-            return fail(f"PPU BLOCK5 scratch writer missing internal layout: {token}")
+        if token not in ppu_body:
+            return fail(f"PPU common compact-store tail missing bounded BLOCK5 layout: {token}")
     for token in (
         "ppu_consume_block5_final_row",
-        "ppu_finalize_block5_l2_row",
-        "ppu_finalize_block5_l3_row",
+        "ppu_finalize_block5_emit_tiles",
+        "ppu_finalize_block5_static_row",
         "ppu_block5_l2_tile0_to_word",
         "ppu_block5_l2_tile1_to_word",
         "ppu_block5_l3_tile0_to_word",
@@ -560,16 +686,14 @@ def check_executor_gateways(
     emit_lines = call_site_lines(ppu, "ppu_finalize_block5_emit_word")
     print("[MC-CHECK] AUDIT: PPU BLOCK5 emit tail call-site audit:")
     print(f"  ppu_finalize_block5_emit_word users: {len(emit_lines)} call sites {emit_lines}")
-    if len(emit_lines) > 2:
+    if len(emit_lines) != 1:
         return fail(
-            "PPU-6 failed: BLOCK5 emit tail is still replicated per static tile; "
-            "keep at most one L2 and one L3 tail call site"
+            "Round5 requires exactly one BLOCK5 arithmetic/store emit call site"
         )
 
     for token in (
         "conv_store_write_aligned_tile",
         "conv_store_write_row_contiguous_word",
-        "conv_store_row_contiguous_set_byte",
         "conv_store_row_contiguous_plan_ok",
     ):
         if token not in conv_store:
@@ -587,7 +711,6 @@ def check_executor_gateways(
     for token in (
         "conv_store_write_aligned_tile",
         "conv_store_write_row_contiguous_word",
-        "conv_store_row_contiguous_set_byte",
         "conv_store_row_contiguous_plan_ok",
     ):
         if token not in core and token not in ppu and token not in vec_alu:
@@ -616,7 +739,7 @@ def check_executor_gateways(
     print("[MC-CHECK] AUDIT: PPU conv-row streaming preserved: yes")
     print("[MC-CHECK] AUDIT: PPU upsample row-buffer path preserved: yes")
     print("[MC-CHECK] AUDIT: extra logits memory pass introduced: no")
-    for name in ("upsample_engine_exec", "pool_engine_exec"):
+    for name in ("pool_engine_exec",):
         if function_body(core, name) is None:
             return fail(f"{name} body not found")
 
@@ -774,10 +897,10 @@ def check_p7_bans(sources: dict[str, str]) -> int:
             return fail(f"avgpool reintroduced duplicated C3 pack/write path: {token}")
     if count_call_sites(avgpool, "avgpool_c3_group32_pack_write") != 2:
         return fail("avgpool must have exactly one C3 group32 pack/write call site plus its definition")
-    if "SA_ACTIVE_TM = 16" not in sa_core:
-        return fail("SA core must use the P7 16-lane time-mux datapath")
+    if "SA_ACTIVE_TM = 32" not in sa_core or "SA_OUTPUT_TM = 16" not in sa_core:
+        return fail("SA core must keep the P7 32-lane MAC / 16-lane output grouping")
     if "cyclic factor=SA_ACTIVE_TM" not in sa_core:
-        return fail("SA core must partition arrays by active 16-lane group")
+        return fail("SA core must partition arrays by the active 32-lane MAC group")
     if "emit_fullres_rows(" in upsample and upsample.count("emit_fullres_rows(") > 2:
         return fail("upsample fullres emitter has multiple specialized call sites")
     for token in ("resolve_block5_scratch_descs", "copy_src1_row_to_b2_backup", "read_b2_backup_src1_tile"):
@@ -809,7 +932,6 @@ def check_csynth_hierarchy(report_root: Path) -> int:
         "execute_issue",
         "conv_engine_exec",
         "vec_alu_engine_exec",
-        "upsample_engine_exec",
         "run_conv_issue_once",
         "run_conv_rows_task",
         "shared_conv_row_engine",
@@ -839,9 +961,125 @@ def check_csynth_hierarchy(report_root: Path) -> int:
     return 0
 
 
+def check_round2_wingen_structure(win_gen: str, exporter: str) -> int:
+    banned = (
+        "find_cached_col",
+        "select_replacement_slot",
+        "update_3x3_column_cache",
+        "WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS",
+    )
+    for token in banned:
+        if token in win_gen:
+            return fail(f"Round2 WinGen legacy associative/unified cache remains: {token}")
+    required = (
+        "scheduled_narrow_3x3_window_row",
+        "scheduled_wide_3x3_window_row",
+        "update_narrow_direct_cache",
+        "update_wide_direct_cache",
+        "stage_narrow_3x3_window",
+        "narrow_3x3_window_t",
+        "s_narrow_cache_row0",
+        "s_narrow_cache_row1",
+        "s_narrow_cache_row2",
+    )
+    for token in required:
+        if token not in win_gen:
+            return fail(f"Round2 WinGen structure missing: {token}")
+    narrow_body = function_body(win_gen, "scheduled_narrow_3x3_window_row")
+    if "ARRAY_PARTITION variable=cache.data" in narrow_body:
+        return fail("narrow WinGen cache is still completely partitioned instead of BRAM-backed")
+    emit_body = function_body(win_gen, "emit_narrow_words_for_mode")
+    if "s_narrow_cache_row" in emit_body:
+        return fail("narrow packer still reads the BRAM cache directly instead of the 9-word snapshot")
+    if "4 * dilation" not in exporter:
+        return fail("exporter does not compile dilation-aware cache_col_slots")
+    return 0
+
+
+def check_round4a_ppu_structure(ppu: str, conv_engine: str) -> int:
+    """Gate the Round4A-R single-owner PPU add and compact-store structure."""
+    required = (
+        "ppu_preadd_row",
+        "ppu_pack_compact_group",
+        "ppu_store_compact_row_core",
+    )
+    for token in required:
+        if function_body(ppu, token) is None:
+            return fail(f"Round4A-R PPU single-owner structure missing: {token}")
+
+    if count_call_sites(ppu, "ppu_preadd_row") != 1:
+        return fail("Round4A-R pre-add gateway must have one definition in ppu.cpp")
+    preadd_lines = call_site_lines(conv_engine, "ppu_preadd_row")
+    if len(preadd_lines) != 1:
+        return fail(
+            "Round4A-R requires one conv_engine pre-add call site before the consumer split, "
+            f"got {preadd_lines}"
+        )
+    for consumer in ("ppu_consume_conv_row", "ppu_consume_block5_final_row"):
+        body = function_body(ppu, consumer) or ""
+        if "ppu_preadd_row" in body or "ppu_add_other_row_to_buffer" in body:
+            return fail(f"Round4A-R duplicate pre-add remains inside {consumer}")
+    if "ppu_add_other_row_to_buffer" in ppu:
+        return fail("Round4A-R legacy duplicated add helper remains in ppu.cpp")
+
+    core = function_body(ppu, "ppu_store_compact_row_core") or ""
+    packer = function_body(ppu, "ppu_pack_compact_group") or ""
+    for token in ("packed_lane", "ppu_set_act_byte", "for (int ch = 0; ch < TM; ++ch)"):
+        if token in core:
+            return fail(f"Round4A PPU still uses bytewise compact-row assembly: {token}")
+    if "ppu_pack_compact_word" in ppu:
+        return fail("Round4A-R template compact-word packer remains")
+    if count_call_sites(core, "ppu_pack_compact_group") != 1:
+        return fail("Round4A-R compact-store core must use one group packer call site")
+    if "#pragma HLS UNROLL factor=4" not in packer:
+        return fail("Round4A compact-word packer must process four lanes per cycle")
+    if "packed_groups" in packer:
+        return fail("Round4A packer must not dynamically write a partitioned group array")
+    if "out_word >> 32" not in core:
+        return fail("Round4A packer must use fixed-width sequential word assembly")
+    if function_body(ppu, "ppu_write_compact_word") is not None:
+        return fail("Round4A-R 256-bit word must not cross a separate compact writer module")
+    if "on_chip_memory_write_pool2_abs_word" not in core or "on_chip_memory_write_fmbuf_abs_word" not in core:
+        return fail("Round4A-R compact-store owner must perform the final physical word write")
+    for token in (" / phys", "% phys"):
+        if token in core or token in packer:
+            return fail(f"Round4A-R compact hot loop contains runtime divide/modulo: {token}")
+    if count_call_sites(ppu, "ppu_store_compact_row_core") != 2:
+        return fail("Round4A requires one definition and one call site for the compact-store core")
+    if count_call_sites(ppu, "ppu_store_compact_layout_row") != 2:
+        return fail("Round4A requires one definition and one common compact-store tail call site")
+    pool_read = function_body(ppu, "ppu_read_abs_word") or ""
+    compact_read = function_body(ppu, "ppu_read_block5_compact_bytes") or ""
+    if not pool_read or not compact_read:
+        return fail("Round4A-R unique PPU absolute-read gateway is missing")
+    if count_call_sites(compact_read, "ppu_read_abs_word") != 1:
+        return fail("Round4A-R compact reader must have one absolute-read call site")
+    if "ppu_block5_read_abs_word" in ppu:
+        return fail("Round4A-R legacy BLOCK5 absolute-read wrapper remains")
+    for legacy_wrapper in ("ppu_store_compact_row", "ppu_store_block5_scratch_row"):
+        if function_body(ppu, legacy_wrapper) is not None:
+            return fail(f"Round4A duplicate compact-store wrapper remains: {legacy_wrapper}")
+    for qparam_owner in (
+        "ppu_apply_row_affine",
+        "ppu_finalize_block5_static_row",
+    ):
+        body = function_body(ppu, qparam_owner) or ""
+        loop_pos = body.find("for (int ow_i")
+        if loop_pos < 0:
+            return fail(f"Round4A qparam owner missing row loop: {qparam_owner}")
+        if "param_dma_get_affine_qparam" in body[loop_pos:]:
+            return fail(f"Round4A qparam load remains inside row hot loop: {qparam_owner}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--report-root", default="", help="Optional HLS syn/report directory for post-csynth clone gate")
+    parser.add_argument(
+        "--round4ar-only",
+        action="store_true",
+        help="Run only the source-level Round4A-R owner/packer gate",
+    )
     args = parser.parse_args()
 
     obsolete_store_engine = SRC_DIR / "store_engine.cpp"
@@ -876,6 +1114,9 @@ def main() -> int:
         "tb": "\n".join(read(path) for path in TB_DIR.glob("*.cpp")),
     }
 
+    if args.round4ar_only:
+        return check_round4a_ppu_structure(sources["ppu"], sources["conv_engine"])
+
     if check_mainctrl_structure(
         sources["core"],
         sources["main_ctrl"],
@@ -885,6 +1126,15 @@ def main() -> int:
         sources["ppu"],
     ) != 0:
         return 1
+    if check_stage_counter_interfaces(
+        sources["core"],
+        sources["ctrl"],
+        sources["main_ctrl"],
+        sources["conv_engine"],
+    ) != 0:
+        return 1
+    if check_app_stage_counter() != 0:
+        return 1
     if check_executor_gateways(
         sources["core"],
         sources["conv_engine"],
@@ -892,6 +1142,10 @@ def main() -> int:
         sources["conv_store"],
         sources["ppu"],
     ) != 0:
+        return 1
+    if check_round2_wingen_structure(sources["win_gen"], read(ROOT / "tools" / "export_int8_hw_blob.py")) != 0:
+        return 1
+    if check_round4a_ppu_structure(sources["ppu"], sources["conv_engine"]) != 0:
         return 1
     if check_p7_bans(sources) != 0:
         return 1

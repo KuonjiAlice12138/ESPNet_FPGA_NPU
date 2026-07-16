@@ -2,9 +2,179 @@
 
 #include "../app_config.h"
 #include "xespnet_encoder_int8_core_hw.h"
+#include "xil_io.h"
 #include "xil_printf.h"
 #include "xparameters.h"
 #include "xstatus.h"
+
+#if defined(XPAR_NPU_STAGE_COUNTER_0_S00_AXI_BASEADDR)
+#define INT8_STAGE_COUNTER_BASEADDR XPAR_NPU_STAGE_COUNTER_0_S00_AXI_BASEADDR
+#define INT8_STAGE_COUNTER_PRESENT 1
+#elif defined(XPAR_NPU_STAGE_COUNTER_0_S_AXI_BASEADDR)
+#define INT8_STAGE_COUNTER_BASEADDR XPAR_NPU_STAGE_COUNTER_0_S_AXI_BASEADDR
+#define INT8_STAGE_COUNTER_PRESENT 1
+#elif defined(XPAR_NPU_STAGE_COUNTER_0_BASEADDR)
+#define INT8_STAGE_COUNTER_BASEADDR XPAR_NPU_STAGE_COUNTER_0_BASEADDR
+#define INT8_STAGE_COUNTER_PRESENT 1
+#elif defined(XPAR_NPU_STAGE_COUNTER_AXI_0_S00_AXI_BASEADDR)
+#define INT8_STAGE_COUNTER_BASEADDR XPAR_NPU_STAGE_COUNTER_AXI_0_S00_AXI_BASEADDR
+#define INT8_STAGE_COUNTER_PRESENT 1
+#else
+#define INT8_STAGE_COUNTER_BASEADDR 0U
+#define INT8_STAGE_COUNTER_PRESENT 0
+#endif
+
+#define STAGE_COUNTER_CTRL_OFFSET 0x000U
+#define STAGE_COUNTER_STATUS_OFFSET 0x004U
+#define STAGE_COUNTER_CURRENT_OFFSET 0x008U
+#define STAGE_COUNTER_TOTAL_LO_OFFSET 0x010U
+#define STAGE_COUNTER_TOTAL_HI_OFFSET 0x014U
+#define STAGE_COUNTER_ACTIVE_LO_OFFSET 0x018U
+#define STAGE_COUNTER_ACTIVE_HI_OFFSET 0x01CU
+#define STAGE_COUNTER_STAGE_BASE_OFFSET 0x040U
+#define STAGE_COUNTER_STAGE_STRIDE 0x008U
+
+#define STAGE_COUNTER_CTRL_ENABLE 0x00000001U
+#define STAGE_COUNTER_CTRL_CLEAR 0x00000002U
+#define STAGE_COUNTER_CTRL_FREEZE 0x00000004U
+
+static u32 stage_counter_read32(u32 offset)
+{
+#if INT8_STAGE_COUNTER_PRESENT
+    return Xil_In32((UINTPTR)INT8_STAGE_COUNTER_BASEADDR + (UINTPTR)offset);
+#else
+    (void)offset;
+    return 0U;
+#endif
+}
+
+static void stage_counter_write32(u32 offset, u32 value)
+{
+#if INT8_STAGE_COUNTER_PRESENT
+    Xil_Out32((UINTPTR)INT8_STAGE_COUNTER_BASEADDR + (UINTPTR)offset, value);
+#else
+    (void)offset;
+    (void)value;
+#endif
+}
+
+static u64 stage_counter_read64(u32 lo_offset)
+{
+    u32 lo0;
+    u32 hi0;
+    u32 lo1;
+    u32 hi1;
+    do {
+        hi0 = stage_counter_read32(lo_offset + 4U);
+        lo0 = stage_counter_read32(lo_offset);
+        hi1 = stage_counter_read32(lo_offset + 4U);
+        lo1 = lo0;
+    } while (hi0 != hi1);
+    return (((u64)hi1) << 32) | (u64)lo1;
+}
+
+static const char *stage_counter_name(unsigned stage)
+{
+    switch (stage) {
+    case 0U: return "IDLE";
+    case 1U: return "PARAM_INIT";
+    case 2U: return "FRAME_LOAD";
+    case 3U: return "MAIN_CTRL";
+    case 4U: return "CONV_WEIGHT_LOAD";
+    case 5U: return "CONV_ROW_DATAPATH";
+    case 6U: return "PPU_ROW_CONSUME";
+    case 7U: return "PPU_BLOCK5_FINAL";
+    case 8U: return "VEC_FIXED";
+    case 9U: return "AVGPOOL";
+    case 10U: return "UPSAMPLE_OUT";
+    case 11U: return "FRAME_STORE";
+    case 12U: return "ERROR";
+    default: return "UNKNOWN";
+    }
+}
+
+static u64 stage_counter_cycles_to_us(u64 cycles)
+{
+    return (cycles * 1000000ULL + (INT8_APP_PL_TARGET_HZ / 2ULL)) /
+           INT8_APP_PL_TARGET_HZ;
+}
+
+void stage_counter_clear(void)
+{
+    stage_counter_write32(STAGE_COUNTER_CTRL_OFFSET, STAGE_COUNTER_CTRL_CLEAR);
+}
+
+void stage_counter_enable(unsigned enable)
+{
+    u32 ctrl = stage_counter_read32(STAGE_COUNTER_CTRL_OFFSET);
+    if (enable != 0U) {
+        ctrl |= STAGE_COUNTER_CTRL_ENABLE;
+    } else {
+        ctrl &= ~STAGE_COUNTER_CTRL_ENABLE;
+    }
+    stage_counter_write32(STAGE_COUNTER_CTRL_OFFSET, ctrl);
+}
+
+void stage_counter_freeze(unsigned freeze)
+{
+    u32 ctrl = stage_counter_read32(STAGE_COUNTER_CTRL_OFFSET);
+    if (freeze != 0U) {
+        ctrl |= STAGE_COUNTER_CTRL_FREEZE;
+    } else {
+        ctrl &= ~STAGE_COUNTER_CTRL_FREEZE;
+    }
+    stage_counter_write32(STAGE_COUNTER_CTRL_OFFSET, ctrl);
+}
+
+u64 stage_counter_read_total(void)
+{
+    return stage_counter_read64(STAGE_COUNTER_TOTAL_LO_OFFSET);
+}
+
+u64 stage_counter_read_active(void)
+{
+    return stage_counter_read64(STAGE_COUNTER_ACTIVE_LO_OFFSET);
+}
+
+u64 stage_counter_read_stage(unsigned stage)
+{
+    if (stage >= INT8_STAGE_COUNTER_STAGE_COUNT) {
+        return 0ULL;
+    }
+    return stage_counter_read64(STAGE_COUNTER_STAGE_BASE_OFFSET +
+                                stage * STAGE_COUNTER_STAGE_STRIDE);
+}
+
+void stage_counter_dump_csv(void)
+{
+#if INT8_STAGE_COUNTER_PRESENT
+    u64 window_cycles = stage_counter_read_active();
+    unsigned stage;
+    xil_printf("RTL_STAGE_CYCLES_BEGIN\r\n");
+    xil_printf("stage_id,stage_name,cycles,us,percent_window\r\n");
+    for (stage = 0U; stage < INT8_STAGE_COUNTER_STAGE_COUNT; ++stage) {
+        u64 cycles = stage_counter_read_stage(stage);
+        u64 us = stage_counter_cycles_to_us(cycles);
+        u64 pct_x100 = (window_cycles > 0ULL) ? ((cycles * 10000ULL) / window_cycles) : 0ULL;
+        xil_printf("%u,%s,%llu,%llu,%llu.%02llu\r\n",
+                   stage,
+                   stage_counter_name(stage),
+                   cycles,
+                   us,
+                   pct_x100 / 100ULL,
+                   pct_x100 % 100ULL);
+    }
+    xil_printf("RTL_STAGE_TOTAL,%llu window=%llu current=0x%08x status=0x%08x base=0x%08x\r\n",
+               stage_counter_read_total(),
+               window_cycles,
+               stage_counter_read32(STAGE_COUNTER_CURRENT_OFFSET),
+               stage_counter_read32(STAGE_COUNTER_STATUS_OFFSET),
+               (u32)INT8_STAGE_COUNTER_BASEADDR);
+    xil_printf("RTL_STAGE_CYCLES_END\r\n");
+#else
+    xil_printf("RTL_STAGE_CYCLES_UNAVAILABLE: npu_stage_counter base macro not found\r\n");
+#endif
+}
 
 static u32 read_u32_le(const u8 *p)
 {
@@ -27,6 +197,19 @@ static void print_u64_arg(const char *name, u64 value)
     xil_printf("%s=0x%08x%08x ", name, (u32)(value >> 32), (u32)value);
 }
 
+#if defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_STATUS_DATA) && \
+    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_HEARTBEAT_DATA) && \
+    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_ACT_WORDS_DATA) && \
+    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_WGT_WORDS_DATA) && \
+    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_PSUM_WORDS_DATA) && \
+    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_OUT_WORDS_DATA) && \
+    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_HW_VERSION_DATA)
+#define INT8_NPU_HAS_DEBUG_REGS 1
+#else
+#define INT8_NPU_HAS_DEBUG_REGS 0
+#endif
+
+#if INT8_NPU_HAS_DEBUG_REGS
 static const char *debug_phase_name(u32 phase)
 {
     switch (phase) {
@@ -63,16 +246,11 @@ static const char *debug_opcode_name(u32 opcode)
     default: return "UNKNOWN";
     }
 }
+#endif
 
 static void int8_npu_dump_debug_regs(const Int8NpuContext *ctx, const char *tag)
 {
-#if defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_STATUS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_HEARTBEAT_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_ACT_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_WGT_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_PSUM_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_OUT_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_HW_VERSION_DATA)
+#if INT8_NPU_HAS_DEBUG_REGS
     u32 status;
     u32 heartbeat;
     u32 act_words;
@@ -128,254 +306,6 @@ static void int8_npu_dump_debug_regs(const Int8NpuContext *ctx, const char *tag)
 #else
     (void)ctx;
     (void)tag;
-#endif
-}
-
-void int8_npu_dump_profile_regs(const Int8NpuContext *ctx, const char *tag)
-{
-#if defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_UOP_COUNT_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_CONV_COUNT_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_WIN_READ_OPS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_WIN_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_WGT_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_SA_MAC_STEPS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_PSUM_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_OUT_TILES_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_OUT_RMW_OPS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_MODEL_CYCLES_DATA)
-    u32 uop_count;
-    u32 conv_count;
-    u32 win_read_ops;
-    u32 win_words;
-    u32 wgt_words;
-    u32 sa_mac_steps;
-    u32 psum_words;
-    u32 out_tiles;
-    u32 out_rmw_ops;
-    u32 model_cycles;
-
-    if (ctx == NULL) {
-        return;
-    }
-
-    uop_count = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_UOP_COUNT_DATA);
-    conv_count = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_CONV_COUNT_DATA);
-    win_read_ops = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_WIN_READ_OPS_DATA);
-    win_words = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_WIN_WORDS_DATA);
-    wgt_words = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_WGT_WORDS_DATA);
-    sa_mac_steps = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_SA_MAC_STEPS_DATA);
-    psum_words = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_PSUM_WORDS_DATA);
-    out_tiles = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_OUT_TILES_DATA);
-    out_rmw_ops = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_OUT_RMW_OPS_DATA);
-    model_cycles = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF_MODEL_CYCLES_DATA);
-
-    xil_printf("NPU: prof %s uop=%u conv=%u win_read=%u win_words=%u\r\n",
-               tag, uop_count, conv_count, win_read_ops, win_words);
-    xil_printf("NPU: prof %s wgt=%u sa_steps=%u psum=%u out_tiles=%u "
-               "rmw_ops=%u model_cycles=%u\r\n",
-               tag, wgt_words, sa_mac_steps, psum_words, out_tiles,
-               out_rmw_ops, model_cycles);
-#if defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF2_WIN_SAVED_READS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF2_WIN_ACTUAL_READS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF2_OUT_DIRECT_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF2_OUT_RMW_READS_DATA)
-    {
-        u32 win_saved_reads = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF2_WIN_SAVED_READS_DATA);
-        u32 win_actual_reads = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF2_WIN_ACTUAL_READS_DATA);
-        u32 out_direct_words = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF2_OUT_DIRECT_WORDS_DATA);
-        u32 out_rmw_reads = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF2_OUT_RMW_READS_DATA);
-        xil_printf("NPU: prof2 %s win_saved=%u win_actual=%u "
-                   "direct_words=%u rmw_reads=%u\r\n",
-                   tag, win_saved_reads, win_actual_reads,
-                   out_direct_words, out_rmw_reads);
-    }
-#endif
-#if defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF3_WGT_CYCLES_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF3_WIN_CYCLES_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF3_SA_CYCLES_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF3_POST_CYCLES_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF3_WRITE_CYCLES_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF3_ROW_REGION_CYCLES_DATA)
-    {
-        u32 wgt_cycles = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF3_WGT_CYCLES_DATA);
-        u32 win_cycles = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF3_WIN_CYCLES_DATA);
-        u32 sa_cycles = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF3_SA_CYCLES_DATA);
-        u32 post_cycles = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF3_POST_CYCLES_DATA);
-        u32 write_cycles = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF3_WRITE_CYCLES_DATA);
-        u32 row_region_cycles = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF3_ROW_REGION_CYCLES_DATA);
-        xil_printf("NPU: prof3 %s wgt_cyc=%u win_cyc=%u sa_cyc=%u\r\n",
-                   tag, wgt_cycles, win_cycles, sa_cycles);
-        xil_printf("NPU: prof3 %s post_cyc=%u write_cyc=%u "
-                   "row_region_cyc=%u\r\n",
-                   tag, post_cycles, write_cycles, row_region_cycles);
-    }
-#endif
-#if defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_IF_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_FRAME_LOAD_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_FRAME_STORE_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_UOP_FETCHES_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_POOL_TILES_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_AFFINE_TILES_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_ADD_TILES_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_STORE_TILES_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_NONCONV_MEM_OPS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_CONV_MODEL_CYCLES_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_TOTAL_WORK_UNITS_DATA)
-    {
-        u32 if_words = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_IF_WORDS_DATA);
-        u32 frame_load_words = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_FRAME_LOAD_WORDS_DATA);
-        u32 frame_store_words = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_FRAME_STORE_WORDS_DATA);
-        u32 uop_fetches = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_UOP_FETCHES_DATA);
-        u32 pool_tiles = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_POOL_TILES_DATA);
-        u32 affine_tiles = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_AFFINE_TILES_DATA);
-        u32 add_tiles = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_ADD_TILES_DATA);
-        u32 store_tiles = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_STORE_TILES_DATA);
-        u32 nonconv_mem_ops = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_NONCONV_MEM_OPS_DATA);
-        u32 conv_model_cycles = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_CONV_MODEL_CYCLES_DATA);
-        u32 total_work_units = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF5_TOTAL_WORK_UNITS_DATA);
-
-        xil_printf("NPU: prof5 %s if_words=%u frame_ld=%u frame_st=%u "
-                   "uop_fetch=%u\r\n",
-                   tag, if_words, frame_load_words, frame_store_words,
-                   uop_fetches);
-        xil_printf("NPU: prof5 %s pool_tiles=%u affine_tiles=%u add_tiles=%u "
-                   "store_tiles=%u\r\n",
-                   tag, pool_tiles, affine_tiles, add_tiles, store_tiles);
-        xil_printf("NPU: prof5 %s nonconv_mem_ops=%u conv_model=%u "
-                   "total_work=%u\r\n",
-                   tag, nonconv_mem_ops, conv_model_cycles, total_work_units);
-    }
-#endif
-#if defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_EXEC_CONV_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_EXEC_POOL_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_EXEC_AFFINE_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_EXEC_STORE_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_EXEC_ADD_AFFINE_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_WIN_CMD_EXECS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_WIN_CACHE_LOADS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_ROW_REGIONS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_FIXED_ITERS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_NARROW_RMW_WRITES_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_UPSAMPLE_ROWS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_WIN_INTERPRETER_ROWS_DATA)
-    {
-        u32 exec_conv = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_EXEC_CONV_DATA);
-        u32 exec_pool = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_EXEC_POOL_DATA);
-        u32 exec_affine = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_EXEC_AFFINE_DATA);
-        u32 exec_store = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_EXEC_STORE_DATA);
-        u32 exec_add_affine = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_EXEC_ADD_AFFINE_DATA);
-        u32 win_cmd_execs = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_WIN_CMD_EXECS_DATA);
-        u32 win_cache_loads = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_WIN_CACHE_LOADS_DATA);
-        u32 row_regions = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_ROW_REGIONS_DATA);
-        u32 fixed_iters = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_FIXED_ITERS_DATA);
-        u32 narrow_rmw_writes = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_NARROW_RMW_WRITES_DATA);
-        u32 upsample_rows = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_UPSAMPLE_ROWS_DATA);
-        u32 win_interpreter_rows = XEspnet_encoder_int8_core_ReadReg(
-            ctx->ip.Control_BaseAddress,
-            XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_PROF7_WIN_INTERPRETER_ROWS_DATA);
-
-        xil_printf("NPU: prof7 %s exec conv=%u pool=%u affine=%u store=%u "
-                   "add_affine=%u\r\n",
-                   tag, exec_conv, exec_pool, exec_affine, exec_store,
-                   exec_add_affine);
-        xil_printf("NPU: prof7 %s win_cmd=%u cache_load=%u rows=%u "
-                   "interp_rows=%u\r\n",
-                   tag, win_cmd_execs, win_cache_loads, row_regions,
-                   win_interpreter_rows);
-        xil_printf("NPU: prof7 %s fixed_iters=%u narrow_writes=%u "
-                   "upsample_rows=%u\r\n",
-                   tag, fixed_iters, narrow_rmw_writes, upsample_rows);
-    }
-#endif
-#else
-    if (ctx != NULL) {
-        xil_printf("NPU: prof %s unavailable in this BSP\r\n",
-                   (tag != NULL) ? tag : "UNKNOWN");
-    }
 #endif
 }
 
@@ -624,57 +554,4 @@ int int8_npu_run_infer(Int8NpuContext *ctx, UINTPTR input_addr,
     }
     return run_once(ctx, INT8_NPU_MODE_RUN, input_addr, output_addr, param_addr,
                     uop_count, timeout_polls, "MODE_RUN");
-}
-
-int int8_npu_run_debug(Int8NpuContext *ctx, UINTPTR input_addr,
-                       UINTPTR output_addr, UINTPTR param_addr, u32 uop_count,
-                       u32 stop_after_uop, u32 dump_tensor_id,
-                       u32 dump_words, u32 timeout_polls, const char *tag)
-{
-    u32 mode;
-    u32 debug_uop_count;
-
-    if (input_addr == (UINTPTR)0U || output_addr == (UINTPTR)0U ||
-        param_addr == (UINTPTR)0U || uop_count > 0xffffU ||
-        stop_after_uop > 0xfffeU || dump_tensor_id > 0xffU ||
-        dump_words > 0xffffU) {
-        return XST_FAILURE;
-    }
-
-    mode = INT8_NPU_MODE_RUN | INT8_NPU_DEBUG_ENABLE_MASK |
-           ((dump_tensor_id & 0xffU) << INT8_NPU_DEBUG_DUMP_TENSOR_SHIFT) |
-           ((dump_words & 0xffffU) << INT8_NPU_DEBUG_DUMP_WORDS_SHIFT);
-    debug_uop_count =
-        (uop_count & 0xffffU) |
-        (((stop_after_uop + 1U) & 0xffffU)
-         << INT8_NPU_PROFILE_STOP_SHIFT);
-
-    return run_once(ctx, mode, input_addr, output_addr, param_addr,
-                    debug_uop_count, timeout_polls, tag);
-}
-
-int int8_npu_run_profile_prefix(Int8NpuContext *ctx, UINTPTR input_addr,
-                                UINTPTR output_addr, UINTPTR param_addr,
-                                u32 uop_count, u32 stop_after_pc,
-                                u32 timeout_polls, const char *tag)
-{
-    u32 mode;
-    u32 debug_uop_count;
-
-    if (input_addr == (UINTPTR)0U || output_addr == (UINTPTR)0U ||
-        param_addr == (UINTPTR)0U || uop_count > 0xffffU ||
-        stop_after_pc > 0xfffeU) {
-        return XST_FAILURE;
-    }
-
-    mode = INT8_NPU_MODE_RUN | INT8_NPU_DEBUG_ENABLE_MASK |
-           ((INT8_NPU_DEBUG_DUMP_TENSOR_DISABLED & 0xffU)
-            << INT8_NPU_DEBUG_DUMP_TENSOR_SHIFT);
-    debug_uop_count =
-        (uop_count & 0xffffU) |
-        (((stop_after_pc + 1U) & 0xffffU)
-         << INT8_NPU_PROFILE_STOP_SHIFT);
-
-    return run_once(ctx, mode, input_addr, output_addr, param_addr,
-                    debug_uop_count, timeout_polls, tag);
 }

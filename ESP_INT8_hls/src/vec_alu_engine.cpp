@@ -21,9 +21,6 @@ bool conv_store_write_aligned_tile(const tensor_desc_t& dst,
 bool conv_store_write_row_contiguous_word(const tensor_desc_t& dst,
                                           u32_t abs_offset,
                                           const axi_vec_t& word);
-void conv_store_row_contiguous_set_byte(axi_vec_t row_words[ROW_CONTIG_MAX_WORDS],
-                                        u32_t byte_idx,
-                                        i8_t value);
 bool conv_store_row_contiguous_plan_ok(const tensor_desc_t& dst,
                                        u16_t width,
                                        u16_t valid_c);
@@ -37,7 +34,6 @@ bool read_b2_backup_src1_tile(u16_t h,
                               u16_t c,
                               u8_t lanes,
                               act_vec_t& packed);
-void profile_record_affine_fixed(const fixed_exec_desc_t& desc, const tensor_desc_t& src);
 
 static axi_vec_t s_shared_row_contig_words[ROW_CONTIG_MAX_WORDS];
 static bool s_shared_b2_src1_saved[MAX_FM_H];
@@ -62,31 +58,61 @@ static void vec_pack_i8_lanes(const i8_t lanes[TM], act_vec_t& word) {
   }
 }
 
-void vec_alu_apply_affine_block(const act_vec_t& in_word,
-                                u8_t valid_c,
-                                aff_q_t qparam,
-                                u8_t act_type,
-                                act_vec_t& out_word) {
+constexpr int VEC_AFF_GROUP_LANES = 8;
+
+static void vec_alu_apply_affine_group(const act_vec_t& in_word,
+                                       unsigned valid,
+                                       const aff_q_t& qparam,
+                                       u8_t act_type,
+                                       int lane_base,
+                                       i8_t out_lanes[TM]) {
+#pragma HLS INLINE
+#pragma HLS ARRAY_PARTITION variable=out_lanes complete dim=1
+  i32_t mul[VEC_AFF_GROUP_LANES];
+  i32_t bias[VEC_AFF_GROUP_LANES];
+  u8_t shift[VEC_AFF_GROUP_LANES];
+#pragma HLS ARRAY_PARTITION variable=mul complete dim=1
+#pragma HLS ARRAY_PARTITION variable=bias complete dim=1
+#pragma HLS ARRAY_PARTITION variable=shift complete dim=1
+
+  for (int i = 0; i < VEC_AFF_GROUP_LANES; ++i) {
+#pragma HLS UNROLL
+    const int lane = lane_base + i;
+    mul[i] = qparam.mul[lane];
+    bias[i] = qparam.bias[lane];
+    shift[i] = qparam.shift[lane];
+  }
+
+  for (int i = 0; i < VEC_AFF_GROUP_LANES; ++i) {
+#pragma HLS UNROLL factor=4
+    const int lane = lane_base + i;
+    i8_t out_value = 0;
+    if (static_cast<unsigned>(lane) < valid) {
+      const i8_t in_value = vec_get_act_i8_dynamic(in_word, lane);
+      out_value = affine_i8_to_i8(in_value, mul[i], bias[i], shift[i], act_type);
+    }
+    out_lanes[lane] = out_value;
+  }
+}
+
+static void vec_alu_apply_affine_block(const act_vec_t& in_word,
+                                       u8_t valid_c,
+                                       const aff_q_t& qparam,
+                                       u8_t act_type,
+                                       act_vec_t& out_word) {
 #pragma HLS INLINE off
-#pragma HLS ARRAY_PARTITION variable=qparam.mul complete dim=1
-#pragma HLS ARRAY_PARTITION variable=qparam.bias complete dim=1
-#pragma HLS ARRAY_PARTITION variable=qparam.shift complete dim=1
   out_word = 0;
   const unsigned valid = valid_c.to_uint();
   i8_t out_lanes[TM];
 #pragma HLS ARRAY_PARTITION variable=out_lanes complete dim=1
-  for (int lane = 0; lane < TM; ++lane) {
-#pragma HLS UNROLL factor=8
-    i8_t out_value = 0;
-    if (static_cast<unsigned>(lane) < valid) {
-      const i8_t in_value = vec_get_act_i8_dynamic(in_word, lane);
-      out_value = affine_i8_to_i8(in_value,
-                                  qparam.mul[lane],
-                                  qparam.bias[lane],
-                                  qparam.shift[lane],
-                                  act_type);
-    }
-    out_lanes[lane] = out_value;
+  for (int group = 0; group < TM / VEC_AFF_GROUP_LANES; ++group) {
+#pragma HLS PIPELINE off
+    vec_alu_apply_affine_group(in_word,
+                               valid,
+                               qparam,
+                               act_type,
+                               group * VEC_AFF_GROUP_LANES,
+                               out_lanes);
   }
   vec_pack_i8_lanes(out_lanes, out_word);
 }
@@ -194,21 +220,22 @@ static bool read_block_affine_source_tile(const tensor_desc_t& src0,
   return false;
 }
 
-static bool read_block_affine_source_tile_b2_backup(const tensor_desc_t& src0,
-                                                    const tensor_desc_t& src1,
-                                                    const tensor_desc_t& src2,
-                                                    bool has_src2,
-                                                    const bool src1_saved[MAX_FM_H],
-                                                    u16_t h,
-                                                    u16_t w,
-                                                    u16_t c,
-                                                    u8_t lanes,
-                                                    act_vec_t& packed) {
+static bool read_fixed_affine_source_tile(const tensor_desc_t& src0,
+                                          const tensor_desc_t& src1,
+                                          const tensor_desc_t& src2,
+                                          bool has_src2,
+                                          bool use_b2_backup,
+                                          const bool src1_saved[MAX_FM_H],
+                                          u16_t h,
+                                          u16_t w,
+                                          u16_t c,
+                                          u8_t lanes,
+                                          act_vec_t& packed) {
 #pragma HLS INLINE
   const unsigned c_abs = c.to_uint();
   const unsigned c0 = src0.c.to_uint();
   const unsigned c1 = src1.c.to_uint();
-  if (c_abs >= c0 && c_abs < c0 + c1 && src1_saved[h.to_uint()]) {
+  if (use_b2_backup && c_abs >= c0 && c_abs < c0 + c1 && src1_saved[h.to_uint()]) {
     return read_b2_backup_src1_tile(h,
                                     w,
                                     static_cast<u16_t>(c_abs - c0),
@@ -245,129 +272,29 @@ static error_code_t resolve_fixed_affine_tensors(const fixed_exec_desc_t& desc,
   return ERR_NONE;
 }
 
-static bool load_affine_qparam_blocks(u8_t param_id,
-                                      int c_blocks,
-                                      aff_q_t aff_qparams[MAX_C_TILE_COUNT]) {
-#pragma HLS INLINE off
-  for (int c_blk = 0; c_blk < MAX_C_TILE_COUNT; ++c_blk) {
-#pragma HLS PIPELINE off
-    if (c_blk >= c_blocks) {
-      break;
-    }
-    if (!param_dma_get_affine_qparam(param_id, static_cast<u8_t>(c_blk), aff_qparams[c_blk])) {
-      return false;
-    }
-  }
-  return true;
-}
-
-static error_code_t run_fixed_row_contiguous_datapath(const fixed_exec_desc_t& desc,
-                                                      const tensor_desc_t& src0,
-                                                      const tensor_desc_t& src1,
-                                                      const tensor_desc_t& src2,
-                                                      bool has_src2,
-                                                      const tensor_desc_t& dst) {
-#pragma HLS INLINE off
-#pragma HLS BIND_STORAGE variable=s_shared_row_contig_words type=ram_2p impl=bram
-  if (!conv_store_row_contiguous_plan_ok(dst, desc.in_w, desc.valid_c)) {
-    return ERR_BANK_OVERFLOW;
-  }
-
-  const int h_count = static_cast<int>(desc.in_h.to_uint());
-  const int w_count = static_cast<int>(desc.in_w.to_uint());
-  const unsigned valid_c_u = desc.valid_c.to_uint();
-  const unsigned row_bytes_u = static_cast<unsigned>(desc.in_w.to_uint()) * valid_c_u;
-  const int row_word_count = static_cast<int>(row_bytes_u / static_cast<unsigned>(AXI_WORD_BYTES));
-  const int c_blocks = static_cast<int>((valid_c_u + static_cast<unsigned>(TM) - 1U) /
-                                        static_cast<unsigned>(TM));
-
-  aff_q_t aff_qparams[MAX_C_TILE_COUNT];
-#pragma HLS ARRAY_PARTITION variable=aff_qparams complete dim=1
-  if (!load_affine_qparam_blocks(desc.param_id, c_blocks, aff_qparams)) {
-    return ERR_PARAM_DESC_RANGE;
-  }
-
-  for (int h_rev = 0; h_rev < MAX_FM_H; ++h_rev) {
-    if (h_rev >= h_count) {
-      break;
-    }
-    const int h_i = h_count - 1 - h_rev;
-    const u16_t h = static_cast<u16_t>(h_i);
-
-    for (int word_idx = 0; word_idx < ROW_CONTIG_MAX_WORDS; ++word_idx) {
-#pragma HLS PIPELINE off
-      if (word_idx >= row_word_count) {
-        break;
-      }
-      s_shared_row_contig_words[word_idx] = 0;
-    }
-
-    for (int w_i = 0; w_i < MAX_FM_W; ++w_i) {
-      if (w_i >= w_count) {
-        break;
-      }
-      const u16_t w = static_cast<u16_t>(w_i);
-      for (int c_blk = 0; c_blk < MAX_C_TILE_COUNT; ++c_blk) {
-#pragma HLS PIPELINE off
-        if (c_blk >= c_blocks) {
-          break;
-        }
-        const u16_t c = static_cast<u16_t>(c_blk * TM);
-        const u16_t remaining = static_cast<u16_t>(desc.valid_c - c);
-        const u8_t lanes = vec_tensor_lanes(remaining);
-        act_vec_t in_packed = 0;
-        if (!read_block_affine_source_tile(src0, src1, src2, has_src2, h, w, c, lanes, in_packed)) {
-          return ERR_BANK_OVERFLOW;
-        }
-        act_vec_t out_packed = 0;
-        vec_alu_apply_affine_block(in_packed,
-                                   lanes,
-                                   aff_qparams[c_blk],
-                                   desc.act_type,
-                                   out_packed);
-        for (int lane = 0; lane < TM; ++lane) {
-#pragma HLS UNROLL
-          if (static_cast<unsigned>(lane) < lanes.to_uint()) {
-            const i8_t out_value = vec_get_act_i8_dynamic(out_packed, lane);
-            const u32_t byte_idx = static_cast<u32_t>(static_cast<unsigned>(w_i) * valid_c_u +
-                                                      c.to_uint() + static_cast<unsigned>(lane));
-            conv_store_row_contiguous_set_byte(s_shared_row_contig_words, byte_idx, out_value);
-          }
-        }
-      }
-    }
-
-    const u32_t dst_row_base = dst.base_offset + static_cast<u32_t>(h_i) * static_cast<u32_t>(row_bytes_u);
-    for (int word_idx = 0; word_idx < ROW_CONTIG_MAX_WORDS; ++word_idx) {
-#pragma HLS PIPELINE off
-      if (word_idx >= row_word_count) {
-        break;
-      }
-      const u32_t abs_offset = dst_row_base + static_cast<u32_t>(word_idx * AXI_WORD_BYTES);
-      if (!conv_store_write_row_contiguous_word(dst, abs_offset, s_shared_row_contig_words[word_idx])) {
-        return ERR_BANK_OVERFLOW;
-      }
-    }
-  }
-  return ERR_NONE;
-}
-
-static error_code_t run_b2_c131_row_contiguous_backup_op(const fixed_exec_desc_t& desc,
-                                                         const tensor_desc_t& src0,
-                                                         const tensor_desc_t& src1,
-                                                         const tensor_desc_t& src2,
-                                                         bool has_src2,
-                                                         const tensor_desc_t& dst) {
+static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
+                                            const tensor_desc_t& src0,
+                                            const tensor_desc_t& src1,
+                                            const tensor_desc_t& src2,
+                                            bool has_src2,
+                                            const tensor_desc_t& dst,
+                                            bool row_contiguous,
+                                            bool use_b2_backup) {
 #pragma HLS INLINE off
 #pragma HLS BIND_STORAGE variable=s_shared_row_contig_words type=ram_2p impl=bram
 #pragma HLS BIND_STORAGE variable=s_shared_b2_src1_saved type=ram_2p impl=bram
-  if (!conv_store_row_contiguous_plan_ok(dst, desc.in_w, desc.valid_c) ||
+  if (row_contiguous) {
+    if (!conv_store_row_contiguous_plan_ok(dst, desc.in_w, desc.valid_c)) {
+      return ERR_BANK_OVERFLOW;
+    }
+  } else if (!vec_full_aligned_tile_write_plan_ok(dst, desc.valid_c)) {
+    return ERR_BANK_OVERFLOW;
+  }
+  if (use_b2_backup &&
       !vec_row_contig_b2_needs_src1_backup(desc, src0, src1, src2, has_src2, dst)) {
     return ERR_BANK_OVERFLOW;
   }
 
-  profile_record_affine_fixed(desc, dst);
-
   const int h_count = static_cast<int>(desc.in_h.to_uint());
   const int w_count = static_cast<int>(desc.in_w.to_uint());
   const unsigned valid_c_u = desc.valid_c.to_uint();
@@ -376,33 +303,25 @@ static error_code_t run_b2_c131_row_contiguous_backup_op(const fixed_exec_desc_t
   const int c_blocks = static_cast<int>((valid_c_u + static_cast<unsigned>(TM) - 1U) /
                                         static_cast<unsigned>(TM));
 
-  aff_q_t aff_qparams[MAX_C_TILE_COUNT];
-#pragma HLS ARRAY_PARTITION variable=aff_qparams complete dim=1
-  if (!load_affine_qparam_blocks(desc.param_id, c_blocks, aff_qparams)) {
-    return ERR_PARAM_DESC_RANGE;
-  }
-
-  for (int row = 0; row < MAX_FM_H; ++row) {
+  if (use_b2_backup) {
+    for (int row = 0; row < MAX_FM_H; ++row) {
 #pragma HLS PIPELINE off
-    s_shared_b2_src1_saved[row] = false;
+      s_shared_b2_src1_saved[row] = false;
+    }
   }
 
-  for (int h_rev = 0; h_rev < MAX_FM_H; ++h_rev) {
-    if (h_rev >= h_count) {
+  for (int h_iter = 0; h_iter < MAX_FM_H; ++h_iter) {
+    if (h_iter >= h_count) {
       break;
     }
-    const int h_i = h_count - 1 - h_rev;
+    const int h_i = row_contiguous ? (h_count - 1 - h_iter) : h_iter;
     const u16_t h = static_cast<u16_t>(h_i);
-
-    for (int word_idx = 0; word_idx < ROW_CONTIG_MAX_WORDS; ++word_idx) {
-#pragma HLS PIPELINE off
-      if (word_idx >= row_word_count) {
-        break;
-      }
-      s_shared_row_contig_words[word_idx] = 0;
-    }
+    axi_vec_t packed_row_word = 0;
+    unsigned packed_lane = 0U;
+    unsigned packed_word_idx = 0U;
 
     for (int w_i = 0; w_i < MAX_FM_W; ++w_i) {
+#pragma HLS PIPELINE off
       if (w_i >= w_count) {
         break;
       }
@@ -411,139 +330,92 @@ static error_code_t run_b2_c131_row_contiguous_backup_op(const fixed_exec_desc_t
 #pragma HLS PIPELINE off
         if (c_blk >= c_blocks) {
           break;
+        }
+        aff_q_t aff_qparam;
+#pragma HLS ARRAY_PARTITION variable=aff_qparam.mul complete dim=1
+#pragma HLS ARRAY_PARTITION variable=aff_qparam.bias complete dim=1
+#pragma HLS ARRAY_PARTITION variable=aff_qparam.shift complete dim=1
+        if (!param_dma_get_affine_qparam(desc.param_id,
+                                         static_cast<u8_t>(c_blk),
+                                         aff_qparam)) {
+          return ERR_PARAM_DESC_RANGE;
         }
         const u16_t c = static_cast<u16_t>(c_blk * TM);
         const u16_t remaining = static_cast<u16_t>(desc.valid_c - c);
-        const u8_t lanes = vec_tensor_lanes(remaining);
+        const u8_t lanes = row_contiguous ? vec_tensor_lanes(remaining) : static_cast<u8_t>(TM);
         act_vec_t in_packed = 0;
-        if (!read_block_affine_source_tile_b2_backup(src0,
-                                                     src1,
-                                                     src2,
-                                                     has_src2,
-                                                     s_shared_b2_src1_saved,
-                                                     h,
-                                                     w,
-                                                     c,
-                                                     lanes,
-                                                     in_packed)) {
-          return ERR_BANK_OVERFLOW;
-        }
         act_vec_t out_packed = 0;
-        vec_alu_apply_affine_block(in_packed,
-                                   lanes,
-                                   aff_qparams[c_blk],
-                                   desc.act_type,
-                                   out_packed);
-        for (int lane = 0; lane < TM; ++lane) {
-#pragma HLS UNROLL
-          if (static_cast<unsigned>(lane) < lanes.to_uint()) {
-            const i8_t out_value = vec_get_act_i8_dynamic(out_packed, lane);
-            const u32_t byte_idx = static_cast<u32_t>(static_cast<unsigned>(w_i) * valid_c_u +
-                                                      c.to_uint() + static_cast<unsigned>(lane));
-            conv_store_row_contiguous_set_byte(s_shared_row_contig_words, byte_idx, out_value);
-          }
-        }
-      }
-    }
-
-    if (!backup_b2_src1_rows_before_write(src1, h_i, s_shared_b2_src1_saved)) {
-      return ERR_BANK_OVERFLOW;
-    }
-
-    const u32_t dst_row_base = dst.base_offset + static_cast<u32_t>(h_i) * static_cast<u32_t>(row_bytes_u);
-    for (int word_idx = 0; word_idx < ROW_CONTIG_MAX_WORDS; ++word_idx) {
-#pragma HLS PIPELINE off
-      if (word_idx >= row_word_count) {
-        break;
-      }
-      const u32_t abs_offset = dst_row_base + static_cast<u32_t>(word_idx * AXI_WORD_BYTES);
-      if (!conv_store_write_row_contiguous_word(dst, abs_offset, s_shared_row_contig_words[word_idx])) {
-        return ERR_BANK_OVERFLOW;
-      }
-    }
-  }
-  return ERR_NONE;
-}
-
-static error_code_t run_fixed_aligned_affine_only_op(const fixed_exec_desc_t& desc) {
-#pragma HLS INLINE off
-  tensor_desc_t src0;
-  tensor_desc_t src1;
-  tensor_desc_t src2;
-  tensor_desc_t dst;
-  bool has_src2 = false;
-  const error_code_t resolve_err = resolve_fixed_affine_tensors(desc, src0, src1, src2, has_src2, dst);
-  if (resolve_err != ERR_NONE) {
-    return resolve_err;
-  }
-  if (!vec_full_aligned_tile_write_plan_ok(dst, desc.valid_c)) {
-    return ERR_BANK_OVERFLOW;
-  }
-  profile_record_affine_fixed(desc, dst);
-
-  const int h_count = static_cast<int>(desc.in_h.to_uint());
-  const int w_count = static_cast<int>(desc.in_w.to_uint());
-  const int c_blocks = static_cast<int>((desc.valid_c.to_uint() + static_cast<unsigned>(TM) - 1U) /
-                                        static_cast<unsigned>(TM));
-
-  aff_q_t aff_qparams[MAX_C_TILE_COUNT];
-#pragma HLS ARRAY_PARTITION variable=aff_qparams complete dim=1
-  if (!load_affine_qparam_blocks(desc.param_id, c_blocks, aff_qparams)) {
-    return ERR_PARAM_DESC_RANGE;
-  }
-
-  for (int h_i = 0; h_i < MAX_FM_H; ++h_i) {
-    if (h_i >= h_count) {
-      break;
-    }
-    const u16_t h = static_cast<u16_t>(h_i);
-    for (int w_i = 0; w_i < MAX_FM_W; ++w_i) {
-      if (w_i >= w_count) {
-        break;
-      }
-      const u16_t w = static_cast<u16_t>(w_i);
-      for (int c_blk = 0; c_blk < MAX_C_TILE_COUNT; ++c_blk) {
-#pragma HLS PIPELINE off
-        if (c_blk >= c_blocks) {
-          break;
-        }
-        const u16_t c = static_cast<u16_t>(c_blk * TM);
-        act_vec_t cat_packed = 0;
-        act_vec_t out_packed = 0;
-        if (!read_block_affine_source_tile(src0,
+        if (!read_fixed_affine_source_tile(src0,
                                            src1,
                                            src2,
                                            has_src2,
+                                           use_b2_backup,
+                                           s_shared_b2_src1_saved,
                                            h,
                                            w,
                                            c,
-                                           static_cast<u8_t>(TM),
-                                           cat_packed)) {
+                                           lanes,
+                                           in_packed)) {
           return ERR_BANK_OVERFLOW;
         }
-        vec_alu_apply_affine_block(cat_packed,
-                                   static_cast<u8_t>(TM),
-                                   aff_qparams[c_blk],
+        vec_alu_apply_affine_block(in_packed,
+                                   lanes,
+                                   aff_qparam,
                                    desc.act_type,
                                    out_packed);
-        if (!conv_store_write_aligned_tile(dst, h, w, c, out_packed)) {
+        if (row_contiguous) {
+          for (int lane = 0; lane < TM; ++lane) {
+#pragma HLS PIPELINE II=1
+            if (lane < static_cast<int>(lanes.to_uint())) {
+              const i8_t out_value = vec_get_act_i8_dynamic(out_packed, lane);
+              u8_t raw = 0;
+              raw.range(7, 0) = out_value.range(7, 0);
+              packed_row_word.range(static_cast<int>(packed_lane * 8U + 7U),
+                                    static_cast<int>(packed_lane * 8U)) = raw;
+              ++packed_lane;
+              if (packed_lane == static_cast<unsigned>(AXI_WORD_BYTES)) {
+                if (packed_word_idx >= static_cast<unsigned>(row_word_count)) {
+                  return ERR_BANK_OVERFLOW;
+                }
+                s_shared_row_contig_words[packed_word_idx] = packed_row_word;
+                ++packed_word_idx;
+                packed_lane = 0U;
+                packed_row_word = 0;
+              }
+            }
+          }
+        } else if (!conv_store_write_aligned_tile(dst, h, w, c, out_packed)) {
+          return ERR_BANK_OVERFLOW;
+        }
+      }
+    }
+
+    if (row_contiguous) {
+      if (packed_lane != 0U || packed_word_idx != static_cast<unsigned>(row_word_count)) {
+        return ERR_BANK_OVERFLOW;
+      }
+      if (use_b2_backup &&
+          !backup_b2_src1_rows_before_write(src1, h_i, s_shared_b2_src1_saved)) {
+        return ERR_BANK_OVERFLOW;
+      }
+      const u32_t dst_row_base =
+          dst.base_offset + static_cast<u32_t>(h_i) * static_cast<u32_t>(row_bytes_u);
+      for (int word_idx = 0; word_idx < ROW_CONTIG_MAX_WORDS; ++word_idx) {
+#pragma HLS PIPELINE off
+        if (word_idx >= row_word_count) {
+          break;
+        }
+        const u32_t abs_offset =
+            dst_row_base + static_cast<u32_t>(word_idx * AXI_WORD_BYTES);
+        if (!conv_store_write_row_contiguous_word(dst,
+                                                  abs_offset,
+                                                  s_shared_row_contig_words[word_idx])) {
           return ERR_BANK_OVERFLOW;
         }
       }
     }
   }
   return ERR_NONE;
-}
-
-static error_code_t run_fixed_row_contiguous_op(const fixed_exec_desc_t& desc,
-                                                const tensor_desc_t& src0,
-                                                const tensor_desc_t& src1,
-                                                const tensor_desc_t& src2,
-                                                bool has_src2,
-                                                const tensor_desc_t& dst) {
-#pragma HLS INLINE off
-  profile_record_affine_fixed(desc, dst);
-  return run_fixed_row_contiguous_datapath(desc, src0, src1, src2, has_src2, dst);
 }
 
 error_code_t vec_alu_run_fixed_issue(const npu_issue_t& issue,
@@ -566,29 +438,36 @@ error_code_t vec_alu_run_fixed_issue(const npu_issue_t& issue,
     return ERR_UOP_DECODE;
   }
 
+  tensor_desc_t src0;
+  tensor_desc_t src1;
+  tensor_desc_t src2;
+  tensor_desc_t dst;
+  bool has_src2 = false;
+  const error_code_t resolve_err =
+      resolve_fixed_affine_tensors(desc, src0, src1, src2, has_src2, dst);
+  if (resolve_err != ERR_NONE) {
+    return resolve_err;
+  }
   const bool row_contiguous =
       (desc.flags.to_uint() & static_cast<unsigned>(FIXED_FLAG_ROW_CONTIGUOUS_STORE)) != 0U;
-  if (row_contiguous) {
-    tensor_desc_t src0;
-    tensor_desc_t src1;
-    tensor_desc_t src2;
-    tensor_desc_t dst;
-    bool has_src2 = false;
-    const error_code_t resolve_err = resolve_fixed_affine_tensors(desc, src0, src1, src2, has_src2, dst);
-    if (resolve_err != ERR_NONE) {
-      return resolve_err;
-    }
-    if (vec_row_contig_b2_needs_src1_backup(desc, src0, src1, src2, has_src2, dst)) {
-      return run_b2_c131_row_contiguous_backup_op(desc, src0, src1, src2, has_src2, dst);
-    }
-    return run_fixed_row_contiguous_op(desc, src0, src1, src2, has_src2, dst);
-  }
-  return run_fixed_aligned_affine_only_op(desc);
+  const bool use_b2_backup =
+      row_contiguous &&
+      vec_row_contig_b2_needs_src1_backup(desc, src0, src1, src2, has_src2, dst);
+  return run_fixed_affine_common(desc,
+                                 src0,
+                                 src1,
+                                 src2,
+                                 has_src2,
+                                 dst,
+                                 row_contiguous,
+                                 use_b2_backup);
 }
 
 error_code_t vec_alu_engine_exec(const npu_issue_t& issue,
-                                 axi_vec_t* gmem_frame_out) {
+                                 axi_vec_t* gmem_frame_out,
+                                 volatile u8_t& prof_stage_id) {
 #pragma HLS INLINE off
+  npu_profile_set_stage(prof_stage_id, PROF_STAGE_VEC_FIXED);
   const unsigned kind = issue.kind.to_uint();
   if (kind == static_cast<unsigned>(ISSUE_VEC_AFFINE)) {
     return vec_alu_run_fixed_issue(issue, gmem_frame_out);

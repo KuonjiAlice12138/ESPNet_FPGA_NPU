@@ -1,16 +1,11 @@
 #include "../include/npu_config.hpp"
 #include "../include/npu_uop.hpp"
+#include "top_call.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <vector>
-
-void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
-                              esp_int8::axi_vec_t* gmem_frame_out,
-                              const esp_int8::axi_vec_t* gmem_param,
-                              std::uint32_t mode,
-                              std::uint32_t uop_count);
 
 static bool read_binary(const char* path, std::vector<std::uint8_t>& bytes) {
   std::ifstream in(path, std::ios::binary);
@@ -46,9 +41,9 @@ static void pack_bytes(const std::vector<std::uint8_t>& bytes,
 
 int main() {
   const char* param_path =
-      "D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623/PARAM.BIN";
+      "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/PARAM.BIN";
   const char* input_path =
-      "D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623/input_q.bin";
+      "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/input_q.bin";
 
   std::vector<std::uint8_t> param_bytes;
   std::vector<std::uint8_t> input_bytes;
@@ -86,16 +81,16 @@ int main() {
   std::printf("top_prefix_lite_tb: full MODE_RUN, no prefix limit\n");
 #endif
 
-  espnet_encoder_int8_core(frame_in,
-                           frame_out,
-                           param,
-                           esp_int8::MODE_INIT,
-                           esp_int8::UOP_COUNT_ENCODER);
-  espnet_encoder_int8_core(frame_in,
-                           frame_out,
-                           param,
-                           esp_int8::MODE_RUN,
-                           esp_int8::UOP_COUNT_ENCODER);
+  call_espnet_encoder_int8_core(frame_in,
+                                frame_out,
+                                param,
+                                esp_int8::MODE_INIT,
+                                esp_int8::UOP_COUNT_ENCODER);
+  call_espnet_encoder_int8_core(frame_in,
+                                frame_out,
+                                param,
+                                esp_int8::MODE_RUN,
+                                esp_int8::UOP_COUNT_ENCODER);
 
 #ifdef ESP_INT8_CSIM_DUMP_UPSAMPLE_INPUT
   {

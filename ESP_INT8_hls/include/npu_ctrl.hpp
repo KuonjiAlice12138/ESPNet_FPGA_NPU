@@ -7,32 +7,50 @@
 
 namespace esp_int8 {
 
-struct profile_ctrl_t {
-  bool enable;
-  bool stop_before;
-  u16_t stop_pc_plus1;
-};
-
 enum npu_engine_t : unsigned {
   NPU_ENGINE_NONE = 0,
   NPU_ENGINE_CONV = 1,
   NPU_ENGINE_VEC = 2,
   NPU_ENGINE_POOL = 3,
-  NPU_ENGINE_UPSAMPLE = 5,
 };
 
 enum npu_issue_kind_t : unsigned {
-  ISSUE_NONE = 0,
-
   ISSUE_CONV_NORMAL = 1,
   ISSUE_CONV_BLOCK5_BRANCH = 2,
 
   ISSUE_VEC_AFFINE = 11,
 
   ISSUE_POOL_AVG = 20,
-
-  ISSUE_UPSAMPLE_ROW = 40,
 };
+
+enum npu_profile_stage_t : unsigned {
+  PROF_STAGE_IDLE = 0,
+  PROF_STAGE_PARAM_INIT = 1,
+  PROF_STAGE_FRAME_LOAD = 2,
+  PROF_STAGE_MAIN_CTRL = 3,
+  PROF_STAGE_CONV_WEIGHT_LOAD = 4,
+  PROF_STAGE_CONV_ROW_DATAPATH = 5,
+  PROF_STAGE_PPU_ROW_CONSUME = 6,
+  PROF_STAGE_PPU_BLOCK5_FINAL = 7,
+  PROF_STAGE_VEC_FIXED = 8,
+  PROF_STAGE_AVGPOOL = 9,
+  PROF_STAGE_UPSAMPLE_OUT = 10,
+  PROF_STAGE_FRAME_STORE = 11,
+  PROF_STAGE_ERROR = 12,
+  PROF_STAGE_COUNT = 13,
+};
+
+inline void npu_profile_set_stage(volatile u8_t& prof_stage_id,
+                                  npu_profile_stage_t stage) {
+#pragma HLS INLINE
+  prof_stage_id = static_cast<u8_t>(static_cast<unsigned>(stage));
+}
+
+inline void npu_profile_set_active(volatile ap_uint<1>& prof_active,
+                                   bool active) {
+#pragma HLS INLINE
+  prof_active = active ? ap_uint<1>(1) : ap_uint<1>(0);
+}
 
 struct npu_issue_t {
   u8_t engine;
@@ -60,46 +78,19 @@ struct npu_issue_t {
   u16_t out_w;
 };
 
-struct main_ctrl_ctx_t {
-  u8_t pc;
-  u8_t exec_count;
-
-  u8_t state;
-  u8_t substate;
-
-  u8_t block5_sched_id;
-  u8_t block5_branch_idx;
-  u16_t block5_row;
-  u16_t block5_row_group_h;
-
-  u8_t fixed_seq_idx;
-  u16_t current_row;
-
-  bool done;
-  bool error;
-  u8_t error_code;
-};
-
 error_code_t main_ctrl_run(axi_vec_t* gmem_frame_out,
-                           const profile_ctrl_t& profile_ctrl);
+                           volatile u8_t& prof_stage_id,
+                           volatile u8_t& prof_pc,
+                           volatile u8_t& prof_issue_kind);
 
 error_code_t conv_engine_exec(const npu_issue_t& issue,
-                              axi_vec_t* gmem_frame_out);
+                              axi_vec_t* gmem_frame_out,
+                              volatile u8_t& prof_stage_id);
 error_code_t vec_alu_engine_exec(const npu_issue_t& issue,
-                                 axi_vec_t* gmem_frame_out);
-error_code_t pool_engine_exec(const npu_issue_t& issue);
-error_code_t upsample_engine_exec(const npu_issue_t& issue,
-                                  axi_vec_t* gmem_frame_out);
-
-void vec_alu_apply_affine_block(const act_vec_t& in_word,
-                                u8_t valid_c,
-                                aff_q_t aff_qparam,
-                                u8_t act_type,
-                                act_vec_t& out_word);
-
-bool main_ctrl_profile_stop_matches(const profile_ctrl_t& ctrl, int pc);
-void main_ctrl_profile_record_exec_entry(unsigned kind);
-void main_ctrl_record_exec_fetch();
+                                 axi_vec_t* gmem_frame_out,
+                                 volatile u8_t& prof_stage_id);
+error_code_t pool_engine_exec(const npu_issue_t& issue,
+                              volatile u8_t& prof_stage_id);
 
 void main_ctrl_set_csim_last_uop(unsigned logical_uop);
 void main_ctrl_set_csim_last_error(error_code_t err);

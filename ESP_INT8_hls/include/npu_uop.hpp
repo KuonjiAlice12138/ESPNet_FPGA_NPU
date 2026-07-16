@@ -80,16 +80,6 @@ struct uop_t {
   u32_t reserved2;
 };
 
-inline bool uop_flag(const uop_t& uop, unsigned bit) {
-#pragma HLS INLINE
-  return ((uop.flags.to_uint() >> bit) & 0x1U) != 0;
-}
-
-inline bool uop_has_bias(const uop_t& uop) {
-#pragma HLS INLINE
-  return uop_flag(uop, UOP_FLAG_BIAS_EN);
-}
-
 inline bool tensor_is_global(u8_t tensor_id) {
 #pragma HLS INLINE
   return tensor_id <= 0x3f;

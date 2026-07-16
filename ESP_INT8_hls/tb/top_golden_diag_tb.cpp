@@ -1,16 +1,11 @@
 #include "../include/npu_config.hpp"
 #include "../include/npu_uop.hpp"
+#include "top_call.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <vector>
-
-void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
-                              esp_int8::axi_vec_t* gmem_frame_out,
-                              const esp_int8::axi_vec_t* gmem_param,
-                              std::uint32_t mode,
-                              std::uint32_t uop_count);
 
 namespace esp_int8 {
 bool param_dma_ready();
@@ -66,8 +61,8 @@ static void print_desc(const char* name, esp_int8::u8_t tensor_id) {
 }
 
 int main() {
-  const char* param_path = "D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623/PARAM.BIN";
-  const char* input_path = "D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623/input_q.bin";
+  const char* param_path = "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/PARAM.BIN";
+  const char* input_path = "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/input_q.bin";
 
   std::vector<std::uint8_t> param_bytes;
   std::vector<std::uint8_t> input_bytes;
@@ -85,7 +80,7 @@ int main() {
     frame_out[i] = 0xaaaaaaaaaaaaaaaaULL;
   }
 
-  espnet_encoder_int8_core(frame_in, frame_out, param, esp_int8::MODE_INIT, esp_int8::UOP_COUNT_ENCODER);
+  call_espnet_encoder_int8_core(frame_in, frame_out, param, esp_int8::MODE_INIT, esp_int8::UOP_COUNT_ENCODER);
   std::printf("[DIAG] param_ready=%u param_bytes=%zu input_bytes=%zu out_words=%d\n",
               esp_int8::param_dma_ready() ? 1U : 0U,
               param_bytes.size(),
@@ -94,7 +89,7 @@ int main() {
   print_desc("INPUT", esp_int8::TID_INPUT);
   print_desc("OUT", esp_int8::TID_OUT);
 
-  espnet_encoder_int8_core(frame_in, frame_out, param, esp_int8::MODE_RUN, esp_int8::UOP_COUNT_ENCODER);
+  call_espnet_encoder_int8_core(frame_in, frame_out, param, esp_int8::MODE_RUN, esp_int8::UOP_COUNT_ENCODER);
 
   std::uint64_t zero_count = 0;
   std::uint64_t one_count = 0;

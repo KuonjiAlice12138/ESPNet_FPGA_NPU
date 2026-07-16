@@ -1,16 +1,11 @@
 #include "../include/npu_config.hpp"
 #include "../include/npu_uop.hpp"
+#include "top_call.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <vector>
-
-void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
-                              esp_int8::axi_vec_t* gmem_frame_out,
-                              const esp_int8::axi_vec_t* gmem_param,
-                              std::uint32_t mode,
-                              std::uint32_t uop_count);
 
 namespace esp_int8 {
 bool param_dma_ready();
@@ -159,11 +154,11 @@ int main() {
   // bit-exact logits. The current HLS integer path has a stable ~0.68% mask
   // delta versus software bilinear-logit golden, with <0.5pp mIoU drop.
   static constexpr int MAX_ALLOWED_MASK_MISMATCHES = 4096;
-  const char* artifact_dir = "D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623";
-  const char* param_path = "D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623/PARAM.BIN";
-  const char* input_path = "D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623/input_q.bin";
+  const char* artifact_dir = "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702";
+  const char* param_path = "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/PARAM.BIN";
+  const char* input_path = "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/input_q.bin";
   const char* golden_logits_path =
-      "D:/ESP_INT8/hw_artifacts/sched_v3_single_p7_hwconv_0623/golden_output_q.bin";
+      "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/golden_output_q.bin";
   const char* hls_output_path = "hls_output_mask.bin";
 
   std::vector<std::uint8_t> param_bytes;
@@ -204,17 +199,17 @@ int main() {
     }
   }
 
-  espnet_encoder_int8_core(frame_in, frame_out, param,
-                           esp_int8::MODE_INIT,
-                           esp_int8::UOP_COUNT_ENCODER);
+  call_espnet_encoder_int8_core(frame_in, frame_out, param,
+                                esp_int8::MODE_INIT,
+                                esp_int8::UOP_COUNT_ENCODER);
   std::printf("top golden diag: param_ready=%u input_bytes=%zu param_bytes=%zu golden_logits=%zu\n",
               esp_int8::param_dma_ready() ? 1U : 0U,
               input_bytes.size(),
               param_bytes.size(),
               golden_logits.size());
-  espnet_encoder_int8_core(frame_in, frame_out, param,
-                           esp_int8::MODE_RUN,
-                           esp_int8::UOP_COUNT_ENCODER);
+  call_espnet_encoder_int8_core(frame_in, frame_out, param,
+                                esp_int8::MODE_RUN,
+                                esp_int8::UOP_COUNT_ENCODER);
   std::printf("top golden diag: after MODE_RUN last_uop=%u last_error=%u\n",
               esp_int8::csim_last_uop(),
               esp_int8::csim_last_error());

@@ -69,7 +69,6 @@ static void print_timer_selftest(void)
 static u8 g_input[INT8_INPUT_BYTES] __attribute__((aligned(64)));
 static u8 g_output[INT8_OUTPUT_BYTES] __attribute__((aligned(64)));
 static u8 g_param[INT8_PARAM_HW_MAX_BYTES] __attribute__((aligned(64)));
-static char g_prefix_csv[8192U] __attribute__((aligned(64)));
 
 typedef struct {
     const char *tag;
@@ -149,135 +148,32 @@ static int run_full_infer_once(Int8NpuContext *npu, u32 uop_count,
     Xil_DCacheFlushRange((UINTPTR)g_input, INT8_INPUT_BYTES);
     Xil_DCacheFlushRange((UINTPTR)g_output, INT8_OUTPUT_BYTES);
 
+    stage_counter_clear();
+    stage_counter_freeze(0U);
+    stage_counter_enable(1U);
+
     start = read_timer_counter();
     if (int8_npu_run_infer(npu, (UINTPTR)g_input, (UINTPTR)g_output,
                            (UINTPTR)g_param, uop_count,
                            INT8_NPU_TIMEOUT_POLLS) != XST_SUCCESS) {
+        stage_counter_freeze(1U);
+        stage_counter_enable(0U);
+        stage_counter_dump_csv();
         return XST_FAILURE;
     }
     end = read_timer_counter();
+    stage_counter_freeze(1U);
+    stage_counter_enable(0U);
 
     Xil_DCacheInvalidateRange((UINTPTR)g_output, INT8_OUTPUT_BYTES);
     if (cycles != NULL) {
         *cycles = (end >= start) ? (end - start) : 0ULL;
     }
+    stage_counter_dump_csv();
     return XST_SUCCESS;
 }
 
-static int run_prefix_once(Int8NpuContext *npu, u32 uop_count, u32 stop_after_pc,
-                           u64 *cycles)
-{
-    u64 start;
-    u64 end;
-
-    memset(g_output, 0, sizeof(g_output));
-    Xil_DCacheFlushRange((UINTPTR)g_input, INT8_INPUT_BYTES);
-    Xil_DCacheFlushRange((UINTPTR)g_output, INT8_OUTPUT_BYTES);
-
-    start = read_timer_counter();
-    if (int8_npu_run_profile_prefix(npu, (UINTPTR)g_input, (UINTPTR)g_output,
-                                    (UINTPTR)g_param, uop_count, stop_after_pc,
-                                    INT8_NPU_TIMEOUT_POLLS,
-                                    "PROFILE_PREFIX") != XST_SUCCESS) {
-        return XST_FAILURE;
-    }
-    end = read_timer_counter();
-
-    Xil_DCacheInvalidateRange((UINTPTR)g_output, INT8_OUTPUT_BYTES);
-    if (cycles != NULL) {
-        *cycles = (end >= start) ? (end - start) : 0ULL;
-    }
-    return XST_SUCCESS;
-}
-
-static int append_prefix_csv(u32 *offset, u32 capacity, u32 pc,
-                             u64 prefix, u64 delta)
-{
-    int n;
-    if (offset == NULL || *offset >= capacity) {
-        return XST_FAILURE;
-    }
-    n = snprintf(&g_prefix_csv[*offset], capacity - *offset,
-                 "%u,%llu,%llu,%llu,%llu\r\n", pc, prefix, delta,
-                 timer_ticks_to_ms(prefix), timer_ticks_to_ms(delta));
-    if (n < 0 || (u32)n >= (capacity - *offset)) {
-        return XST_FAILURE;
-    }
-    *offset += (u32)n;
-    return XST_SUCCESS;
-}
-
-static int run_prefix_profile(Int8NpuContext *npu, u32 uop_count,
-                              u32 exec_plan_count, u64 full_cycles)
-{
-#if INT8_APP_ENABLE_PREFIX_PROFILING
-    u32 pc;
-    u32 pc_limit = exec_plan_count;
-    u32 csv_len = 0U;
-    u64 prev = 0ULL;
-    u64 last = 0ULL;
-    u64 coverage_permille = 0ULL;
-
-    if (pc_limit == 0U || pc_limit > INT8_MAX_EXEC_PLAN_COUNT) {
-        xil_printf("APP: invalid exec_plan_count=%u\r\n", exec_plan_count);
-        return XST_FAILURE;
-    }
-    if (pc_limit > (INT8_APP_PREFIX_PROFILE_MAX_PC + 1U)) {
-        pc_limit = INT8_APP_PREFIX_PROFILE_MAX_PC + 1U;
-    }
-
-    memset(g_prefix_csv, 0, sizeof(g_prefix_csv));
-    {
-        int n = snprintf(g_prefix_csv, sizeof(g_prefix_csv),
-                         "pc,cycles_prefix,cycles_delta,ms_prefix,ms_delta\r\n");
-        if (n < 0 || (u32)n >= sizeof(g_prefix_csv)) {
-            return XST_FAILURE;
-        }
-        csv_len = (u32)n;
-    }
-
-    xil_printf("APP: prefix profiling start entries=%u\r\n", pc_limit);
-    for (pc = 0U; pc < pc_limit; ++pc) {
-        u64 prefix_cycles = 0ULL;
-        u64 delta;
-        if (run_prefix_once(npu, uop_count, pc, &prefix_cycles) != XST_SUCCESS) {
-            xil_printf("APP: prefix run failed pc=%u\r\n", pc);
-            return XST_FAILURE;
-        }
-        delta = (prefix_cycles >= prev) ? (prefix_cycles - prev) : 0ULL;
-        prev = prefix_cycles;
-        last = prefix_cycles;
-        if (append_prefix_csv(&csv_len, sizeof(g_prefix_csv), pc,
-                              prefix_cycles, delta) != XST_SUCCESS) {
-            xil_printf("APP: prefix CSV buffer overflow\r\n");
-            return XST_FAILURE;
-        }
-        xil_printf("APP: prefix pc=%u ticks=%llu delta=%llu ms=%llu\r\n",
-                   pc, prefix_cycles, delta, timer_ticks_to_ms(prefix_cycles));
-    }
-
-    coverage_permille = (full_cycles > 0ULL) ?
-        ((last * 1000ULL + (full_cycles / 2ULL)) / full_cycles) : 0ULL;
-    xil_printf("APP: prefix profiling done last=%llu full=%llu coverage=%llu.%03llu\r\n",
-               last, full_cycles, coverage_permille / 1000ULL,
-               coverage_permille % 1000ULL);
-
-    if (SD_SaveMemoryToFile(INT8_APP_PREFIX_PROFILE_CSV_FILE, g_prefix_csv,
-                            csv_len) != XST_SUCCESS) {
-        xil_printf("APP: save prefix CSV failed\r\n");
-        return XST_FAILURE;
-    }
-#else
-    (void)npu;
-    (void)uop_count;
-    (void)exec_plan_count;
-    (void)full_cycles;
-#endif
-    return XST_SUCCESS;
-}
-
-static int run_single_image(Int8NpuContext *npu, u32 uop_count,
-                            u32 exec_plan_count)
+static int run_single_image(Int8NpuContext *npu, u32 uop_count)
 {
     u32 input_size = 0U;
     u64 cycles = 0ULL;
@@ -318,13 +214,6 @@ static int run_single_image(Int8NpuContext *npu, u32 uop_count,
 
     xil_printf("APP: single MODE_RUN done\r\n");
     print_perf_summary();
-    int8_npu_dump_profile_regs(npu, "SINGLE");
-
-    if (run_prefix_profile(npu, uop_count, exec_plan_count, cycles) !=
-        XST_SUCCESS) {
-        xil_printf("APP: prefix profiling failed\r\n");
-        return XST_FAILURE;
-    }
 
     if (SD_SaveMemoryToFile(INT8_APP_SINGLE_PERF_OUTPUT_FILE, g_output,
                             INT8_OUTPUT_BYTES) != XST_SUCCESS) {
@@ -424,7 +313,6 @@ static int run_val_set(Int8NpuContext *npu, u32 uop_count)
     xil_printf("APP: avg_cycles=%llu avg_ms=%llu min_ms=%llu max_ms=%llu\r\n",
                total_cycles / processed, timer_ticks_to_ms(total_cycles / processed),
                timer_ticks_to_ms(min_cycles), timer_ticks_to_ms(max_cycles));
-    int8_npu_dump_profile_regs(npu, "VAL_LAST");
     xil_printf("APP: run host eval_val_hw_masks_fullres on Oxxxx.BIN files\r\n");
     return XST_SUCCESS;
 }
@@ -479,13 +367,13 @@ int main(void)
 
 #if INT8_APP_ENABLE_VAL_SET_TEST
 #if INT8_APP_ENABLE_SINGLE_PERF_BEFORE_VAL
-    if (run_single_image(&npu, header.uop_count, header.exec_plan_count) != XST_SUCCESS) {
+    if (run_single_image(&npu, header.uop_count) != XST_SUCCESS) {
         xil_printf("APP: single perf before valset failed\r\n");
         return XST_FAILURE;
     }
 #endif
     return run_val_set(&npu, header.uop_count);
 #else
-    return run_single_image(&npu, header.uop_count, header.exec_plan_count);
+    return run_single_image(&npu, header.uop_count);
 #endif
 }

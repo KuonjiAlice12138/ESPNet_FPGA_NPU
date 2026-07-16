@@ -23,6 +23,19 @@ bool on_chip_memory_read_aligned_full_tile(const tensor_desc_t& desc,
                                            u16_t c_begin,
                                            act_vec_t& packed);
 
+bool on_chip_memory_prepare_row_base(const tensor_desc_t& desc,
+                                     i32_t h,
+                                     u32_t& row_base,
+                                     bool& row_valid);
+
+bool on_chip_memory_read_packed_tile_from_row(const tensor_desc_t& desc,
+                                              u32_t row_base,
+                                              bool row_valid,
+                                              i32_t w,
+                                              u16_t c_begin,
+                                              u8_t valid_c,
+                                              act_vec_t& packed);
+
 static act_vec_t read_tile_or_zero(const tensor_desc_t& desc,
                                    i32_t h,
                                    i32_t w,
@@ -60,164 +73,198 @@ static bool win_can_read_aligned_1x1(const tensor_desc_t& desc, u16_t c_begin) {
            ((base_start & static_cast<unsigned>(AXI_WORD_BYTES - 1)) == 0U);
 }
 
-static void read_pixel_chunks_or_zero(const tensor_desc_t& desc,
-                                      i32_t ih,
-                                      i32_t iw,
-                                      u16_t in_c,
-                                      u8_t cache_chunks,
-                                      act_vec_t out_chunks[MAX_3X3_CACHE_CHUNKS]) {
+struct narrow_3x3_window_t {
+    act_vec_t spatial[9];
+};
+
+static act_vec_t s_narrow_cache_row0[WINGEN_NARROW_CACHE_COL_SLOTS];
+static act_vec_t s_narrow_cache_row1[WINGEN_NARROW_CACHE_COL_SLOTS];
+static act_vec_t s_narrow_cache_row2[WINGEN_NARROW_CACHE_COL_SLOTS];
+
+struct wide_3x3_cache_t {
+    act_vec_t data[3][WINGEN_WIDE_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS];
+};
+
+static act_vec_t read_staged_cache(const narrow_3x3_window_t& window,
+                                   int kh,
+                                   int kw,
+                                   int,
+                                   int) {
+#pragma HLS INLINE
+    return window.spatial[kh * 3 + kw];
+}
+
+static act_vec_t read_staged_cache(const wide_3x3_cache_t& cache,
+                                   int kh,
+                                   int,
+                                   int slot,
+                                   int chunk) {
+#pragma HLS INLINE
+    return cache.data[kh][slot][chunk];
+}
+
+static void load_narrow_cache_column(const tensor_desc_t& src_desc,
+                                     const u32_t row_base[3],
+                                     const bool row_valid[3],
+                                     i32_t input_col,
+                                     u8_t slot,
+                                     const window_sched_desc_t& sched) {
 #pragma HLS INLINE off
-    const int chunk_count = static_cast<int>(cache_chunks.to_uint());
-    for (int chunk = 0; chunk < MAX_3X3_CACHE_CHUNKS; ++chunk) {
+    const int slot_i = static_cast<int>(slot.to_uint());
+    u8_t valid_c = 0;
+    valid_c.range(7, 0) = sched.in_c.range(7, 0);
+    for (int kh = 0; kh < 3; ++kh) {
 #pragma HLS PIPELINE off
         act_vec_t word = 0;
-        if (chunk < chunk_count) {
-            const unsigned c_begin_u = static_cast<unsigned>(chunk * TK);
-            unsigned valid = 0U;
-            if (c_begin_u < in_c.to_uint()) {
-                valid = in_c.to_uint() - c_begin_u;
+        on_chip_memory_read_packed_tile_from_row(src_desc,
+                                                 row_base[kh],
+                                                 row_valid[kh],
+                                                 input_col,
+                                                 static_cast<u16_t>(0),
+                                                 valid_c,
+                                                 word);
+        if (kh == 0) {
+            s_narrow_cache_row0[slot_i] = word;
+        } else if (kh == 1) {
+            s_narrow_cache_row1[slot_i] = word;
+        } else {
+            s_narrow_cache_row2[slot_i] = word;
+        }
+    }
+}
+
+static void load_wide_cache_column(const tensor_desc_t& src_desc,
+                                   const u32_t row_base[3],
+                                   const bool row_valid[3],
+                                   i32_t input_col,
+                                   u8_t slot,
+                                   const window_sched_desc_t& sched,
+                                   wide_3x3_cache_t& cache) {
+#pragma HLS INLINE off
+    const int slot_i = static_cast<int>(slot.to_uint());
+    for (int kh = 0; kh < 3; ++kh) {
+#pragma HLS PIPELINE off
+        for (int chunk = 0; chunk < MAX_3X3_CACHE_CHUNKS; ++chunk) {
+#pragma HLS PIPELINE off
+            act_vec_t word = 0;
+            if (chunk < static_cast<int>(sched.cache_chunks.to_uint())) {
+                const unsigned c_begin_u = static_cast<unsigned>(chunk * TK);
+                unsigned valid = sched.in_c.to_uint() - c_begin_u;
                 if (valid > static_cast<unsigned>(TK)) {
                     valid = static_cast<unsigned>(TK);
                 }
+                on_chip_memory_read_packed_tile_from_row(src_desc,
+                                                         row_base[kh],
+                                                         row_valid[kh],
+                                                         input_col,
+                                                         static_cast<u16_t>(c_begin_u),
+                                                         static_cast<u8_t>(valid),
+                                                         word);
             }
-            if (valid != 0U) {
-                word = read_tile_or_zero(desc,
-                                         ih,
-                                         iw,
-                                         static_cast<u16_t>(c_begin_u),
-                                         static_cast<u8_t>(valid));
-            }
+            cache.data[kh][slot_i][chunk] = word;
         }
-        out_chunks[chunk] = word;
     }
 }
 
-static void load_3x3_cache_column(const tensor_desc_t& src_desc,
-                                  i32_t base_h,
-                                  i32_t input_col,
-                                  u8_t slot,
-                                  const window_sched_desc_t& sched,
-                                  act_vec_t cache[3][WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS]) {
+static void update_narrow_direct_cache(const tensor_desc_t& src_desc,
+                                       const window_sched_desc_t& sched,
+                                       const u32_t row_base[3],
+                                       const bool row_valid[3],
+                                       const i32_t want_col[3],
+                                       i32_t col_tag[WINGEN_NARROW_CACHE_COL_SLOTS],
+                                       u8_t slot_for_kw[3]) {
 #pragma HLS INLINE off
-    const int slot_i = static_cast<int>(slot.to_uint());
-    const int dilation_i = static_cast<int>(sched.dilation.to_uint());
-    for (int kh = 0; kh < 3; ++kh) {
-#pragma HLS PIPELINE off
-        const i32_t ih = base_h + static_cast<i32_t>(kh * dilation_i);
-        read_pixel_chunks_or_zero(src_desc,
-                                  ih,
-                                  input_col,
-                                  sched.in_c,
-                                  sched.cache_chunks,
-                                  cache[kh][slot_i]);
-    }
-}
-
-static int find_cached_col(const i32_t col_tag[WINGEN_CACHE_COL_SLOTS], i32_t col) {
-#pragma HLS INLINE
-    int hit = -1;
-    for (int slot = 0; slot < WINGEN_CACHE_COL_SLOTS; ++slot) {
-#pragma HLS UNROLL
-        if (col_tag[slot] == col) {
-            hit = slot;
-        }
-    }
-    return hit;
-}
-
-static int select_replacement_slot(const bool used[WINGEN_CACHE_COL_SLOTS]) {
-#pragma HLS INLINE
-    int chosen = 0;
-    for (int slot = 0; slot < WINGEN_CACHE_COL_SLOTS; ++slot) {
-#pragma HLS UNROLL
-        if (!used[slot]) {
-            chosen = slot;
-            break;
-        }
-    }
-    return chosen;
-}
-
-static void update_3x3_column_cache(const tensor_desc_t& src_desc,
-                                    const window_sched_desc_t& sched,
-                                    i32_t base_h,
-                                    i32_t want_col[3],
-                                    i32_t col_tag[WINGEN_CACHE_COL_SLOTS],
-                                    u8_t slot_for_kw[3],
-                                    act_vec_t cache[3][WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS]) {
-#pragma HLS INLINE off
-    bool used[WINGEN_CACHE_COL_SLOTS];
-#pragma HLS ARRAY_PARTITION variable=used complete dim=1
-
-    for (int slot = 0; slot < WINGEN_CACHE_COL_SLOTS; ++slot) {
-#pragma HLS UNROLL
-        used[slot] = false;
-    }
-    for (int kw = 0; kw < 3; ++kw) {
-#pragma HLS UNROLL
-        slot_for_kw[kw] = static_cast<u8_t>(0xff);
-    }
-
-    for (int kw = 0; kw < 3; ++kw) {
-#pragma HLS UNROLL
-        const int hit = find_cached_col(col_tag, want_col[kw]);
-        if (hit >= 0) {
-            slot_for_kw[kw] = static_cast<u8_t>(hit);
-            used[hit] = true;
-        }
-    }
-
+    const unsigned slot_mask = sched.cache_col_slots.to_uint() - 1U;
     for (int kw = 0; kw < 3; ++kw) {
 #pragma HLS PIPELINE off
-        if (slot_for_kw[kw].to_uint() == 0xffU) {
-            const int slot = select_replacement_slot(used);
-            used[slot] = true;
+        const unsigned slot = static_cast<unsigned>(want_col[kw].to_int()) & slot_mask;
+        slot_for_kw[kw] = static_cast<u8_t>(slot);
+        if (col_tag[slot] != want_col[kw]) {
+            load_narrow_cache_column(src_desc,
+                                     row_base,
+                                     row_valid,
+                                     want_col[kw],
+                                     static_cast<u8_t>(slot),
+                                     sched);
             col_tag[slot] = want_col[kw];
-            slot_for_kw[kw] = static_cast<u8_t>(slot);
-            load_3x3_cache_column(src_desc,
-                                  base_h,
-                                  want_col[kw],
-                                  static_cast<u8_t>(slot),
-                                  sched,
-                                  cache);
         }
     }
 }
 
-template <int SPATIAL, int SRC_LANE, int DST_LANE, int COUNT>
+static void stage_narrow_3x3_window(const u8_t slot_for_kw[3],
+                                    narrow_3x3_window_t& window) {
+#pragma HLS INLINE off
+    for (int kw = 0; kw < 3; ++kw) {
+#pragma HLS PIPELINE II=1
+        const int slot = static_cast<int>(slot_for_kw[kw].to_uint());
+        window.spatial[kw] = s_narrow_cache_row0[slot];
+        window.spatial[3 + kw] = s_narrow_cache_row1[slot];
+        window.spatial[6 + kw] = s_narrow_cache_row2[slot];
+    }
+}
+
+static void update_wide_direct_cache(const tensor_desc_t& src_desc,
+                                     const window_sched_desc_t& sched,
+                                     const u32_t row_base[3],
+                                     const bool row_valid[3],
+                                     const i32_t want_col[3],
+                                     i32_t col_tag[WINGEN_WIDE_CACHE_COL_SLOTS],
+                                     u8_t slot_for_kw[3],
+                                     wide_3x3_cache_t& cache) {
+#pragma HLS INLINE off
+    for (int kw = 0; kw < 3; ++kw) {
+#pragma HLS PIPELINE off
+        const unsigned slot = static_cast<unsigned>(want_col[kw].to_int()) &
+                              static_cast<unsigned>(WINGEN_WIDE_CACHE_COL_SLOTS - 1);
+        slot_for_kw[kw] = static_cast<u8_t>(slot);
+        if (col_tag[slot] != want_col[kw]) {
+            load_wide_cache_column(src_desc,
+                                   row_base,
+                                   row_valid,
+                                   want_col[kw],
+                                   static_cast<u8_t>(slot),
+                                   sched,
+                                   cache);
+            col_tag[slot] = want_col[kw];
+        }
+    }
+}
+
+template <int SPATIAL, int SRC_LANE, int DST_LANE, int COUNT, typename CacheT>
 static void copy_staged_cache_segment(
-    const act_vec_t cache[3][WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS],
+    const CacheT& cache,
     const u8_t slot_for_kw[3],
     act_vec_t& word) {
 #pragma HLS INLINE
     const int kh = SPATIAL / 3;
     const int kw = SPATIAL - kh * 3;
     const int slot = static_cast<int>(slot_for_kw[kw].to_uint());
-    const act_vec_t src = cache[kh][slot][0];
+    const act_vec_t src = read_staged_cache(cache, kh, kw, slot, 0);
     word.range(DST_LANE * 8 + COUNT * 8 - 1, DST_LANE * 8) =
         src.range(SRC_LANE * 8 + COUNT * 8 - 1, SRC_LANE * 8);
 }
 
-template <int SPATIAL, int CHUNK, int SRC_LANE, int DST_LANE, int COUNT>
+template <int SPATIAL, int CHUNK, int SRC_LANE, int DST_LANE, int COUNT, typename CacheT>
 static void copy_staged_cache_chunk_segment(
-    const act_vec_t cache[3][WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS],
+    const CacheT& cache,
     const u8_t slot_for_kw[3],
     act_vec_t& word) {
 #pragma HLS INLINE
     const int kh = SPATIAL / 3;
     const int kw = SPATIAL - kh * 3;
     const int slot = static_cast<int>(slot_for_kw[kw].to_uint());
-    const act_vec_t src = cache[kh][slot][CHUNK];
+    const act_vec_t src = read_staged_cache(cache, kh, kw, slot, CHUNK);
     word.range(DST_LANE * 8 + COUNT * 8 - 1, DST_LANE * 8) =
         src.range(SRC_LANE * 8 + COUNT * 8 - 1, SRC_LANE * 8);
 }
 
+template <typename CacheT>
 static void build_staged_c3_word(
-    const act_vec_t cache[3][WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS],
+    const CacheT& cache,
     const u8_t slot_for_kw[3],
     int,
     act_vec_t& word) {
-#pragma HLS INLINE off
+#pragma HLS INLINE
     copy_staged_cache_segment<0, 0, 0, 3>(cache, slot_for_kw, word);
     copy_staged_cache_segment<1, 0, 3, 3>(cache, slot_for_kw, word);
     copy_staged_cache_segment<2, 0, 6, 3>(cache, slot_for_kw, word);
@@ -229,12 +276,13 @@ static void build_staged_c3_word(
     copy_staged_cache_segment<8, 0, 24, 3>(cache, slot_for_kw, word);
 }
 
+template <typename CacheT>
 static void build_staged_c12_word(
-    const act_vec_t cache[3][WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS],
+    const CacheT& cache,
     const u8_t slot_for_kw[3],
     int kt,
     act_vec_t& word) {
-#pragma HLS INLINE off
+#pragma HLS INLINE
     switch (kt) {
         case 0:
             copy_staged_cache_segment<0, 0, 0, 12>(cache, slot_for_kw, word);
@@ -260,12 +308,13 @@ static void build_staged_c12_word(
     }
 }
 
+template <typename CacheT>
 static void build_staged_c19_word(
-    const act_vec_t cache[3][WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS],
+    const CacheT& cache,
     const u8_t slot_for_kw[3],
     int kt,
     act_vec_t& word) {
-#pragma HLS INLINE off
+#pragma HLS INLINE
     switch (kt) {
         case 0:
             copy_staged_cache_segment<0, 0, 0, 19>(cache, slot_for_kw, word);
@@ -298,12 +347,13 @@ static void build_staged_c19_word(
     }
 }
 
+template <typename CacheT>
 static void build_staged_c25_word(
-    const act_vec_t cache[3][WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS],
+    const CacheT& cache,
     const u8_t slot_for_kw[3],
     int kt,
     act_vec_t& word) {
-#pragma HLS INLINE off
+#pragma HLS INLINE
     switch (kt) {
         case 0:
             copy_staged_cache_segment<0, 0, 0, 25>(cache, slot_for_kw, word);
@@ -342,8 +392,9 @@ static void build_staged_c25_word(
     }
 }
 
+template <typename CacheT>
 static void build_staged_c28_word(
-    const act_vec_t cache[3][WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS],
+    const CacheT& cache,
     const u8_t slot_for_kw[3],
     int kt,
     act_vec_t& word) {
@@ -385,8 +436,9 @@ static void build_staged_c28_word(
     }
 }
 
+template <typename CacheT>
 static void build_staged_c64_word(
-    const act_vec_t cache[3][WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS],
+    const CacheT& cache,
     const u8_t slot_for_kw[3],
     int kt,
     act_vec_t& word) {
@@ -451,8 +503,9 @@ static void build_staged_c64_word(
     }
 }
 
+template <typename CacheT>
 static void build_staged_c128_word(
-    const act_vec_t cache[3][WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS],
+    const CacheT& cache,
     const u8_t slot_for_kw[3],
     int kt,
     act_vec_t& word) {
@@ -571,8 +624,9 @@ static void build_staged_c128_word(
     }
 }
 
+template <typename CacheT>
 static void build_staged_c131_word(
-    const act_vec_t cache[3][WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS],
+    const CacheT& cache,
     const u8_t slot_for_kw[3],
     int kt,
     act_vec_t& word) {
@@ -734,62 +788,246 @@ static void build_staged_c131_word(
     }
 }
 
-static void build_staged_word_for_mode(
+static void emit_narrow_words_for_mode(
     unsigned mode,
-    const act_vec_t cache[3][WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS],
+    const narrow_3x3_window_t& window,
     const u8_t slot_for_kw[3],
-    int kt,
-    act_vec_t& word) {
+    hls::stream<act_vec_t>& act_stream) {
 #pragma HLS INLINE off
     if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C3)) {
-        build_staged_c3_word(cache, slot_for_kw, kt, word);
+        for (int kt = 0; kt < 1; ++kt) {
+#pragma HLS PIPELINE II=1
+            act_vec_t word = 0;
+            build_staged_c3_word(window, slot_for_kw, kt, word);
+            act_stream.write(word);
+        }
         return;
     }
     if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12)) {
-        build_staged_c12_word(cache, slot_for_kw, kt, word);
+        for (int kt = 0; kt < 4; ++kt) {
+#pragma HLS PIPELINE II=1
+            act_vec_t word = 0;
+            build_staged_c12_word(window, slot_for_kw, kt, word);
+            act_stream.write(word);
+        }
         return;
     }
     if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C19)) {
-        build_staged_c19_word(cache, slot_for_kw, kt, word);
+        for (int kt = 0; kt < 6; ++kt) {
+#pragma HLS PIPELINE II=1
+            act_vec_t word = 0;
+            build_staged_c19_word(window, slot_for_kw, kt, word);
+            act_stream.write(word);
+        }
         return;
     }
     if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C25)) {
-        build_staged_c25_word(cache, slot_for_kw, kt, word);
-        return;
-    }
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C28)) {
-        build_staged_c28_word(cache, slot_for_kw, kt, word);
-        return;
-    }
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C64)) {
-        build_staged_c64_word(cache, slot_for_kw, kt, word);
-        return;
-    }
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C128)) {
-        build_staged_c128_word(cache, slot_for_kw, kt, word);
-        return;
-    }
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C131)) {
-        build_staged_c131_word(cache, slot_for_kw, kt, word);
+        for (int kt = 0; kt < 8; ++kt) {
+#pragma HLS PIPELINE II=1
+            act_vec_t word = 0;
+            build_staged_c25_word(window, slot_for_kw, kt, word);
+            act_stream.write(word);
+        }
         return;
     }
 }
 
-static void scheduled_3x3_staged_window_row(const tensor_desc_t& src_desc,
+static void emit_narrow_word_pair_for_mode(
+    unsigned mode,
+    const narrow_3x3_window_t& window0,
+    const narrow_3x3_window_t& window1,
+    const u8_t slot_for_kw0[3],
+    const u8_t slot_for_kw1[3],
+    hls::stream<act_vec_t>& act_stream0,
+    hls::stream<act_vec_t>& act_stream1) {
+#pragma HLS INLINE off
+    const int k_tiles = (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C3))
+                            ? 1
+                            : (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12))
+                                  ? 4
+                                  : (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C19)) ? 6 : 8;
+    for (int kt = 0; kt < 8; ++kt) {
+#pragma HLS PIPELINE II=1
+        if (kt >= k_tiles) {
+            break;
+        }
+        act_vec_t word0 = 0;
+        act_vec_t word1 = 0;
+        if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C3)) {
+            build_staged_c3_word(window0, slot_for_kw0, kt, word0);
+            build_staged_c3_word(window1, slot_for_kw1, kt, word1);
+        } else if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12)) {
+            build_staged_c12_word(window0, slot_for_kw0, kt, word0);
+            build_staged_c12_word(window1, slot_for_kw1, kt, word1);
+        } else if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C19)) {
+            build_staged_c19_word(window0, slot_for_kw0, kt, word0);
+            build_staged_c19_word(window1, slot_for_kw1, kt, word1);
+        } else {
+            build_staged_c25_word(window0, slot_for_kw0, kt, word0);
+            build_staged_c25_word(window1, slot_for_kw1, kt, word1);
+        }
+        act_stream0.write(word0);
+        act_stream1.write(word1);
+    }
+}
+
+static void emit_wide_words_for_mode(
+    unsigned mode,
+    const wide_3x3_cache_t& cache,
+    const u8_t slot_for_kw[3],
+    hls::stream<act_vec_t>& act_stream) {
+#pragma HLS INLINE off
+    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C28)) {
+        for (int kt = 0; kt < 8; ++kt) {
+            act_vec_t word = 0;
+            build_staged_c28_word(cache, slot_for_kw, kt, word);
+            act_stream.write(word);
+        }
+        return;
+    }
+    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C64)) {
+        for (int kt = 0; kt < 18; ++kt) {
+            act_vec_t word = 0;
+            build_staged_c64_word(cache, slot_for_kw, kt, word);
+            act_stream.write(word);
+        }
+        return;
+    }
+    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C128)) {
+        for (int kt = 0; kt < 36; ++kt) {
+            act_vec_t word = 0;
+            build_staged_c128_word(cache, slot_for_kw, kt, word);
+            act_stream.write(word);
+        }
+        return;
+    }
+    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C131)) {
+        for (int kt = 0; kt < 37; ++kt) {
+            act_vec_t word = 0;
+            build_staged_c131_word(cache, slot_for_kw, kt, word);
+            act_stream.write(word);
+        }
+        return;
+    }
+}
+
+static void scheduled_narrow_3x3_window_row(const tensor_desc_t& src_desc,
                                             const window_sched_desc_t& sched,
                                             unsigned mode,
-                                            hls::stream<act_vec_t>& act_stream,
+                                            hls::stream<act_vec_t>& act_stream0,
+                                            hls::stream<act_vec_t>& act_stream1,
                                             u16_t out_row) {
 #pragma HLS INLINE off
-    act_vec_t cache[3][WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS];
-#pragma HLS BIND_STORAGE variable=cache type=ram_2p impl=lutram
+#pragma HLS BIND_STORAGE variable=s_narrow_cache_row0 type=ram_2p impl=bram
+#pragma HLS BIND_STORAGE variable=s_narrow_cache_row1 type=ram_2p impl=bram
+#pragma HLS BIND_STORAGE variable=s_narrow_cache_row2 type=ram_2p impl=bram
+#pragma HLS RESET variable=s_narrow_cache_row0 off
+#pragma HLS RESET variable=s_narrow_cache_row1 off
+#pragma HLS RESET variable=s_narrow_cache_row2 off
 
-    i32_t col_tag[WINGEN_CACHE_COL_SLOTS];
+    i32_t col_tag[WINGEN_NARROW_CACHE_COL_SLOTS];
+#pragma HLS BIND_STORAGE variable=col_tag type=ram_2p impl=lutram
+    u8_t slot_for_kw[3];
+#pragma HLS ARRAY_PARTITION variable=slot_for_kw complete dim=1
+
+    for (int slot = 0; slot < WINGEN_NARROW_CACHE_COL_SLOTS; ++slot) {
+#pragma HLS PIPELINE II=1
+        col_tag[slot] = static_cast<i32_t>(-32768);
+    }
+
+    const int out_w_i = static_cast<int>(sched.out_w.to_uint());
+    const int stride_i = static_cast<int>(sched.stride.to_uint());
+    const int dilation_i = static_cast<int>(sched.dilation.to_uint());
+    const int padding_i = static_cast<int>(sched.padding.to_uint());
+    const i32_t base_h =
+        static_cast<i32_t>(out_row.to_uint() * static_cast<unsigned>(stride_i)) -
+        static_cast<i32_t>(padding_i);
+    u32_t row_base[3];
+    bool row_valid[3];
+#pragma HLS ARRAY_PARTITION variable=row_base complete dim=1
+#pragma HLS ARRAY_PARTITION variable=row_valid complete dim=1
+    for (int kh = 0; kh < 3; ++kh) {
+#pragma HLS UNROLL
+        on_chip_memory_prepare_row_base(src_desc,
+                                        base_h + static_cast<i32_t>(kh * dilation_i),
+                                        row_base[kh],
+                                        row_valid[kh]);
+    }
+
+    const bool paired =
+        (sched.flags.to_uint() & static_cast<unsigned>(WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)) != 0U;
+    const bool odd_tail =
+        (sched.flags.to_uint() & static_cast<unsigned>(WINDOW_SCHED_FLAG_ODD_TAIL)) != 0U;
+    const int issue_count = paired ? ((out_w_i + 1) / 2) : out_w_i;
+    for (int issue_i = 0; issue_i < MAX_FM_W; ++issue_i) {
+        if (issue_i >= issue_count) {
+            break;
+        }
+        const int pixel0 = paired ? issue_i * 2 : issue_i;
+        const i32_t base_w0 =
+            static_cast<i32_t>(pixel0 * stride_i) - static_cast<i32_t>(padding_i);
+        i32_t want_col0[3];
+#pragma HLS ARRAY_PARTITION variable=want_col0 complete dim=1
+        for (int kw = 0; kw < 3; ++kw) {
+#pragma HLS UNROLL
+            want_col0[kw] = base_w0 + static_cast<i32_t>(kw * dilation_i);
+        }
+        update_narrow_direct_cache(src_desc, sched, row_base, row_valid, want_col0, col_tag, slot_for_kw);
+        narrow_3x3_window_t window0;
+#pragma HLS ARRAY_PARTITION variable=window0.spatial complete dim=1
+        stage_narrow_3x3_window(slot_for_kw, window0);
+
+        if (!paired) {
+            emit_narrow_words_for_mode(mode, window0, slot_for_kw, act_stream0);
+            continue;
+        }
+
+        u8_t slot_for_kw1[3];
+#pragma HLS ARRAY_PARTITION variable=slot_for_kw1 complete dim=1
+        narrow_3x3_window_t window1;
+#pragma HLS ARRAY_PARTITION variable=window1.spatial complete dim=1
+        const bool tail_issue = odd_tail && issue_i == issue_count - 1;
+        if (!tail_issue) {
+            const i32_t base_w1 =
+                static_cast<i32_t>((pixel0 + 1) * stride_i) - static_cast<i32_t>(padding_i);
+            i32_t want_col1[3];
+#pragma HLS ARRAY_PARTITION variable=want_col1 complete dim=1
+            for (int kw = 0; kw < 3; ++kw) {
+#pragma HLS UNROLL
+                want_col1[kw] = base_w1 + static_cast<i32_t>(kw * dilation_i);
+            }
+            update_narrow_direct_cache(src_desc, sched, row_base, row_valid, want_col1, col_tag, slot_for_kw1);
+            stage_narrow_3x3_window(slot_for_kw1, window1);
+        } else {
+            for (int kw = 0; kw < 3; ++kw) {
+#pragma HLS UNROLL
+                slot_for_kw1[kw] = 0;
+            }
+            for (int spatial = 0; spatial < 9; ++spatial) {
+#pragma HLS UNROLL
+                window1.spatial[spatial] = 0;
+            }
+        }
+        emit_narrow_word_pair_for_mode(
+            mode, window0, window1, slot_for_kw, slot_for_kw1, act_stream0, act_stream1);
+    }
+}
+
+static void scheduled_wide_3x3_window_row(const tensor_desc_t& src_desc,
+                                          const window_sched_desc_t& sched,
+                                          unsigned mode,
+                                          hls::stream<act_vec_t>& act_stream,
+                                          u16_t out_row) {
+#pragma HLS INLINE off
+    wide_3x3_cache_t cache;
+#pragma HLS ARRAY_PARTITION variable=cache.data complete dim=1
+#pragma HLS BIND_STORAGE variable=cache.data type=ram_2p impl=lutram
+    i32_t col_tag[WINGEN_WIDE_CACHE_COL_SLOTS];
 #pragma HLS ARRAY_PARTITION variable=col_tag complete dim=1
     u8_t slot_for_kw[3];
 #pragma HLS ARRAY_PARTITION variable=slot_for_kw complete dim=1
 
-    for (int slot = 0; slot < WINGEN_CACHE_COL_SLOTS; ++slot) {
+    for (int slot = 0; slot < WINGEN_WIDE_CACHE_COL_SLOTS; ++slot) {
 #pragma HLS UNROLL
         col_tag[slot] = static_cast<i32_t>(-32768);
     }
@@ -798,16 +1036,25 @@ static void scheduled_3x3_staged_window_row(const tensor_desc_t& src_desc,
     const int stride_i = static_cast<int>(sched.stride.to_uint());
     const int dilation_i = static_cast<int>(sched.dilation.to_uint());
     const int padding_i = static_cast<int>(sched.padding.to_uint());
-    const int k_tiles_i = static_cast<int>(sched.k_tiles.to_uint());
     const i32_t base_h =
         static_cast<i32_t>(out_row.to_uint() * static_cast<unsigned>(stride_i)) -
         static_cast<i32_t>(padding_i);
+    u32_t row_base[3];
+    bool row_valid[3];
+#pragma HLS ARRAY_PARTITION variable=row_base complete dim=1
+#pragma HLS ARRAY_PARTITION variable=row_valid complete dim=1
+    for (int kh = 0; kh < 3; ++kh) {
+#pragma HLS UNROLL
+        on_chip_memory_prepare_row_base(src_desc,
+                                        base_h + static_cast<i32_t>(kh * dilation_i),
+                                        row_base[kh],
+                                        row_valid[kh]);
+    }
 
     for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
         if (ow_i >= out_w_i) {
             break;
         }
-
         const i32_t base_w =
             static_cast<i32_t>(ow_i * stride_i) - static_cast<i32_t>(padding_i);
         i32_t want_col[3];
@@ -816,29 +1063,22 @@ static void scheduled_3x3_staged_window_row(const tensor_desc_t& src_desc,
 #pragma HLS UNROLL
             want_col[kw] = base_w + static_cast<i32_t>(kw * dilation_i);
         }
-
-        update_3x3_column_cache(src_desc,
-                                sched,
-                                base_h,
-                                want_col,
-                                col_tag,
-                                slot_for_kw,
-                                cache);
-
-        for (int kt = 0; kt < MAX_K_TILE_COUNT; ++kt) {
-            if (kt >= k_tiles_i) {
-                break;
-            }
-            act_vec_t word = 0;
-            build_staged_word_for_mode(mode, cache, slot_for_kw, kt, word);
-            act_stream.write(word);
-        }
+        update_wide_direct_cache(src_desc,
+                                 sched,
+                                 row_base,
+                                 row_valid,
+                                 want_col,
+                                 col_tag,
+                                 slot_for_kw,
+                                 cache);
+        emit_wide_words_for_mode(mode, cache, slot_for_kw, act_stream);
     }
 }
 
 static void scheduled_1x1_window_row(const tensor_desc_t& src_desc,
                                      const window_sched_desc_t& sched,
-                                     hls::stream<act_vec_t>& act_stream,
+                                     hls::stream<act_vec_t>& act_stream0,
+                                     hls::stream<act_vec_t>& act_stream1,
                                      u16_t out_row,
                                      bool aligned_full_tile) {
 #pragma HLS INLINE off
@@ -848,21 +1088,28 @@ static void scheduled_1x1_window_row(const tensor_desc_t& src_desc,
     const int in_c_i = static_cast<int>(sched.in_c.to_uint());
     const i32_t ih = static_cast<i32_t>(out_row.to_uint() * static_cast<unsigned>(stride_i));
 
-    for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
-        if (ow_i >= out_w_i) {
+    const bool paired =
+        (sched.flags.to_uint() & static_cast<unsigned>(WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)) != 0U;
+    const bool odd_tail =
+        (sched.flags.to_uint() & static_cast<unsigned>(WINDOW_SCHED_FLAG_ODD_TAIL)) != 0U;
+    const int issue_count = paired ? ((out_w_i + 1) / 2) : out_w_i;
+    for (int issue_i = 0; issue_i < MAX_FM_W; ++issue_i) {
+        if (issue_i >= issue_count) {
             break;
         }
-        const i32_t iw = static_cast<i32_t>(ow_i * stride_i);
+        const int pixel0 = paired ? issue_i * 2 : issue_i;
+        const i32_t iw0 = static_cast<i32_t>(pixel0 * stride_i);
+        const i32_t iw1 = static_cast<i32_t>((pixel0 + 1) * stride_i);
         for (int kt = 0; kt < MAX_K_TILE_COUNT; ++kt) {
 #pragma HLS PIPELINE off
             if (kt >= k_tiles_i) {
                 break;
             }
             const unsigned c_begin = static_cast<unsigned>(kt) * static_cast<unsigned>(TK);
-            act_vec_t word = 0;
+            act_vec_t word0 = 0;
             if (aligned_full_tile &&
                 win_can_read_aligned_1x1(src_desc, static_cast<u16_t>(c_begin))) {
-                word = read_aligned_or_zero(src_desc, ih, iw, static_cast<u16_t>(c_begin));
+                word0 = read_aligned_or_zero(src_desc, ih, iw0, static_cast<u16_t>(c_begin));
             } else {
                 unsigned valid = (c_begin < static_cast<unsigned>(in_c_i))
                                      ? (static_cast<unsigned>(in_c_i) - c_begin)
@@ -870,13 +1117,36 @@ static void scheduled_1x1_window_row(const tensor_desc_t& src_desc,
                 if (valid > static_cast<unsigned>(TK)) {
                     valid = static_cast<unsigned>(TK);
                 }
-                word = read_tile_or_zero(src_desc,
+                word0 = read_tile_or_zero(src_desc,
                                          ih,
-                                         iw,
+                                         iw0,
                                          static_cast<u16_t>(c_begin),
                                          static_cast<u8_t>(valid));
             }
-            act_stream.write(word);
+            act_stream0.write(word0);
+            if (paired) {
+                act_vec_t word1 = 0;
+                const bool tail_issue = odd_tail && issue_i == issue_count - 1;
+                if (!tail_issue) {
+                    if (aligned_full_tile &&
+                        win_can_read_aligned_1x1(src_desc, static_cast<u16_t>(c_begin))) {
+                        word1 = read_aligned_or_zero(src_desc, ih, iw1, static_cast<u16_t>(c_begin));
+                    } else {
+                        unsigned valid = (c_begin < static_cast<unsigned>(in_c_i))
+                                             ? (static_cast<unsigned>(in_c_i) - c_begin)
+                                             : 0U;
+                        if (valid > static_cast<unsigned>(TK)) {
+                            valid = static_cast<unsigned>(TK);
+                        }
+                        word1 = read_tile_or_zero(src_desc,
+                                                  ih,
+                                                  iw1,
+                                                  static_cast<u16_t>(c_begin),
+                                                  static_cast<u8_t>(valid));
+                    }
+                }
+                act_stream1.write(word1);
+            }
         }
     }
 }
@@ -884,48 +1154,27 @@ static void scheduled_1x1_window_row(const tensor_desc_t& src_desc,
 void scheduled_window_generator_row(const tensor_desc_t& src_desc,
                                     const conv_exec_desc_t&,
                                     const window_sched_desc_t& sched,
-                                    hls::stream<act_vec_t>& act_stream,
+                                    hls::stream<act_vec_t>& act_stream0,
+                                    hls::stream<act_vec_t>& act_stream1,
                                     u16_t out_row) {
 #pragma HLS INLINE off
     const unsigned mode = sched.mode.to_uint();
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C3)) {
-        scheduled_3x3_staged_window_row(src_desc, sched, mode, act_stream, out_row);
+    if (mode >= static_cast<unsigned>(WIN_MODE_3X3_STAGED_C3) &&
+        mode <= static_cast<unsigned>(WIN_MODE_3X3_STAGED_C25)) {
+        scheduled_narrow_3x3_window_row(src_desc, sched, mode, act_stream0, act_stream1, out_row);
         return;
     }
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12)) {
-        scheduled_3x3_staged_window_row(src_desc, sched, mode, act_stream, out_row);
-        return;
-    }
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C19)) {
-        scheduled_3x3_staged_window_row(src_desc, sched, mode, act_stream, out_row);
-        return;
-    }
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C25)) {
-        scheduled_3x3_staged_window_row(src_desc, sched, mode, act_stream, out_row);
-        return;
-    }
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C28)) {
-        scheduled_3x3_staged_window_row(src_desc, sched, mode, act_stream, out_row);
-        return;
-    }
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C64)) {
-        scheduled_3x3_staged_window_row(src_desc, sched, mode, act_stream, out_row);
-        return;
-    }
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C128)) {
-        scheduled_3x3_staged_window_row(src_desc, sched, mode, act_stream, out_row);
-        return;
-    }
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C131)) {
-        scheduled_3x3_staged_window_row(src_desc, sched, mode, act_stream, out_row);
+    if (mode >= static_cast<unsigned>(WIN_MODE_3X3_STAGED_C131) &&
+        mode <= static_cast<unsigned>(WIN_MODE_3X3_STAGED_C128)) {
+        scheduled_wide_3x3_window_row(src_desc, sched, mode, act_stream0, out_row);
         return;
     }
     if (mode == static_cast<unsigned>(WIN_MODE_1X1_ALIGNED)) {
-        scheduled_1x1_window_row(src_desc, sched, act_stream, out_row, true);
+        scheduled_1x1_window_row(src_desc, sched, act_stream0, act_stream1, out_row, true);
         return;
     }
     if (mode == static_cast<unsigned>(WIN_MODE_1X1_PACKED)) {
-        scheduled_1x1_window_row(src_desc, sched, act_stream, out_row, false);
+        scheduled_1x1_window_row(src_desc, sched, act_stream0, act_stream1, out_row, false);
         return;
     }
 }

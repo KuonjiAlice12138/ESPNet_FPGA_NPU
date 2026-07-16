@@ -67,6 +67,9 @@ WIN_MODE_3X3_STAGED_C28 = 9
 WIN_MODE_3X3_STAGED_C64 = 10
 WIN_MODE_3X3_STAGED_C128 = 11
 
+WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2 = 1 << 0
+WINDOW_SCHED_FLAG_ODD_TAIL = 1 << 1
+
 PACK_CMD_VALID = 1 << 0
 PACK_CMD_ZERO = 1 << 1
 PACK_CMD_CONTIG_READ = 1 << 2
@@ -1295,6 +1298,17 @@ def window_cache_chunks_for(in_c: int, kernel: int) -> int:
     return chunks
 
 
+def window_mode_supports_pixel_parallel(mode: int) -> bool:
+    return mode in (
+        WIN_MODE_1X1_ALIGNED,
+        WIN_MODE_1X1_PACKED,
+        WIN_MODE_3X3_STAGED_C3,
+        WIN_MODE_3X3_STAGED_C12,
+        WIN_MODE_3X3_STAGED_C19,
+        WIN_MODE_3X3_STAGED_C25,
+    )
+
+
 def make_window_pack_schedule(
     in_c: int,
     kernel: int,
@@ -1343,6 +1357,22 @@ def make_window_pack_schedule(
             )
     kt_cmd_base.append(len(commands))
 
+    if kernel == 3:
+        if in_c <= 25:
+            cache_col_slots = 4 * dilation
+            if cache_col_slots > 64 or cache_col_slots & (cache_col_slots - 1):
+                raise ValueError(
+                    f"unsupported narrow 3x3 cache geometry: dilation={dilation} slots={cache_col_slots}"
+                )
+        else:
+            if dilation != 1:
+                raise ValueError(
+                    f"wide 3x3 schedule requires dilation=1, got in_c={in_c} dilation={dilation}"
+                )
+            cache_col_slots = 4
+    else:
+        cache_col_slots = 0
+
     desc = WindowSchedDesc(
         mode=window_mode_for(in_c, kernel) if mode is None else mode,
         kernel=kernel,
@@ -1350,7 +1380,7 @@ def make_window_pack_schedule(
         dilation=dilation,
         padding=padding,
         cache_chunks=window_cache_chunks_for(in_c, kernel),
-        cache_col_slots=3 if kernel == 3 else 0,
+        cache_col_slots=cache_col_slots,
         flags=0,
         in_c=in_c,
         out_w=out_w,
@@ -1777,7 +1807,7 @@ def build_window_schedule_sections(uops: Sequence[Uop]) -> Tuple[List[WindowSche
     schedules: List[WindowSchedDesc] = []
     commands: List[WindowPackCmd] = []
     schedule_ids_by_param: Dict[int, int] = {}
-    cache: Dict[Tuple[int, int, int, int, int, int, int], int] = {}
+    cache: Dict[Tuple[int, int, int, int, int, int, int, int], int] = {}
 
     for uop in uops:
         if uop.opcode != UOP_CONV:
@@ -1785,7 +1815,15 @@ def build_window_schedule_sections(uops: Sequence[Uop]) -> Tuple[List[WindowSche
         source_aligned = tensor_supports_aligned_1x1_read(uop.src0)
         mode = window_mode_for(uop.in_c, uop.kernel, source_aligned)
         out_w = conv_out_dim(uop.in_w, uop.stride)
-        key = (uop.kernel, uop.in_c, mode, uop.stride, uop.dilation, uop.padding, out_w)
+        pixel_parallel = 2 if (
+            0 < uop.out_c <= 16 and window_mode_supports_pixel_parallel(mode)
+        ) else 1
+        sched_flags = 0
+        if pixel_parallel == 2:
+            sched_flags |= WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2
+            if out_w & 1:
+                sched_flags |= WINDOW_SCHED_FLAG_ODD_TAIL
+        key = (uop.kernel, uop.in_c, mode, uop.stride, uop.dilation, uop.padding, out_w, sched_flags)
         if key not in cache:
             local_desc, _legacy_cmds = make_window_pack_schedule(
                 uop.in_c,
@@ -1804,7 +1842,7 @@ def build_window_schedule_sections(uops: Sequence[Uop]) -> Tuple[List[WindowSche
                 padding=local_desc.padding,
                 cache_chunks=local_desc.cache_chunks,
                 cache_col_slots=local_desc.cache_col_slots,
-                flags=local_desc.flags,
+                flags=sched_flags,
                 in_c=local_desc.in_c,
                 out_w=local_desc.out_w,
                 k_tiles=local_desc.k_tiles,
@@ -1844,6 +1882,8 @@ def build_window_schedule_sections(uops: Sequence[Uop]) -> Tuple[List[WindowSche
                     desc.out_w,
                 ],
                 "cache_chunks": desc.cache_chunks,
+                "pixel_parallel": 2 if (desc.flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2) else 1,
+                "odd_tail": bool(desc.flags & WINDOW_SCHED_FLAG_ODD_TAIL),
                 "k_tiles": desc.k_tiles,
                 "cmd_base": desc.cmd_base,
                 "cmd_count": desc.cmd_count,
@@ -3347,7 +3387,7 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
     for sid in range(sched_count):
         off = sched_off + sid * 128
         fields = struct.unpack("<8B5H", data[off : off + 18])
-        mode, kernel, stride, dilation, padding, cache_chunks, _cache_col_slots, _flags, in_c, out_w, k_tiles, cmd_base, cmd_len = fields
+        mode, kernel, stride, dilation, padding, cache_chunks, cache_col_slots, _flags, in_c, out_w, k_tiles, cmd_base, cmd_len = fields
         schedule_modes.append(mode)
         if mode == WIN_MODE_INVALID or kernel not in (1, 3) or in_c == 0:
             raise ValueError(f"bad window schedule[{sid}] header: {fields}")
@@ -3368,6 +3408,15 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
                 raise ValueError(f"window schedule[{sid}] kernel=3 uses unsupported mode={mode}")
             if cache_chunks <= 0 or cache_chunks > 5:
                 raise ValueError(f"window schedule[{sid}] invalid cache_chunks={cache_chunks}")
+            expected_slots = 4 * dilation if in_c <= 25 else 4
+            if cache_col_slots != expected_slots:
+                raise ValueError(
+                    f"window schedule[{sid}] cache_col_slots={cache_col_slots}, expected={expected_slots}"
+                )
+            if in_c > 25 and dilation != 1:
+                raise ValueError(
+                    f"window schedule[{sid}] wide 3x3 requires dilation=1, got {dilation}"
+                )
         if k_tiles > MAX_K_TILE_COUNT:
             raise ValueError(f"window schedule[{sid}] k_tiles={k_tiles} exceeds max")
         if cmd_base + cmd_len > cmd_count:

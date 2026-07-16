@@ -45,10 +45,7 @@ constexpr int OUTPUT_FRAME_BYTES = FULLRES_MASK_BYTES;
 constexpr int OUTPUT_FRAME_AXI_WORDS = (OUTPUT_FRAME_BYTES + AXI_WORD_BYTES - 1) / AXI_WORD_BYTES;
 
 constexpr std::uint32_t RUNTIME_MODE_MASK = 0x0000000fU;
-constexpr std::uint32_t RUNTIME_PROFILE_ENABLE_MASK = 0x00000010U;
-constexpr std::uint32_t RUNTIME_PROFILE_STOP_BEFORE_MASK = 0x00000020U;
 constexpr std::uint32_t RUNTIME_UOP_COUNT_MASK = 0x0000ffffU;
-constexpr int RUNTIME_PROFILE_STOP_SHIFT = 16;
 
 constexpr int FMBUF_BYTES = 0x598000;
 constexpr int FMBUF_BANK_COUNT = 3;
@@ -127,7 +124,8 @@ constexpr int MAX_BLOCK5_SCHED_COUNT = 8;
 constexpr int MAX_PACK_CMDS_PER_KT = 9;
 constexpr int MAX_STAGED_WINDOW_PACK_CMDS = 64;
 constexpr int MAX_3X3_CACHE_CHUNKS = 5;
-constexpr int WINGEN_CACHE_COL_SLOTS = 3;
+constexpr int WINGEN_NARROW_CACHE_COL_SLOTS = 64;
+constexpr int WINGEN_WIDE_CACHE_COL_SLOTS = 4;
 
 constexpr int WINDOW_PACK_CMD_BLOB_BYTES = 8;
 constexpr int WINDOW_SCHED_DESC_BLOB_BYTES = 128;

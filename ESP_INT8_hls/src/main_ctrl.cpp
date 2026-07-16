@@ -44,17 +44,18 @@ static bool block5_schedule_valid(const fixed_exec_desc_t& desc,
 }
 
 static error_code_t execute_issue(const npu_issue_t& issue,
-                                  axi_vec_t* gmem_frame_out) {
+                                  axi_vec_t* gmem_frame_out,
+                                  volatile u8_t& prof_stage_id) {
 #pragma HLS INLINE off
   switch (issue.engine.to_uint()) {
     case static_cast<unsigned>(NPU_ENGINE_CONV):
-      return conv_engine_exec(issue, gmem_frame_out);
+      return conv_engine_exec(issue, gmem_frame_out, prof_stage_id);
     case static_cast<unsigned>(NPU_ENGINE_VEC):
-      return vec_alu_engine_exec(issue, gmem_frame_out);
+      npu_profile_set_stage(prof_stage_id, PROF_STAGE_VEC_FIXED);
+      return vec_alu_engine_exec(issue, gmem_frame_out, prof_stage_id);
     case static_cast<unsigned>(NPU_ENGINE_POOL):
-      return pool_engine_exec(issue);
-    case static_cast<unsigned>(NPU_ENGINE_UPSAMPLE):
-      return upsample_engine_exec(issue, gmem_frame_out);
+      npu_profile_set_stage(prof_stage_id, PROF_STAGE_AVGPOOL);
+      return pool_engine_exec(issue, prof_stage_id);
     case static_cast<unsigned>(NPU_ENGINE_NONE):
       return ERR_NONE;
     default:
@@ -245,7 +246,6 @@ static error_code_t build_block5_issue_step(ctrl_runtime_t& ctx,
 }
 
 static error_code_t prepare_new_entry(ctrl_runtime_t& ctx,
-                                      const profile_ctrl_t& profile_ctrl,
                                       npu_issue_t& issue,
                                       bool& issue_valid,
                                       bool& entry_complete) {
@@ -260,16 +260,6 @@ static error_code_t prepare_new_entry(ctrl_runtime_t& ctx,
     return ERR_UOP_DECODE;
   }
 
-  const int pc_i = static_cast<int>(ctx.pc.to_uint());
-  if (profile_ctrl.stop_before && main_ctrl_profile_stop_matches(profile_ctrl, pc_i)) {
-    main_ctrl_set_csim_last_error(ERR_NONE);
-    entry_complete = false;
-    ctx.entry_active = false;
-    ctx.stop_requested = true;
-    return ERR_NONE;
-  }
-
-  main_ctrl_record_exec_fetch();
   const unsigned logical_uop = entry.logical_uop_id.to_uint();
   main_ctrl_set_csim_last_uop(logical_uop);
   if (main_ctrl_csim_stop_before_logical_uop(logical_uop)) {
@@ -288,7 +278,6 @@ static error_code_t prepare_new_entry(ctrl_runtime_t& ctx,
     return ERR_NONE;
   }
 
-  main_ctrl_profile_record_exec_entry(kind);
   if (!main_ctrl_csim_dump_tensor_set_pre(logical_uop)) {
     main_ctrl_set_csim_last_error(ERR_BANK_OVERFLOW);
     return ERR_BANK_OVERFLOW;
@@ -331,20 +320,11 @@ static error_code_t prepare_new_entry(ctrl_runtime_t& ctx,
   return ERR_NONE;
 }
 
-static error_code_t complete_entry(ctrl_runtime_t& ctx,
-                                   const profile_ctrl_t& profile_ctrl) {
+static error_code_t complete_entry(ctrl_runtime_t& ctx) {
 #pragma HLS INLINE off
   if (!main_ctrl_csim_dump_tensor_set_post(ctx.logical_uop)) {
     main_ctrl_set_csim_last_error(ERR_BANK_OVERFLOW);
     return ERR_BANK_OVERFLOW;
-  }
-
-  const int pc_i = static_cast<int>(ctx.pc.to_uint());
-  if (!profile_ctrl.stop_before && main_ctrl_profile_stop_matches(profile_ctrl, pc_i)) {
-    main_ctrl_set_csim_last_error(ERR_NONE);
-    ctx.entry_active = false;
-    ctx.stop_requested = true;
-    return ERR_NONE;
   }
 
   ctx.entry_active = false;
@@ -354,7 +334,9 @@ static error_code_t complete_entry(ctrl_runtime_t& ctx,
 }
 
 error_code_t main_ctrl_run(axi_vec_t* gmem_frame_out,
-                           const profile_ctrl_t& profile_ctrl) {
+                           volatile u8_t& prof_stage_id,
+                           volatile u8_t& prof_pc,
+                           volatile u8_t& prof_issue_kind) {
 #pragma HLS INLINE off
   ctrl_runtime_t ctx;
   init_ctrl_runtime(ctx);
@@ -375,7 +357,7 @@ error_code_t main_ctrl_run(axi_vec_t* gmem_frame_out,
     }
 
     if (!ctx.entry_active) {
-      err = prepare_new_entry(ctx, profile_ctrl, issue, issue_valid, entry_complete);
+      err = prepare_new_entry(ctx, issue, issue_valid, entry_complete);
     } else if (ctx.block5_active) {
       err = build_block5_issue_step(ctx, issue, issue_valid, entry_complete);
     } else {
@@ -397,15 +379,19 @@ error_code_t main_ctrl_run(axi_vec_t* gmem_frame_out,
 
     // Single-tail dispatch: this must be the only non-definition call site of execute_issue().
     if (issue_valid) {
-      err = execute_issue(issue, gmem_frame_out);
+      prof_pc = ctx.pc;
+      prof_issue_kind = issue.kind;
+      npu_profile_set_stage(prof_stage_id, PROF_STAGE_MAIN_CTRL);
+      err = execute_issue(issue, gmem_frame_out, prof_stage_id);
       if (err != ERR_NONE) {
         main_ctrl_set_csim_last_error(err);
+        npu_profile_set_stage(prof_stage_id, PROF_STAGE_ERROR);
         return err;
       }
     }
 
     if (entry_complete) {
-      err = complete_entry(ctx, profile_ctrl);
+      err = complete_entry(ctx);
       if (err != ERR_NONE) {
         return err;
       }

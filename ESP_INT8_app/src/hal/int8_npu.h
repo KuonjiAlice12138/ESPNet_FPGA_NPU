@@ -43,16 +43,15 @@ int int8_npu_run_init(Int8NpuContext *ctx, UINTPTR param_addr, u32 uop_count,
 int int8_npu_run_infer(Int8NpuContext *ctx, UINTPTR input_addr,
                        UINTPTR output_addr, UINTPTR param_addr, u32 uop_count,
                        u32 timeout_polls);
-int int8_npu_run_debug(Int8NpuContext *ctx, UINTPTR input_addr,
-                       UINTPTR output_addr, UINTPTR param_addr, u32 uop_count,
-                       u32 stop_after_uop, u32 dump_tensor_id,
-                       u32 dump_words, u32 timeout_polls, const char *tag);
-int int8_npu_run_profile_prefix(Int8NpuContext *ctx, UINTPTR input_addr,
-                                UINTPTR output_addr, UINTPTR param_addr,
-                                u32 uop_count, u32 stop_after_pc,
-                                u32 timeout_polls, const char *tag);
 void int8_npu_dump_regs(const Int8NpuContext *ctx, const char *tag);
-void int8_npu_dump_profile_regs(const Int8NpuContext *ctx, const char *tag);
 u32 int8_npu_read_ap_ctrl(const Int8NpuContext *ctx);
+
+void stage_counter_clear(void);
+void stage_counter_enable(unsigned enable);
+void stage_counter_freeze(unsigned freeze);
+u64 stage_counter_read_total(void);
+u64 stage_counter_read_active(void);
+u64 stage_counter_read_stage(unsigned stage);
+void stage_counter_dump_csv(void);
 
 #endif
