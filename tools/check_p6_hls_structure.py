@@ -191,7 +191,7 @@ def check_mainctrl_structure(core: str, main_ctrl: str, ctrl: str, vec_alu: str,
     for token in (
         "scheduled_window_generator_row",
         "systolic_array_core_row",
-        "post_process_row_to_buffer",
+        "post_process_conv_iteration",
         "store_conv_output_row",
         "conv_store_write_conv_row",
     ):
@@ -279,6 +279,16 @@ def check_mainctrl_structure(core: str, main_ctrl: str, ctrl: str, vec_alu: str,
             return fail(
                 f"{name} must appear only as prototype + definition + execute_issue call, got {actual}"
             )
+
+    sa_calls = call_site_lines(conv_engine, "systolic_array_core_row")
+    if len(sa_calls) != 1:
+        return fail(f"Round3 requires one SA call site in conv_engine.cpp, got {sa_calls}")
+    win_calls = call_site_lines(conv_engine, "scheduled_window_generator_row")
+    if len(win_calls) != 1:
+        return fail(
+            "Round3 requires one full-row WinGen call site, "
+            f"got {win_calls}"
+        )
 
     ctrl_body = function_body(main_ctrl, "main_ctrl_run")
     if not ctrl_body:
@@ -431,7 +441,9 @@ def check_executor_gateways(
         "conv_engine_exec",
         "run_conv_issue_once",
         "run_conv_rows_task",
-        "shared_conv_row_engine",
+        "run_segment_overlap_row",
+        "overlap_compute_and_consume_segment",
+        "compute_conv_datapath_owner",
         "build_normal_conv_task",
         "build_block5_branch_task",
         "load_conv_weight_buffer",
@@ -448,6 +460,9 @@ def check_executor_gateways(
         "run_conv_issue_once",
         "run_conv_rows_task",
         "shared_conv_row_engine",
+        "generate_conv_window_row",
+        "consume_compact_conv_row",
+        "replay_conv_row_to_stream",
         "build_normal_conv_task",
         "build_block5_branch_task",
         "load_conv_weight_buffer",
@@ -478,29 +493,86 @@ def check_executor_gateways(
     if conv_task_body is None:
         return fail("run_conv_rows_task body not found")
     if count_call_sites(conv_task_body, "shared_conv_row_engine") != 1:
-        return fail("run_conv_rows_task must be the only caller of shared_conv_row_engine")
-    if count_call_sites(conv_engine, "shared_conv_row_engine") != 2:
-        return fail("shared_conv_row_engine should appear only as definition plus run_conv_rows_task call")
+        return fail("Round0722 baseline must have one whole-row Conv call site")
+    if count_call_sites(conv_task_body, "consume_compact_conv_row") != 1:
+        return fail("Round0722 baseline must have one compact PPU call site per row")
 
-    row_engine_body = function_body(conv_engine, "shared_conv_row_engine")
-    if row_engine_body is None:
-        return fail("shared_conv_row_engine body not found")
-    if count_call_sites(row_engine_body, "systolic_array_core_row") != 1:
-        return fail("shared_conv_row_engine must call systolic_array_core_row exactly once")
+    dataflow_body = function_body(conv_engine, "shared_conv_row_engine") or ""
+    if "#pragma HLS DATAFLOW" not in dataflow_body:
+        return fail("Round0722 whole-row Conv owner is not a DATAFLOW region")
+    for token in (
+        "generate_conv_window_row",
+        "systolic_array_core_row",
+        "post_process_conv_row_to_buffer",
+    ):
+        if count_call_sites(dataflow_body, token) != 1:
+            return fail(f"Round0722 whole-row Conv owner must call {token} exactly once")
+    if re.search(r"\b(if|for|while|switch)\s*\(", dataflow_body):
+        return fail("Round0722 whole-row Conv owner contains control flow")
+
+    compact_body = function_body(conv_engine, "consume_compact_conv_row") or ""
+    if "#pragma HLS DATAFLOW" not in compact_body:
+        return fail("Round0722 compact PPU owner is not a DATAFLOW region")
+    for token in ("replay_conv_row_to_stream", "ppu_consume_conv_stream"):
+        if count_call_sites(compact_body, token) != 1:
+            return fail(f"Round0722 compact PPU owner must call {token} exactly once")
+    if re.search(r"\b(if|for|while|switch)\s*\(", compact_body):
+        return fail("Round0722 compact PPU owner contains control flow")
+
+    generate_body = function_body(conv_engine, "generate_conv_window_row") or ""
+    if count_call_sites(generate_body, "scheduled_window_generator_row") != 1:
+        return fail("Round0722 WinGen gateway must call the scheduled entry exactly once")
+    for token in ("issue_begin", "issue_count", "row_begin"):
+        if token in generate_body:
+            return fail(f"Round0722 whole-row WinGen gateway retains segment token {token}")
+
+    for legacy in (
+        "overlap_compute_and_consume_segment",
+        "stage_segment_for_consumer",
+        "consume_conv_segment_task",
+        "s_segment_out_buf0",
+        "s_segment_out_buf1",
+        "s_segment_act_buf0",
+        "s_segment_act_buf1",
+        "capture_window_segment",
+        "prefetch_window_segment",
+        "produce_conv_iteration_acts",
+        "compute_consume_segment_dataflow",
+        "run_streamed_segment_row",
+        "make_segment_cfg",
+        "make_segment_sched",
+    ):
+        if legacy in conv_engine:
+            return fail(f"Round0722 legacy overlap/materialization token remains: {legacy}")
+    if "ppu_consume_conv_row" in conv_engine:
+        return fail("Round0722 must not restore the obsolete generic Conv PPU wrapper")
+    if count_call_sites(conv_engine, "ppu_consume_conv_stream") != 2:
+        return fail("Round0722 compact PPU must have one declaration and one physical call site")
+    if count_call_sites(conv_engine, "scheduled_window_generator_row") != 2:
+        return fail("Round0722 WinGen must have one declaration and one physical call site")
+    if "scheduled_window_generator_segment" in conv_engine:
+        return fail("Round0722 obsolete segment WinGen gateway remains in conv_engine.cpp")
+    if not re.search(
+        r"ppu_consume_conv_stream\s*\([^;{]*hls::stream<act_vec_t>\s*&\s*conv_stream",
+        ppu,
+        flags=re.DOTALL,
+    ):
+        return fail("Round0722 PPU must retain one stream input gateway")
     for token in ("sa_cfg_stream", "sa_sched_flags_stream"):
-        if token not in row_engine_body:
-            return fail(f"Round 3 DATAFLOW control stream missing from shared_conv_row_engine: {token}")
-    if "sched.flags" in row_engine_body:
-        return fail("Round 3 DATAFLOW stages must not read sched.flags directly from the caller")
+        if token not in dataflow_body:
+            return fail(f"Round0722 DATAFLOW control stream missing from Conv datapath owner: {token}")
 
-    post_body = function_body(conv_engine, "post_process_row_to_buffer")
+    post_body = function_body(conv_engine, "post_process_conv_row_to_buffer")
     if post_body is None:
-        return fail("post_process_row_to_buffer body not found")
+        return fail("post_process_conv_row_to_buffer body not found")
     if "set_act_vec_i8_dynamic" in post_body:
-        return fail("Round 3 postprocess still performs dynamic packed-word RMW")
+        return fail("Round0722 postprocess still performs dynamic packed-word RMW")
     for token in ("POST_LANES_PER_CYCLE", "out_lanes", "POST_REQUANT_GROUPS"):
         if token not in post_body:
-            return fail(f"Round 3 shared lane postprocess structure missing: {token}")
+            return fail(f"Round0722 shared lane postprocess structure missing: {token}")
+
+    if re.search(r"static\s+[^;\n]*\bs_compact_", ppu):
+        return fail("Round0722 compact PPU still carries segment-persistent static packet state")
 
     for token in (
         "run_scheduled_conv_op",
@@ -567,10 +639,36 @@ def check_executor_gateways(
         if function_body(vec_alu, token) is not None:
             return fail(f"obsolete full-tile Vec primitive remains: {token}")
     for token in (
-        "ppu_store_compact_row_core",
+        "ppu_consume_conv_stream",
+        "ppu_transform_conv_word",
+        "ppu_write_compact_word",
         "ppu_apply_c19_affine_word",
         "ppu_apply_block_affine_word",
         "ppu_apply_block_add_affine_word",
+        "ppu_init_block5_source_cursors",
+        "ppu_read_block5_source_words",
+        "ppu_compose_block5_l2_words",
+        "ppu_compose_block5_l3_words",
+        "ppu_finalize_block5_emit_tiles",
+        "ppu_finalize_block5_static_row",
+    ):
+        if function_body(ppu, token) is None:
+            return fail(f"PPU-5 local datapath helper missing: {token}")
+    for helper in (
+        "ppu_apply_block_affine_word",
+        "ppu_apply_block_add_affine_word",
+    ):
+        helper_body = function_body(ppu, helper) or ""
+        if "#pragma HLS UNROLL factor=4" not in helper_body:
+            return fail(f"Round0717 {helper} must retain the routable factor=4 arithmetic baseline")
+        if "#pragma HLS UNROLL factor=8" in helper_body:
+            return fail(f"Round0717 {helper} still contains the rejected factor=8 sprint")
+    for token in (
+        "ppu_block5_segment_width",
+        "ppu_read_block5_scratch_segment",
+        "ppu_block5_compose_tile",
+        "ppu_finalize_block5_row",
+        "ppu_block5_rowbuf_segment_to_lanes",
         "ppu_read_compact_segment_to_lanes",
         "ppu_read_rowbuf_segment_to_lanes",
         "ppu_block5_l2_tile0_to_word",
@@ -579,20 +677,63 @@ def check_executor_gateways(
         "ppu_block5_l3_tile1_to_word",
         "ppu_block5_l3_tile2_to_word",
         "ppu_block5_l3_tile3_to_word",
-        "ppu_finalize_block5_emit_tiles",
-        "ppu_finalize_block5_static_row",
-    ):
-        if function_body(ppu, token) is None:
-            return fail(f"PPU-5 local datapath helper missing: {token}")
-    for token in (
-        "ppu_block5_segment_width",
-        "ppu_read_block5_scratch_segment",
-        "ppu_block5_compose_tile",
-        "ppu_finalize_block5_row",
-        "ppu_block5_rowbuf_segment_to_lanes",
+        "ppu_read_block5_compact_bytes",
+        "ppu_read_block5_l2_source_words",
+        "ppu_read_block5_l3_source_words",
     ):
         if function_body(ppu, token) is not None:
             return fail(f"PPU BLOCK5 runtime composer must not remain: {token}")
+    for token in (
+        "ppu_block5_compact_cursor_t",
+        "ppu_init_block5_compact_cursor",
+        "ppu_init_block5_source_cursors",
+        "ppu_read_block5_compact_cursor",
+        "ppu_read_block5_source_words",
+    ):
+        if token not in ppu:
+            return fail(f"Round0717 BLOCK5 rolling source cache missing: {token}")
+    init_cursor_body = function_body(ppu, "ppu_init_block5_compact_cursor") or ""
+    if count_call_sites(init_cursor_body, "ppu_read_abs_word") != 1:
+        return fail("Round0717 cursor init must prefetch exactly one first word")
+    if "cursor.valid = true" not in init_cursor_body:
+        return fail("Round0717 cursor init must leave the first word valid")
+    init_sources_body = function_body(ppu, "ppu_init_block5_source_cursors") or ""
+    if count_call_sites(init_sources_body, "ppu_init_block5_compact_cursor") != 4:
+        return fail("Round0717 unified source init must initialize exactly four cursors")
+    cursor_body = function_body(ppu, "ppu_read_block5_compact_cursor") or ""
+    if count_call_sites(cursor_body, "ppu_read_abs_word") != 1:
+        return fail("Round0717 hot cursor must have one physical read call site")
+    for legacy_token in ("read_count", "read_idx < 2", "need_current_word"):
+        if legacy_token in cursor_body:
+            return fail(f"Round0717 hot cursor still permits the old two-read path: {legacy_token}")
+    source_body = function_body(ppu, "ppu_read_block5_source_words") or ""
+    read_count = count_call_sites(source_body, "ppu_read_block5_compact_cursor")
+    if read_count != 4:
+        return fail(f"Round0717 unified source reader must consume exactly four cursors, got {read_count}")
+    if "local_row" in source_body or "u16_t ow" in source_body:
+        return fail("Round0717 unified source reader must use sequential cursors, not per-pixel addresses")
+    for helper in (
+        "ppu_compose_block5_l2_words",
+        "ppu_compose_block5_l3_words",
+    ):
+        helper_body = function_body(ppu, helper) or ""
+        if "i8_t lanes" in helper_body or "ppu_pack_lanes" in helper_body:
+            return fail(f"Round0717 {helper} must use fixed bit slices, not a lane array")
+        if ".range(" not in helper_body:
+            return fail(f"Round0717 {helper} is missing fixed-range tile composition")
+    block5_row_body = function_body(ppu, "ppu_finalize_block5_static_row") or ""
+    if block5_row_body.count("ppu_block5_compact_cursor_t") != 4:
+        return fail("Round0717 BLOCK5 row owner must instantiate exactly four source cursors")
+    if count_call_sites(block5_row_body, "ppu_init_block5_source_cursors") != 1:
+        return fail("Round0717 BLOCK5 row owner must have one unified cursor-init call site")
+    if count_call_sites(block5_row_body, "ppu_read_block5_source_words") != 1:
+        return fail("Round0717 BLOCK5 row owner must have one unified source-reader call site")
+    for helper in (
+        "ppu_compose_block5_l2_words",
+        "ppu_compose_block5_l3_words",
+    ):
+        if count_call_sites(block5_row_body, helper) != 1:
+            return fail(f"Round0717 BLOCK5 row owner must have one {helper} call site")
     if "vec_alu_apply_" in ppu:
         return fail("PPU-5 failed: ppu.cpp still calls or declares vec_alu_apply_*")
     fixed_affine_body = function_body(vec_alu, "run_fixed_affine_common") or ""
@@ -606,8 +747,54 @@ def check_executor_gateways(
     print(f"  vec_alu_apply_affine_block users: {len(affine_block_lines)} call sites {affine_block_lines}")
     if len(affine_block_lines) != 1:
         return fail("Round5 requires one source call site for the fixed affine datapath")
-    if "s_shared_row_contig_words[packed_word_idx] = packed_row_word" not in fixed_affine_body:
-        return fail("Round5 row-contiguous path must assemble sequential packed words")
+    for token in (
+        "vec_affine_group_buffer_t",
+        "vec_append_compact_group",
+        "vec_pack_compact_groups",
+        "FIXED_FLAG_CBLOCK_MAJOR",
+    ):
+        if token not in vec_alu:
+            return fail(f"Round0717 Vec packetizer/loop-mode structure missing: {token}")
+    if "for (int lane = 0; lane < TM; ++lane)" in fixed_affine_body:
+        return fail("Round0717 C131 path still appends one byte per cycle")
+    if "packed_lane * 8U" in fixed_affine_body:
+        return fail("Round0717 C131 path still uses a dynamic 256-bit destination range")
+    if "s_shared_row_contig_words[packed_word_idx] = packed_row_word" in fixed_affine_body:
+        return fail("Round0717 legacy byte-packed row word remains")
+    if "cblock_major" not in fixed_affine_body:
+        return fail("Round0717 fixed-affine path does not dispatch the compiled loop mode")
+    for token in (
+        "vec_alu_load_affine_resident_bank",
+        "i32_t qmul[TM][VEC_AFF_RESIDENT_BLOCKS]",
+        "const int c_blk = cblock_major ? outer : inner",
+        "const int h_i = cblock_major ? middle : row_h_i",
+        "const int w_i = cblock_major ? inner : middle",
+    ):
+        if token not in fixed_affine_body:
+            return fail(f"Round4A resident-qparam/traversal structure missing: {token}")
+    outer_loop = fixed_affine_body.find("for (int outer")
+    if outer_loop < 0:
+        return fail("Round4A fixed-affine hot loop is missing")
+    if "param_dma_get_affine_qparam" in fixed_affine_body[outer_loop:]:
+        return fail("Round4A affine qparam load remains inside the tile hot loop")
+    affine_apply = function_body(vec_alu, "vec_alu_apply_affine_block") or ""
+    affine_half = function_body(vec_alu, "vec_alu_apply_affine_half") or ""
+    if "#pragma HLS INLINE" not in affine_apply:
+        return fail("Round4A affine block must inline into its unique fixed-Vec caller")
+    if "#pragma HLS INLINE off" in affine_apply:
+        return fail("Round4A affine block retains per-tile function handshake overhead")
+    if "for (int pair = 0; pair < VEC_AFF_HALF_COUNT; ++pair)" not in affine_apply:
+        return fail("Round4A affine block is not scheduled as two 16-lane halves")
+    if "#pragma HLS PIPELINE II=1" not in affine_apply:
+        return fail("Round4A affine half loop is not pipelined at II=1")
+    if "vec_alu_apply_affine_half" not in affine_apply:
+        return fail("Round4A affine block does not use the 16-lane half primitive")
+    if "vec_affine_i8_to_i8_narrow" not in affine_half:
+        return fail("Round4A affine half still carries the generic 64-bit requant datapath")
+    if "vec_alu_apply_affine_group" in vec_alu:
+        return fail("Round4A legacy 8-lane affine group helper remains")
+    if re.search(r"valid_c[^\n]*(?:==|!=)[^\n]*(?:131|256)", fixed_affine_body):
+        return fail("Round0717 HLS hot path infers fixed loop mode from valid_c")
     if "conv_store_row_contiguous_set_byte" in vec_alu:
         return fail("Round5 row-contiguous path still uses the legacy random byte setter")
 
@@ -626,13 +813,17 @@ def check_executor_gateways(
 
     if "row_consumer_engine_consume" in conv_engine or "row_consumer_engine_consume" in ppu:
         return fail("legacy row_consumer_engine_consume remains in active PPU-1 path")
-    ppu_body = function_body(ppu, "ppu_consume_conv_row")
+    ppu_body = function_body(ppu, "ppu_consume_conv_stream")
     if ppu_body is None:
-        return fail("ppu_consume_conv_row body not found in ppu.cpp")
-    if count_call_sites(ppu, "ppu_consume_conv_row") != 1:
-        return fail("ppu_consume_conv_row must be defined once in ppu.cpp")
-    if count_call_sites(conv_engine, "ppu_consume_conv_row") != 2:
-        return fail("ppu_consume_conv_row should be declared and called only from conv_engine.cpp")
+        return fail("ppu_consume_conv_stream body not found in ppu.cpp")
+    if count_call_sites(ppu, "ppu_consume_conv_stream") != 1:
+        return fail("ppu_consume_conv_stream must have exactly one definition in ppu.cpp")
+    if count_call_sites(conv_engine, "ppu_consume_conv_stream") != 2:
+        return fail("ppu_consume_conv_stream should be declared and called only from conv_engine.cpp")
+    if count_call_sites(ppu, "ppu_consume_upsample_row") != 1:
+        return fail("ppu_consume_upsample_row must be defined once in ppu.cpp")
+    if count_call_sites(conv_engine, "ppu_consume_upsample_row") != 2:
+        return fail("ppu_consume_upsample_row should be declared and called only from conv_engine.cpp")
     banned_ppu_splits = (
         "consume_store_only",
         "consume_affine_store",
@@ -647,26 +838,26 @@ def check_executor_gateways(
             )
     for token in (
         "ppu_preadd_row",
-        "ppu_apply_row_affine",
-        "ppu_cat_other_row_to_buffer",
-        "ppu_consume_upsample_out",
-        "ppu_store_compact_layout_row",
+        "ppu_preadd_segment",
+        "ppu_consume_upsample_row",
+        "ppu_consume_conv_stream",
+        "ppu_transform_conv_word",
+        "ppu_write_compact_word",
     ):
         if function_body(ppu, token) is None:
             return fail(f"ppu.cpp missing {token}")
+    segment_body = function_body(ppu, "ppu_layout_to_compact_shape") or ""
     for token in ("STORE_LAYOUT_COMPACT_C16", "STORE_LAYOUT_COMPACT_C28"):
-        if token not in ppu_body:
+        if token not in segment_body:
             return fail(f"PPU common compact-store tail missing bounded BLOCK5 layout: {token}")
     for token in (
         "ppu_consume_block5_final_row",
         "ppu_finalize_block5_emit_tiles",
         "ppu_finalize_block5_static_row",
-        "ppu_block5_l2_tile0_to_word",
-        "ppu_block5_l2_tile1_to_word",
-        "ppu_block5_l3_tile0_to_word",
-        "ppu_block5_l3_tile1_to_word",
-        "ppu_block5_l3_tile2_to_word",
-        "ppu_block5_l3_tile3_to_word",
+        "ppu_init_block5_source_cursors",
+        "ppu_read_block5_source_words",
+        "ppu_compose_block5_l2_words",
+        "ppu_compose_block5_l3_words",
         "ppu_apply_block_affine_word",
         "ppu_apply_block_add_affine_word",
     ):
@@ -731,9 +922,9 @@ def check_executor_gateways(
         if token in store_dispatch_body:
             return fail(f"conv_store.cpp still contains compact/high-level writer token: {token}")
 
-    if "ROW_CONSUMER_UPSAMPLE_OUT" not in ppu_body:
-        return fail("PPU streaming path no longer handles ROW_CONSUMER_UPSAMPLE_OUT")
-    upsample_forward_body = function_body(ppu, "ppu_consume_upsample_out") or ""
+    if "ROW_CONSUMER_UPSAMPLE_OUT" not in conv_task_body:
+        return fail("Conv row scheduler no longer dispatches ROW_CONSUMER_UPSAMPLE_OUT")
+    upsample_forward_body = function_body(ppu, "ppu_consume_upsample_row") or ""
     if "upsample_fused_consume_logits_row" not in upsample_forward_body:
         return fail("PPU upsample row-buffer wrapper no longer calls fused fullres upsample")
     print("[MC-CHECK] AUDIT: PPU conv-row streaming preserved: yes")
@@ -775,12 +966,12 @@ def check_p7_bans(sources: dict[str, str]) -> int:
         (param_dma, "param_dma_get_exec_entry", "missing exec-plan getter"),
         (param_dma, "param_dma_get_row_consumer", "missing row-consumer getter"),
         (param_dma, "param_dma_get_block5_sched", "missing BLOCK5 schedule getter"),
-        (win_gen, "scheduled_window_generator_row", "missing scheduled WinGen entry"),
+        (win_gen, "scheduled_window_generator_row", "missing scheduled full-row WinGen entry"),
         (win_gen, "WIN_MODE_3X3_STAGED_C131", "missing staged C131 WinGen coverage"),
         (ppu, "STORE_LAYOUT_", "PPU does not use scheduled store layout"),
         (core, "param_dma_is_schedule_blob", "top path does not require schedule blob"),
-        (conv_engine, "shared_conv_row_engine", "missing shared conv row engine"),
-        (ppu, "ppu_apply_row_affine", "missing PPU row affine engine"),
+        (conv_engine, "shared_conv_row_engine", "missing shared whole-row Conv datapath owner"),
+        (ppu, "ppu_transform_conv_word", "missing compact PPU word transform"),
         (vec_alu, "vec_alu_apply_affine_block", "missing active affine-block Vec primitive"),
     )
     for haystack, token, msg in required_tokens:
@@ -829,6 +1020,7 @@ def check_p7_bans(sources: dict[str, str]) -> int:
         "run_conv_task_sequence",
         "ESP_INT8_ENABLE_COLD_RMW_FALLBACK",
         "write_tensor_slice_narrow_checked",
+        "scheduled_window_generator_segment",
     )
     for token in banned_tokens:
         if token in combined_hot:
@@ -858,7 +1050,7 @@ def check_p7_bans(sources: dict[str, str]) -> int:
 
     win_body = function_body(win_gen, "scheduled_window_generator_row")
     if win_body is None:
-        return fail("scheduled_window_generator_row body not found")
+        return fail("scheduled full-row WinGen entry is missing")
     if "sched.mode" not in win_body:
         return fail("scheduled_window_generator_row must dispatch by PARAM schedule mode")
     for pattern in (r"cfg\.in_c\s*==", r"conv_desc\.in_c\s*==", r"cfg\.kernel\s*==", r"conv_desc\.kernel\s*=="):
@@ -935,9 +1127,11 @@ def check_csynth_hierarchy(report_root: Path) -> int:
         "run_conv_issue_once",
         "run_conv_rows_task",
         "shared_conv_row_engine",
+        "consume_compact_conv_row",
         "scheduled_window_generator_row",
         "systolic_array_core_row",
-        "post_process_row_to_buffer",
+        "ppu_consume_conv_stream",
+        "post_process_conv_row_to_buffer",
         "store_conv_output_row",
         "shared_add_affine_vec_stage",
         "shared_affine_vec_engine",
@@ -952,7 +1146,7 @@ def check_csynth_hierarchy(report_root: Path) -> int:
         "vec_alu_apply_",
         "ppu_write_compact_word",
         "shared_conv_row_engine",
-        "ppu_consume_conv_row",
+        "ppu_consume_conv_stream",
         "systolic_array_core_row",
     )
     for line in text.splitlines():
@@ -967,102 +1161,324 @@ def check_round2_wingen_structure(win_gen: str, exporter: str) -> int:
         "select_replacement_slot",
         "update_3x3_column_cache",
         "WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS",
+        "scheduled_narrow_3x3_window_row",
+        "scheduled_wide_3x3_window_row",
+        "prepare_narrow_issue_windows",
+        "update_wide_direct_cache",
+        "load_narrow_cache_column",
+        "load_wide_cache_column",
+        "s_narrow_col_tag",
+        "s_wide_col_tag",
     )
     for token in banned:
         if token in win_gen:
-            return fail(f"Round2 WinGen legacy associative/unified cache remains: {token}")
+            return fail(f"Round2 WinGen legacy path remains: {token}")
     required = (
-        "scheduled_narrow_3x3_window_row",
-        "scheduled_wide_3x3_window_row",
-        "update_narrow_direct_cache",
-        "update_wide_direct_cache",
-        "stage_narrow_3x3_window",
+        "configure_window_row",
+        "window_row_loader",
+        "window_row_assembler",
+        "scheduled_3x3_window_row_pipeline",
+        "window_column_meta_t",
+        "window_load_word_t",
         "narrow_3x3_window_t",
-        "s_narrow_cache_row0",
-        "s_narrow_cache_row1",
-        "s_narrow_cache_row2",
+        "s_narrow_row_bank0",
+        "s_narrow_row_bank1",
+        "s_narrow_row_bank2",
+        "window_row_loader_narrow_reuse",
+        "window_row_assembler_read_narrow_window",
     )
     for token in required:
         if token not in win_gen:
             return fail(f"Round2 WinGen structure missing: {token}")
-    narrow_body = function_body(win_gen, "scheduled_narrow_3x3_window_row")
-    if "ARRAY_PARTITION variable=cache.data" in narrow_body:
-        return fail("narrow WinGen cache is still completely partitioned instead of BRAM-backed")
+
+    loader_body = function_body(win_gen, "window_row_loader") or ""
+    load_column_body = function_body(win_gen, "window_loader_emit_column") or ""
+    assembler_body = function_body(win_gen, "window_row_assembler") or ""
+    store_body = function_body(win_gen, "window_assembler_store_wide_word") or ""
+    pipeline_body = function_body(win_gen, "scheduled_3x3_window_row_pipeline") or ""
+    if "window_loader_emit_column" not in loader_body:
+        return fail("Round2 loader does not own the compiled column-read sequence")
+    if "read_packed_tile_from_row_cached" not in load_column_body:
+        return fail("Round2 loader bypasses the bounded packed-word reader")
+    if "s_wide_cache" in loader_body or "s_wide_cache" in load_column_body:
+        return fail("Round4B loader illegally accesses assembler-owned wide cache")
+    if "window_assembler_store_wide_word" not in assembler_body:
+        return fail("Round4B assembler does not own wide-cache updates")
+    if "s_wide_cache" not in store_body:
+        return fail("Round4B wide-cache store gateway is missing")
+    if "s_narrow_row_bank" in assembler_body or "s_narrow_row_bank" in store_body:
+        return fail("Round4B narrow row bank has more than one DATAFLOW owner")
+    if "on_chip_memory_read" in assembler_body or "on_chip_memory_read" in store_body:
+        return fail("Round2 assembler performs an illegal FMBUF read")
+    for token in (
+        "#pragma HLS DATAFLOW",
+        "#pragma HLS STREAM variable=column_meta_stream depth=16",
+        "#pragma HLS STREAM variable=load_word_stream depth=16",
+        "configure_window_row",
+        "window_row_loader",
+        "window_row_assembler",
+    ):
+        if token not in pipeline_body:
+            return fail(f"Round2 bounded DATAFLOW region missing: {token}")
+
     emit_body = function_body(win_gen, "emit_narrow_words_for_mode")
     if "s_narrow_cache_row" in emit_body:
         return fail("narrow packer still reads the BRAM cache directly instead of the 9-word snapshot")
     if "4 * dilation" not in exporter:
         return fail("exporter does not compile dilation-aware cache_col_slots")
+    for token in (
+        "compile_window_loader_contract",
+        "compile_window_row_reuse_word",
+        "loader_warmup_mask",
+        "loader_steady_mask",
+    ):
+        if token not in exporter:
+            return fail(f"exporter is missing the Round2 loader contract: {token}")
+    if "ARRAY_PARTITION variable=s_wide_cache.data complete dim=3" not in win_gen:
+        return fail("C131 wide cache is not banked by channel chunk")
+    return 0
+
+
+def check_round0727_supply_structure(
+    win_gen: str,
+    memory: str,
+    conv_engine: str,
+) -> int:
+    """Gate the bounded reader and Round4B single-owner narrow row reuse."""
+    pipeline_body = (
+        function_body(win_gen, "scheduled_3x3_window_row_pipeline") or ""
+    )
+    for token in (
+        "packed_word_cursor_t",
+        "s_packed_word_cursor",
+        "reset_packed_word_cursors",
+        "read_packed_tile_from_row_cached",
+        "s_narrow_row_bank0",
+        "s_narrow_row_bank1",
+        "s_narrow_row_bank2",
+        "narrow_reuse_prepare_rows",
+        "read_packed_tile_from_reuse_row",
+        "window_row_loader_narrow_reuse",
+        "window_loader_emit_narrow_reuse_window",
+        "window_row_assembler_read_narrow_window",
+    ):
+        if token not in win_gen:
+            return fail(f"Round0727/Round4B supply structure missing: {token}")
+
+    for legacy in (
+        "on_chip_memory_read_packed_tile_from_row",
+        "update_narrow_direct_cache",
+        "stage_narrow_3x3_window_select",
+        "s_narrow_cache_row",
+        "window_loader_emit_narrow_run",
+        "window_loader_emit_narrow_run_row",
+    ):
+        if legacy in win_gen or legacy in memory:
+            return fail(f"Round0727/Round4B obsolete helper remains: {legacy}")
+    if re.search(r"\bstage_narrow_3x3_window\s*\(", win_gen):
+        return fail("Round0727 obsolete single-window stager remains")
+    if "stage_narrow_3x3_window_pair" in win_gen:
+        return fail("Round0727 dual-read paired stager would replicate narrow cache BRAM")
+
+    narrow_loader = (
+        function_body(win_gen, "window_row_loader_narrow_paired") or ""
+    )
+    reuse_loader = (
+        function_body(win_gen, "window_row_loader_narrow_reuse") or ""
+    )
+    narrow_update = (
+        function_body(win_gen, "window_loader_update_narrow_run") or ""
+    )
+    narrow_emit = (
+        function_body(win_gen, "window_loader_emit_narrow_cached_window") or ""
+    )
+    reuse_prepare = function_body(win_gen, "narrow_reuse_prepare_rows") or ""
+    reuse_load = (
+        function_body(win_gen, "narrow_reuse_load_source_row") or ""
+    )
+    reuse_read = (
+        function_body(win_gen, "read_packed_tile_from_reuse_row") or ""
+    )
+    bank_read = function_body(win_gen, "narrow_row_bank_read") or ""
+    bank_lane_read = (
+        function_body(win_gen, "narrow_row_bank_lane_read") or ""
+    )
+    reuse_emit = (
+        function_body(win_gen, "window_loader_emit_narrow_reuse_window") or ""
+    )
+    assembler = function_body(win_gen, "window_row_assembler") or ""
+    if not all(
+        (
+            narrow_loader,
+            reuse_loader,
+            narrow_update,
+            narrow_emit,
+            reuse_prepare,
+            reuse_load,
+            reuse_read,
+            bank_read,
+            bank_lane_read,
+            reuse_emit,
+            assembler,
+        )
+    ):
+        return fail("Round0727/Round4B narrow loader hierarchy is incomplete")
+
+    for forbidden in (
+        "window_loader_emit_column",
+        "MAX_3X3_CACHE_CHUNKS",
+        "column_meta_stream",
+    ):
+        if forbidden in narrow_loader or forbidden in reuse_loader:
+            return fail(f"Round0727/Round4B narrow loader retains generic logic: {forbidden}")
+    if "window_loader_update_narrow_run" not in narrow_loader:
+        return fail("Round0727 narrow loader does not update its compact horizontal ring")
+    if "window_loader_emit_narrow_cached_window" not in narrow_loader:
+        return fail("Round0727 narrow loader does not emit from its compact horizontal ring")
+    if "narrow_reuse_prepare_rows" not in reuse_loader:
+        return fail("Round4B reuse loader does not prepare the compiled three-row window")
+    if "window_loader_emit_narrow_reuse_window" not in reuse_loader:
+        return fail("Round4B reuse loader does not emit from the packed-row cache")
+    if "read_packed_tile_from_reuse_row" not in reuse_emit:
+        return fail("Round4B reuse emitter bypasses the packed-row cache reader")
+    if "narrow_row_bank_lane_read" not in reuse_read:
+        return fail("Round4B packed-row reader bypasses the striped row-bank gateway")
+    for token in (
+        "s_narrow_row_bank0",
+        "s_narrow_row_bank1",
+        "s_narrow_row_bank2",
+    ):
+        if token not in bank_lane_read:
+            return fail(f"Round4B row-bank gateway is missing: {token}")
+    if "on_chip_memory_read" in reuse_read or "read_packed_tile_from_row_cached" in reuse_read:
+        return fail("Round4B hot reuse reader still accesses global feature memory")
+    if "narrow_reuse_load_source_row" not in reuse_prepare:
+        return fail("Round4B row preparation bypasses its single preload gateway")
+    if "on_chip_memory_read_aligned_tensor_word" not in reuse_load:
+        return fail("Round4B row preload bypasses the aligned feature-memory gateway")
+    if "s_narrow_row_bank" in assembler:
+        return fail("Round4B assembler illegally shares ownership of the narrow row banks")
+
+    cached_read = function_body(win_gen, "read_packed_tile_from_row_cached") or ""
+    aligned_cache = function_body(win_gen, "read_aligned_word_cached") or ""
+    if "read_aligned_word_cached" not in cached_read:
+        return fail("Round0727 packed reader bypasses the bounded aligned-word cache")
+    if "on_chip_memory_read_aligned_tensor_word" not in aligned_cache:
+        return fail("Round0727 aligned-word cache bypasses the single memory owner")
+    loader_body = function_body(win_gen, "window_loader_emit_column") or ""
+    if "on_chip_memory_read_packed_tile_from_row" in loader_body:
+        return fail("Round0727 loader still performs uncached packed-tile reads")
+    if "read_packed_tile_from_row_cached" not in loader_body:
+        return fail("Round0727 loader does not use the bounded packed-word cursor")
+
+    top_loader = function_body(win_gen, "window_row_loader") or ""
+    for token in (
+        "window_row_loader_narrow_reuse",
+        "window_row_loader_narrow_paired",
+        "window_row_loader_narrow_unpaired",
+        "BIND_STORAGE variable=s_narrow_row_bank0",
+        "BIND_STORAGE variable=s_narrow_row_bank1",
+        "BIND_STORAGE variable=s_narrow_row_bank2",
+    ):
+        if token not in top_loader:
+            return fail(f"Round4B single narrow-bank owner is missing: {token}")
+
+    for bank in (
+        "s_narrow_row_bank0",
+        "s_narrow_row_bank1",
+        "s_narrow_row_bank2",
+    ):
+        if not re.search(
+            rf"static\s+u64_t\s+{bank}\s*"
+            r"\[\s*WINGEN_NARROW_WORD_LANES\s*\]",
+            win_gen,
+        ):
+            return fail(
+                f"Round4B {bank} is not split into 64-bit physical stripes"
+            )
+        if (
+            f"ARRAY_PARTITION variable={bank} complete dim=1"
+            not in top_loader
+        ):
+            return fail(f"Round4B {bank} stripe dimension is not partitioned")
+        if (
+            f"BIND_STORAGE variable={bank} type=ram_1p impl=bram"
+            not in top_loader
+        ):
+            return fail(f"Round4B {bank} is not bound to single-port BRAM")
+        if (
+            f"BIND_STORAGE variable={bank} type=ram_2p"
+            in top_loader
+        ):
+            return fail(f"Round4B {bank} still uses the BRAM-expensive dual-port binding")
+    if "#pragma HLS STREAM variable=assembler_cfg_stream depth=3" not in pipeline_body:
+        return fail("Round4B assembler config FIFO must satisfy the HLS depth=3 guidance")
+    if (
+        "#pragma HLS BIND_STORAGE variable=assembler_cfg_stream "
+        "type=fifo impl=lutram"
+        not in pipeline_body
+    ):
+        return fail("Round4B depth=3 assembler config FIFO must be forced to LUTRAM")
+
+    if function_body(memory, "on_chip_memory_read_aligned_tensor_word") is None:
+        return fail("Round0727 memory.cpp is missing the aligned tensor-word gateway")
+
+    post_body = function_body(conv_engine, "post_process_conv_row_to_buffer") or ""
+    if not re.search(r"POST_LANES_PER_CYCLE\s*=\s*8\s*;", post_body):
+        return fail("Round0727 postprocess is not fixed at 8 lanes/cycle")
     return 0
 
 
 def check_round4a_ppu_structure(ppu: str, conv_engine: str) -> int:
-    """Gate the Round4A-R single-owner PPU add and compact-store structure."""
-    required = (
-        "ppu_preadd_row",
+    """Gate the fixed-rate postprocess-to-PPU stream consumer."""
+    stream_consumer = function_body(ppu, "ppu_consume_conv_stream") or ""
+    transform = function_body(ppu, "ppu_transform_conv_word") or ""
+    writer = function_body(ppu, "ppu_write_compact_word") or ""
+    if not stream_consumer or not transform or not writer:
+        return fail("Round3 streamed compact consumer structure is incomplete")
+    for legacy in (
+        "ppu_consume_conv_segment",
+        "ppu_consume_compact_segment_readonly",
+        "ppu_cat_other_row_to_buffer",
+        "ppu_apply_row_affine",
         "ppu_pack_compact_group",
         "ppu_store_compact_row_core",
-    )
-    for token in required:
-        if function_body(ppu, token) is None:
-            return fail(f"Round4A-R PPU single-owner structure missing: {token}")
+        "ppu_store_compact_layout_segment",
+    ):
+        if function_body(ppu, legacy) is not None:
+            return fail(f"legacy multi-pass compact consumer remains: {legacy}")
+    for token in ("ppu_apply_add_word", "ppu_cat_tail_word", "ppu_apply_c19_affine_word"):
+        if token not in transform:
+            return fail(f"single-pass segment transform missing {token}")
+    for token in ("carry_bytes", "packed_groups", "ppu_transform_conv_word"):
+        if token not in stream_consumer:
+            return fail(f"single-pass compact packetizer missing {token}")
+    for token in ("conv_stream.read()", "status ="):
+        if token not in stream_consumer:
+            return fail(f"fixed-rate streamed PPU contract missing {token}")
+    if "return false" in stream_consumer or "return true" in stream_consumer:
+        return fail("streamed PPU may not return before draining its fixed-rate input")
+    for dynamic_shift in ("byte_base * 8U", "carry_bytes.to_uint() * 8U"):
+        if dynamic_shift in stream_consumer:
+            return fail(f"compact packetizer retains timing-critical dynamic shift: {dynamic_shift}")
+    if "on_chip_memory_write_pool2_abs_word" not in writer or "on_chip_memory_write_fmbuf_abs_word" not in writer:
+        return fail("compact writer does not own both physical destination gateways")
+    dataflow = function_body(conv_engine, "consume_compact_conv_row") or ""
+    if count_call_sites(dataflow, "ppu_consume_conv_stream") != 1:
+        return fail("compact PPU DATAFLOW must have one streamed PPU call site")
 
-    if count_call_sites(ppu, "ppu_preadd_row") != 1:
-        return fail("Round4A-R pre-add gateway must have one definition in ppu.cpp")
-    preadd_lines = call_site_lines(conv_engine, "ppu_preadd_row")
-    if len(preadd_lines) != 1:
-        return fail(
-            "Round4A-R requires one conv_engine pre-add call site before the consumer split, "
-            f"got {preadd_lines}"
-        )
-    for consumer in ("ppu_consume_conv_row", "ppu_consume_block5_final_row"):
-        body = function_body(ppu, consumer) or ""
-        if "ppu_preadd_row" in body or "ppu_add_other_row_to_buffer" in body:
-            return fail(f"Round4A-R duplicate pre-add remains inside {consumer}")
-    if "ppu_add_other_row_to_buffer" in ppu:
-        return fail("Round4A-R legacy duplicated add helper remains in ppu.cpp")
-
-    core = function_body(ppu, "ppu_store_compact_row_core") or ""
-    packer = function_body(ppu, "ppu_pack_compact_group") or ""
-    for token in ("packed_lane", "ppu_set_act_byte", "for (int ch = 0; ch < TM; ++ch)"):
-        if token in core:
-            return fail(f"Round4A PPU still uses bytewise compact-row assembly: {token}")
-    if "ppu_pack_compact_word" in ppu:
-        return fail("Round4A-R template compact-word packer remains")
-    if count_call_sites(core, "ppu_pack_compact_group") != 1:
-        return fail("Round4A-R compact-store core must use one group packer call site")
-    if "#pragma HLS UNROLL factor=4" not in packer:
-        return fail("Round4A compact-word packer must process four lanes per cycle")
-    if "packed_groups" in packer:
-        return fail("Round4A packer must not dynamically write a partitioned group array")
-    if "out_word >> 32" not in core:
-        return fail("Round4A packer must use fixed-width sequential word assembly")
-    if function_body(ppu, "ppu_write_compact_word") is not None:
-        return fail("Round4A-R 256-bit word must not cross a separate compact writer module")
-    if "on_chip_memory_write_pool2_abs_word" not in core or "on_chip_memory_write_fmbuf_abs_word" not in core:
-        return fail("Round4A-R compact-store owner must perform the final physical word write")
-    for token in (" / phys", "% phys"):
-        if token in core or token in packer:
-            return fail(f"Round4A-R compact hot loop contains runtime divide/modulo: {token}")
-    if count_call_sites(ppu, "ppu_store_compact_row_core") != 2:
-        return fail("Round4A requires one definition and one call site for the compact-store core")
-    if count_call_sites(ppu, "ppu_store_compact_layout_row") != 2:
-        return fail("Round4A requires one definition and one common compact-store tail call site")
     pool_read = function_body(ppu, "ppu_read_abs_word") or ""
-    compact_read = function_body(ppu, "ppu_read_block5_compact_bytes") or ""
+    compact_read = function_body(ppu, "ppu_read_block5_compact_cursor") or ""
     if not pool_read or not compact_read:
-        return fail("Round4A-R unique PPU absolute-read gateway is missing")
+        return fail("Round0717 rolling BLOCK5 absolute-read gateway is missing")
     if count_call_sites(compact_read, "ppu_read_abs_word") != 1:
-        return fail("Round4A-R compact reader must have one absolute-read call site")
+        return fail("Round0717 rolling compact reader must have one absolute-read call site")
     if "ppu_block5_read_abs_word" in ppu:
         return fail("Round4A-R legacy BLOCK5 absolute-read wrapper remains")
     for legacy_wrapper in ("ppu_store_compact_row", "ppu_store_block5_scratch_row"):
         if function_body(ppu, legacy_wrapper) is not None:
             return fail(f"Round4A duplicate compact-store wrapper remains: {legacy_wrapper}")
-    for qparam_owner in (
-        "ppu_apply_row_affine",
-        "ppu_finalize_block5_static_row",
-    ):
+    for qparam_owner in ("ppu_finalize_block5_static_row",):
         body = function_body(ppu, qparam_owner) or ""
         loop_pos = body.find("for (int ow_i")
         if loop_pos < 0:
@@ -1144,6 +1560,12 @@ def main() -> int:
     ) != 0:
         return 1
     if check_round2_wingen_structure(sources["win_gen"], read(ROOT / "tools" / "export_int8_hw_blob.py")) != 0:
+        return 1
+    if check_round0727_supply_structure(
+        sources["win_gen"],
+        sources["memory"],
+        sources["conv_engine"],
+    ) != 0:
         return 1
     if check_round4a_ppu_structure(sources["ppu"], sources["conv_engine"]) != 0:
         return 1

@@ -32,6 +32,32 @@ enum window_sched_flags_t : std::uint8_t {
   WINDOW_SCHED_FLAG_ODD_TAIL = 1 << 1,
 };
 
+enum window_loader_class_t : std::uint8_t {
+  WIN_LOADER_DIRECT_1X1 = 0,
+  WIN_LOADER_3X3_NARROW = 1,
+  WIN_LOADER_3X3_WIDE = 2,
+};
+
+constexpr int WINDOW_LOADER_RUN_MAX = 3;
+constexpr int WINDOW_LOADER_WARMUP_COUNT_WORD = 0;
+constexpr int WINDOW_LOADER_WARMUP_RUN_WORD = 1;
+constexpr int WINDOW_LOADER_STEADY_COUNT_WORD = 4;
+constexpr int WINDOW_LOADER_STEADY_RUN_WORD = 5;
+constexpr int WINDOW_LOADER_PHASE_SPLIT_WORD = 8;
+constexpr int WINDOW_LOADER_ROW_REUSE_WORD = 9;
+constexpr int WINDOW_LOADER_RESERVED_WORDS = 10;
+
+enum window_row_reuse_mode_t : std::uint8_t {
+  WINDOW_ROW_REUSE_NONE = 0,
+  WINDOW_ROW_REUSE_STRIDE1_KEEP2 = 1,
+  WINDOW_ROW_REUSE_STRIDE2_KEEP1 = 2,
+};
+
+constexpr unsigned WINDOW_ROW_REUSE_MODE_MASK = 0x3U;
+constexpr unsigned WINDOW_ROW_REUSE_WORDS_SHIFT = 2U;
+constexpr unsigned WINDOW_ROW_REUSE_WORDS_MASK = 0x7FU;
+constexpr unsigned WINDOW_ROW_REUSE_RESERVED_SHIFT = 9U;
+
 enum row_consumer_mode_t : std::uint8_t {
   ROW_CONSUMER_NONE = 0,
   ROW_CONSUMER_STORE = 1,
@@ -70,6 +96,7 @@ enum fixed_exec_flags_t : std::uint8_t {
   FIXED_FLAG_BLOCK5_AFFINE = 1 << 0,
   FIXED_FLAG_BLOCK5_ADD_AFFINE = 1 << 1,
   FIXED_FLAG_BLOCK5_ROW_GROUP = 1 << 2,
+  FIXED_FLAG_CBLOCK_MAJOR = 1 << 3,
   FIXED_FLAG_ROW_CONTIGUOUS_STORE = 1 << 7,
 };
 
@@ -110,7 +137,15 @@ struct window_sched_desc_t {
   u16_t cmd_base;
   u16_t cmd_count;
   u16_t kt_cmd_base[MAX_K_TILE_COUNT + 1];
-  u16_t reserved[14];
+  u8_t loader_class;
+  u8_t loader_request_cols;
+  u8_t loader_warmup_issues;
+  u8_t loader_warmup_new_cols;
+  u8_t loader_steady_new_cols;
+  u8_t loader_words_per_col;
+  u8_t loader_warmup_mask;
+  u8_t loader_steady_mask;
+  u16_t reserved[WINDOW_LOADER_RESERVED_WORDS];
 };
 
 struct conv_exec_desc_t {

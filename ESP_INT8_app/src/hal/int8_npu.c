@@ -145,6 +145,16 @@ u64 stage_counter_read_stage(unsigned stage)
                                 stage * STAGE_COUNTER_STAGE_STRIDE);
 }
 
+u32 stage_counter_read_current(void)
+{
+    return stage_counter_read32(STAGE_COUNTER_CURRENT_OFFSET);
+}
+
+u32 stage_counter_read_status(void)
+{
+    return stage_counter_read32(STAGE_COUNTER_STATUS_OFFSET);
+}
+
 void stage_counter_dump_csv(void)
 {
 #if INT8_STAGE_COUNTER_PRESENT
@@ -414,6 +424,16 @@ int int8_npu_read_param_header(const u8 *param_blob, u32 param_bytes,
     header->affine_qparam_offset = read_u32_le(param_blob + 76U);
     header->add_qparam_offset = read_u32_le(param_blob + 80U);
     header->pool_qparam_offset = read_u32_le(param_blob + 84U);
+    header->conv_exec_desc_offset = read_u32_le(param_blob + 88U);
+    header->window_sched_offset = read_u32_le(param_blob + 92U);
+    header->window_cmd_offset = read_u32_le(param_blob + 96U);
+    header->row_consumer_offset = read_u32_le(param_blob + 100U);
+    header->fixed_exec_offset = read_u32_le(param_blob + 104U);
+    header->exec_plan_offset = read_u32_le(param_blob + 108U);
+    header->window_sched_count = read_u32_le(param_blob + 112U);
+    header->window_cmd_count = read_u32_le(param_blob + 116U);
+    header->block5_sched_offset = read_u32_le(param_blob + 120U);
+    header->row_consumer_count = read_u32_le(param_blob + 124U);
 
     return XST_SUCCESS;
 }
@@ -421,6 +441,7 @@ int int8_npu_read_param_header(const u8 *param_blob, u32 param_bytes,
 int int8_npu_validate_param_header(const Int8ParamBlobHeader *header,
                                    u32 param_bytes)
 {
+    u32 exec_end;
     u32 uop_end;
 
     if (header == NULL) {
@@ -444,10 +465,11 @@ int int8_npu_validate_param_header(const Int8ParamBlobHeader *header,
                    header->uop_count, INT8_EXPECTED_UOP_COUNT);
         return XST_FAILURE;
     }
-    if (header->exec_plan_count == 0U ||
+    if (header->exec_plan_count != INT8_EXPECTED_EXEC_PLAN_COUNT ||
         header->exec_plan_count > INT8_MAX_EXEC_PLAN_COUNT) {
-        xil_printf("NPU: invalid exec_plan_count=%u max=%u\r\n",
-                   header->exec_plan_count, INT8_MAX_EXEC_PLAN_COUNT);
+        xil_printf("NPU: invalid exec_plan_count=%u expected=%u max=%u\r\n",
+                   header->exec_plan_count, INT8_EXPECTED_EXEC_PLAN_COUNT,
+                   INT8_MAX_EXEC_PLAN_COUNT);
         return XST_FAILURE;
     }
     if (header->uop_offset > param_bytes) {
@@ -462,12 +484,48 @@ int int8_npu_validate_param_header(const Int8ParamBlobHeader *header,
                    header->uop_offset, header->uop_count, param_bytes);
         return XST_FAILURE;
     }
+    if (header->exec_plan_offset > param_bytes) {
+        xil_printf("NPU: invalid exec_plan_offset=%u bytes=%u\r\n",
+                   header->exec_plan_offset, param_bytes);
+        return XST_FAILURE;
+    }
+    exec_end = header->exec_plan_offset +
+               header->exec_plan_count * INT8_EXEC_PLAN_ENTRY_BYTES;
+    if (exec_end < header->exec_plan_offset || exec_end > param_bytes) {
+        xil_printf("NPU: invalid exec plan range, off=%u count=%u bytes=%u\r\n",
+                   header->exec_plan_offset, header->exec_plan_count,
+                   param_bytes);
+        return XST_FAILURE;
+    }
 
     xil_printf("NPU: param ok, uops=%u exec=%u conv=%u affine=%u add=%u pool=%u\r\n",
                header->uop_count, header->exec_plan_count,
                header->conv_desc_count,
                header->affine_desc_count, header->add_desc_count,
                header->pool_desc_count);
+    return XST_SUCCESS;
+}
+
+int int8_npu_read_exec_plan_entry(const u8 *param_blob, u32 param_bytes,
+                                  const Int8ParamBlobHeader *header,
+                                  u32 index, Int8ExecPlanEntry *entry)
+{
+    u32 offset;
+
+    if (param_blob == NULL || header == NULL || entry == NULL ||
+        index >= header->exec_plan_count) {
+        return XST_FAILURE;
+    }
+    offset = header->exec_plan_offset + index * INT8_EXEC_PLAN_ENTRY_BYTES;
+    if (offset < header->exec_plan_offset ||
+        offset + INT8_EXEC_PLAN_ENTRY_BYTES > param_bytes) {
+        return XST_FAILURE;
+    }
+
+    entry->kind = param_blob[offset + 0U];
+    entry->desc_id = param_blob[offset + 1U];
+    entry->logical_uop_id = param_blob[offset + 2U];
+    entry->flags = param_blob[offset + 3U];
     return XST_SUCCESS;
 }
 

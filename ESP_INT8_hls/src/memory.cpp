@@ -255,32 +255,16 @@ bool on_chip_memory_prepare_row_base(const tensor_desc_t& desc,
     return true;
 }
 
-bool on_chip_memory_read_packed_tile_from_row(const tensor_desc_t& desc,
-                                              u32_t row_base,
-                                              bool row_valid,
-                                              i32_t w,
-                                              u16_t c_begin,
-                                              u8_t valid_c,
-                                              axi_vec_t& packed) {
+bool on_chip_memory_read_aligned_tensor_word(const tensor_desc_t& desc,
+                                             u32_t byte_offset,
+                                             axi_vec_t& packed) {
 #pragma HLS INLINE off
 #pragma HLS PIPELINE off
     packed = 0;
-    const u8_t lanes = effective_lanes(valid_c);
-    const unsigned lane_count = lanes.to_uint();
-    if (!row_valid || w < 0 || w >= static_cast<i32_t>(desc.w) || c_begin >= desc.c) {
-        return true;
+    if ((byte_offset.to_uint() & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U) {
+        return false;
     }
-    const unsigned remaining_c = static_cast<unsigned>(desc.c.to_uint() - c_begin.to_uint());
-    const unsigned read_count = (lane_count < remaining_c) ? lane_count : remaining_c;
-    if (read_count == 0U) {
-        return true;
-    }
-    const u32_t start_offset =
-        row_base + static_cast<u32_t>(w) * static_cast<u32_t>(desc_phys_c(desc)) +
-        static_cast<u32_t>(c_begin);
-    const u32_t word0_offset = start_offset & static_cast<u32_t>(~(AXI_WORD_BYTES - 1));
-    const unsigned byte0 = start_offset.to_uint() & 0x1fU;
-    return read_tile_packed_word(desc.bank_id, word0_offset, byte0, read_count, packed);
+    return read_bank_word(desc.bank_id, byte_offset, packed);
 }
 
 bool on_chip_memory_read_packed_tile(const tensor_desc_t& desc,

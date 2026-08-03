@@ -56,6 +56,18 @@ D:\ESPNet\.venv\Scripts\python.exe tools\audit_p7_precision_contract.py `
 
 导出指定 prefix tensor 的 replay 结果，便于和 CSim dump 或 golden 分层比对。
 
+`export_exec_prefix_params.py`
+
+从同一份 PARAM v4 生成板级逐 exec 归因文件 `P00.BIN` 至
+`P15.BIN`。`P00` 是零 exec 基线，`P15` 与源 `PARAM.BIN`
+bit-exact；中间文件各只把相应 pc 的 `kind` 字节改为 `EXEC_END`。
+
+```powershell
+D:\ESPNet\.venv\Scripts\python.exe tools\export_exec_prefix_params.py `
+  --param D:\ESP_INT8\hw_artifacts\sched_v4_p7_0702\PARAM.BIN `
+  --out-dir D:\ESP_INT8\hw_artifacts\sched_v4_p7_0702\exec_prefix
+```
+
 ## 精度评估
 
 `eval_hw_constrained_qat.py`

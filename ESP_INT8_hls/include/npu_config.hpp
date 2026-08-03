@@ -125,6 +125,7 @@ constexpr int MAX_PACK_CMDS_PER_KT = 9;
 constexpr int MAX_STAGED_WINDOW_PACK_CMDS = 64;
 constexpr int MAX_3X3_CACHE_CHUNKS = 5;
 constexpr int WINGEN_NARROW_CACHE_COL_SLOTS = 64;
+constexpr int WINGEN_NARROW_ROW_WORDS = 96;
 constexpr int WINGEN_WIDE_CACHE_COL_SLOTS = 4;
 
 constexpr int WINDOW_PACK_CMD_BLOB_BYTES = 8;

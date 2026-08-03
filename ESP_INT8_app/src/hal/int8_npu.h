@@ -27,7 +27,24 @@ typedef struct {
     u32 affine_qparam_offset;
     u32 add_qparam_offset;
     u32 pool_qparam_offset;
+    u32 conv_exec_desc_offset;
+    u32 window_sched_offset;
+    u32 window_cmd_offset;
+    u32 row_consumer_offset;
+    u32 fixed_exec_offset;
+    u32 exec_plan_offset;
+    u32 window_sched_count;
+    u32 window_cmd_count;
+    u32 block5_sched_offset;
+    u32 row_consumer_count;
 } Int8ParamBlobHeader;
+
+typedef struct {
+    u8 kind;
+    u8 desc_id;
+    u8 logical_uop_id;
+    u8 flags;
+} Int8ExecPlanEntry;
 
 typedef struct {
     XEspnet_encoder_int8_core ip;
@@ -38,6 +55,9 @@ int int8_npu_read_param_header(const u8 *param_blob, u32 param_bytes,
                                Int8ParamBlobHeader *header);
 int int8_npu_validate_param_header(const Int8ParamBlobHeader *header,
                                    u32 param_bytes);
+int int8_npu_read_exec_plan_entry(const u8 *param_blob, u32 param_bytes,
+                                  const Int8ParamBlobHeader *header,
+                                  u32 index, Int8ExecPlanEntry *entry);
 int int8_npu_run_init(Int8NpuContext *ctx, UINTPTR param_addr, u32 uop_count,
                       u32 timeout_polls);
 int int8_npu_run_infer(Int8NpuContext *ctx, UINTPTR input_addr,
@@ -52,6 +72,8 @@ void stage_counter_freeze(unsigned freeze);
 u64 stage_counter_read_total(void);
 u64 stage_counter_read_active(void);
 u64 stage_counter_read_stage(unsigned stage);
+u32 stage_counter_read_current(void);
+u32 stage_counter_read_status(void);
 void stage_counter_dump_csv(void);
 
 #endif

@@ -25,6 +25,7 @@ sys.path.insert(0, str(TOOL_DIR))
 import eval_val_hw_masks_fullres as eval_fullres
 import export_int8_hw_blob as blob_tools
 from audit_p7_precision_contract import detect_round_mode, inspect_qat_hook_source
+from export_exec_prefix_params import build_exec_prefix_blobs
 from export_p7_param_replay_prefix import export_prefix
 from hw_int8_math import (
     hls_activation_quant_dequant,
@@ -33,7 +34,13 @@ from hw_int8_math import (
     hls_round_away_from_zero,
     hls_round_shift_int,
 )
-from hw_param_replay import ParamBlob, _store_slice, compare_i8_arrays, replay_prefix
+from hw_param_replay import (
+    ParamBlob,
+    _store_slice,
+    compare_i8_arrays,
+    decode_window_loader_runs as replay_decode_window_loader_runs,
+    replay_prefix,
+)
 
 
 def assert_tensor_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -118,6 +125,70 @@ def test_param_parser_contract() -> None:
     assert pool1_lifetime["last_read"] < pool2_lifetime["first_write"]
 
 
+def test_exec_prefix_param_contract() -> None:
+    source = (ARTIFACT_DIR / "PARAM.BIN").read_bytes()
+    prefixes, records = build_exec_prefix_blobs(source)
+    blob = ParamBlob(ARTIFACT_DIR / "PARAM.BIN")
+    exec_offset = blob.header["exec_plan_offset"]
+    active_count = next(i for i, entry in enumerate(blob.exec_plan) if entry.kind == blob_tools.EXEC_END)
+
+    assert active_count == 15
+    assert len(prefixes) == active_count + 1
+    assert len(records) == active_count + 1
+
+    with tempfile.TemporaryDirectory() as td:
+        for prefix_count, data in enumerate(prefixes):
+            assert len(data) == len(source)
+            prefix_path = Path(td) / f"P{prefix_count:02d}.BIN"
+            prefix_path.write_bytes(data)
+            parsed = ParamBlob(prefix_path)
+            first_end = next(
+                i for i, entry in enumerate(parsed.exec_plan)
+                if entry.kind == blob_tools.EXEC_END
+            )
+            assert first_end == prefix_count
+            assert records[prefix_count]["active_exec_count"] == prefix_count
+            assert records[prefix_count]["file"] == prefix_path.name
+
+            changed = [i for i, (lhs, rhs) in enumerate(zip(source, data)) if lhs != rhs]
+            if prefix_count < active_count:
+                assert changed == [exec_offset + prefix_count * 4]
+                assert data[changed[0]] == blob_tools.EXEC_END
+            else:
+                assert changed == []
+                assert data == source
+
+
+def test_exec_prefix_app_contract() -> None:
+    config = (ROOT / "ESP_INT8_app" / "src" / "app_config.h").read_text(encoding="utf-8")
+    main_src = (ROOT / "ESP_INT8_app" / "src" / "main.c").read_text(encoding="utf-8")
+    app_yaml = (ROOT / "ESP_INT8_app" / "src" / "app.yaml").read_text(encoding="utf-8")
+    hal_header = (
+        ROOT / "ESP_INT8_app" / "src" / "hal" / "int8_npu.h"
+    ).read_text(encoding="utf-8")
+
+    assert '#define INT8_APP_ENABLE_EXEC_PREFIX_PROFILE 1U' in config
+    assert '#define INT8_APP_EXEC_PREFIX_COUNT 16U' in config
+    assert (
+        '#define INT8_APP_EXEC_PREFIX_REFERENCE_FULL_RTL_CYCLES 54200473ULL'
+        in config
+    )
+    assert (
+        '#define INT8_APP_EXEC_PREFIX_TARGET_MAX_RTL_CYCLES 50000000ULL'
+        in config
+    )
+    assert 'INT8-BOARD-20260803-P7-R4' in config
+    assert "platform_p7r4_0803" in app_yaml
+    assert "run_exec_prefix_profile" in main_src
+    assert "EXEC_PREFIX_CYCLES_BEGIN" in main_src
+    assert "PREFIX_CUM" in main_src
+    assert "PREFIX_DELTA" in main_src
+    assert "APP: prefix baseline" in main_src
+    assert "APP: prefix target" in main_src
+    assert "stage_counter_read_status" in hal_header
+    assert "stage_counter_read_current" in hal_header
+
+
 def test_prefix_replay_contract() -> None:
     blob = ParamBlob(ARTIFACT_DIR / "PARAM.BIN")
 
@@ -172,6 +243,41 @@ def test_precision_audit_contract() -> None:
     assert hook_report["conv2d_forward_patch"] is True
 
 
+def _window_request_columns(desc, issue: int) -> list[int]:
+    paired = bool(desc.flags & blob_tools.WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
+    pixel0 = issue * (2 if paired else 1)
+    columns = [
+        pixel0 * desc.stride - desc.padding + kw * desc.dilation
+        for kw in range(3)
+    ]
+    if paired and pixel0 + 1 < desc.out_w:
+        columns.extend(
+            (pixel0 + 1) * desc.stride - desc.padding + kw * desc.dilation
+            for kw in range(3)
+        )
+    return columns
+
+
+def _expected_update_deltas(desc, issue: int, update_mask: int) -> list[int]:
+    columns = _window_request_columns(desc, issue)
+    base = issue * 2 * desc.stride - desc.padding
+    return sorted(
+        {
+            column - base
+            for request, column in enumerate(columns)
+            if update_mask & (1 << request)
+        }
+    )
+
+
+def _expand_loader_runs(runs) -> list[int]:
+    return [
+        start_delta + offset
+        for start_delta, count in runs
+        for offset in range(count)
+    ]
+
+
 def test_window_schedule_contracts() -> None:
     for dilation in (1, 2, 4, 8, 16):
         for in_c in (3, 12, 19, 25):
@@ -187,6 +293,14 @@ def test_window_schedule_contracts() -> None:
             assert desc.cache_chunks == 1
             assert desc.cache_col_slots == 4 * dilation
             assert desc.k_tiles == (in_c * 9 + blob_tools.TK - 1) // blob_tools.TK
+            assert desc.loader_class == blob_tools.WIN_LOADER_3X3_NARROW
+            assert desc.loader_request_cols == 3
+            assert desc.loader_warmup_issues == dilation
+            assert desc.loader_warmup_new_cols == 3
+            assert desc.loader_steady_new_cols == 1
+            assert desc.loader_words_per_col == 3
+            assert desc.loader_warmup_mask == 0x07
+            assert desc.loader_steady_mask == 0x04
             assert len(commands) < desc.k_tiles * blob_tools.TK
             for kt in range(desc.k_tiles):
                 begin = desc.kt_cmd_base[kt]
@@ -202,9 +316,63 @@ def test_window_schedule_contracts() -> None:
         )
         assert desc.cache_chunks == (in_c + blob_tools.TK - 1) // blob_tools.TK
         assert desc.cache_col_slots == 4
+        assert desc.loader_class == blob_tools.WIN_LOADER_3X3_WIDE
+        assert desc.loader_request_cols == 3
+        assert desc.loader_warmup_issues == 1
+        assert desc.loader_warmup_new_cols == 3
+        assert desc.loader_steady_new_cols == 1
+        assert desc.loader_words_per_col == 3 * desc.cache_chunks
+        assert desc.loader_warmup_mask == 0x07
+        assert desc.loader_steady_mask == 0x04
 
     uops = blob_tools.build_uops()
     schedules, _commands, schedule_ids, _audit = blob_tools.build_window_schedule_sections(uops)
+    reuse_contracts = {
+        (
+            sched.mode,
+            sched.stride,
+            sched.dilation,
+            sched.in_c,
+            sched.out_w,
+        ): (
+            sched.reserved[blob_tools.WINDOW_LOADER_ROW_REUSE_WORD]
+            & blob_tools.WINDOW_ROW_REUSE_MODE_MASK,
+            (
+                sched.reserved[blob_tools.WINDOW_LOADER_ROW_REUSE_WORD]
+                >> blob_tools.WINDOW_ROW_REUSE_WORDS_SHIFT
+            )
+            & blob_tools.WINDOW_ROW_REUSE_WORDS_MASK,
+        )
+        for sched in schedules
+        if (
+            sched.reserved[blob_tools.WINDOW_LOADER_ROW_REUSE_WORD]
+            & blob_tools.WINDOW_ROW_REUSE_MODE_MASK
+        )
+    }
+    assert reuse_contracts == {
+        (
+            blob_tools.WIN_MODE_3X3_STAGED_C3,
+            2,
+            1,
+            3,
+            512,
+        ): (blob_tools.WINDOW_ROW_REUSE_STRIDE2_KEEP1, 96),
+        (
+            blob_tools.WIN_MODE_3X3_STAGED_C12,
+            1,
+            1,
+            12,
+            256,
+        ): (blob_tools.WINDOW_ROW_REUSE_STRIDE1_KEEP2, 96),
+    }
+    assert all(
+        (
+            sched.reserved[blob_tools.WINDOW_LOADER_ROW_REUSE_WORD]
+            >> blob_tools.WINDOW_ROW_REUSE_RESERVED_SHIFT
+        )
+        == 0
+        for sched in schedules
+    )
     for uop in uops:
         if uop.opcode == blob_tools.UOP_CONV and uop.kernel == 3:
             sched = schedules[schedule_ids[uop.param_id]]
@@ -213,6 +381,48 @@ def test_window_schedule_contracts() -> None:
             assert sched.dilation == uop.dilation
             assert sched.padding == uop.padding
             assert sched.out_w == blob_tools.conv_out_dim(uop.in_w, uop.stride)
+            assert sched.loader_class in (
+                blob_tools.WIN_LOADER_3X3_NARROW,
+                blob_tools.WIN_LOADER_3X3_WIDE,
+            )
+            assert sched.loader_request_cols in (3, 6)
+            assert sched.loader_warmup_new_cols >= sched.loader_steady_new_cols
+            assert sched.loader_words_per_col == 3 * sched.cache_chunks
+
+    first_layer = schedules[schedule_ids[0]]
+    assert first_layer.loader_request_cols == 6
+    assert first_layer.loader_warmup_issues == 1
+    assert first_layer.loader_warmup_new_cols == 5
+    assert first_layer.loader_steady_new_cols == 4
+    assert first_layer.loader_warmup_mask == 0x37
+    assert first_layer.loader_steady_mask == 0x36
+    assert blob_tools.decode_window_loader_runs(first_layer.reserved, warmup=True) == ((0, 5),)
+    assert blob_tools.decode_window_loader_runs(first_layer.reserved, warmup=False) == ((1, 4),)
+    assert blob_tools.decode_window_loader_phase_split(
+        first_layer.reserved, warmup=True
+    ) == 3
+    assert blob_tools.decode_window_loader_phase_split(
+        first_layer.reserved, warmup=False
+    ) == 2
+    assert replay_decode_window_loader_runs(first_layer.reserved, warmup=True) == ((0, 5),)
+    assert replay_decode_window_loader_runs(first_layer.reserved, warmup=False) == ((1, 4),)
+
+    packed_first_layer = blob_tools.pack_window_sched_desc(first_layer)
+    assert len(packed_first_layer) == 128
+    assert tuple(packed_first_layer[100:108]) == (
+        first_layer.loader_class,
+        first_layer.loader_request_cols,
+        first_layer.loader_warmup_issues,
+        first_layer.loader_warmup_new_cols,
+        first_layer.loader_steady_new_cols,
+        first_layer.loader_words_per_col,
+        first_layer.loader_warmup_mask,
+        first_layer.loader_steady_mask,
+    )
+    assert tuple(
+        int.from_bytes(packed_first_layer[108 + index * 2 : 110 + index * 2], "little")
+        for index in range(10)
+    ) == tuple(first_layer.reserved)
 
     paired_params = {
         uop.param_id
@@ -237,6 +447,43 @@ def test_window_schedule_contracts() -> None:
         assert paired == (uop.param_id in paired_params), (uop.param_id, uop.out_c, sched.flags)
         odd_tail = bool(sched.flags & blob_tools.WINDOW_SCHED_FLAG_ODD_TAIL)
         assert odd_tail == (paired and (sched.out_w & 1) != 0)
+        narrow_paired_3x3 = (
+            uop.kernel == 3
+            and paired
+            and sched.loader_class == blob_tools.WIN_LOADER_3X3_NARROW
+        )
+        if narrow_paired_3x3:
+            warmup_runs = blob_tools.decode_window_loader_runs(
+                sched.reserved, warmup=True
+            )
+            steady_runs = blob_tools.decode_window_loader_runs(
+                sched.reserved, warmup=False
+            )
+            assert 1 <= len(warmup_runs) <= 3
+            assert 1 <= len(steady_runs) <= 3
+            assert _expand_loader_runs(warmup_runs) == _expected_update_deltas(
+                sched, 0, sched.loader_warmup_mask
+            )
+            steady_issue = max(sched.loader_warmup_issues, 1)
+            assert _expand_loader_runs(steady_runs) == _expected_update_deltas(
+                sched, steady_issue, sched.loader_steady_mask
+            )
+            warmup_split = blob_tools.decode_window_loader_phase_split(
+                sched.reserved, warmup=True
+            )
+            steady_split = blob_tools.decode_window_loader_phase_split(
+                sched.reserved, warmup=False
+            )
+            assert warmup_split <= sched.loader_warmup_new_cols
+            assert steady_split <= sched.loader_steady_new_cols
+            if sched.stride == 2 and sched.dilation == 1:
+                assert warmup_split > 0
+                assert steady_split > 0
+            else:
+                assert warmup_split == 0
+                assert steady_split == 0
+        else:
+            assert all(int(value) == 0 for value in sched.reserved)
     # P7F keeps L20/L2B0 materialized as compact C64 tensors. U21 therefore
     # should use the fast aligned 1x1 path instead of the old wide-slice packed
     # reader.
@@ -257,6 +504,118 @@ def test_window_schedule_contracts() -> None:
         else:
             assert mode == blob_tools.WIN_MODE_1X1_PACKED
             assert (uop.in_c % blob_tools.TK != 0) or not source_aligned
+
+
+def test_serial_row_schedule_contracts() -> None:
+    uops = blob_tools.build_uops()
+    schedules, _commands, schedule_ids, _audit = blob_tools.build_window_schedule_sections(uops)
+    conv_uops = [uop for uop in uops if uop.opcode == blob_tools.UOP_CONV]
+    weight_offsets = {uop.param_id: uop.param_id * 1024 for uop in conv_uops}
+    weight_report = [
+        {
+            "param_id": uop.param_id,
+            "packed_words": ((uop.in_c * uop.kernel * uop.kernel + blob_tools.TK - 1) // blob_tools.TK)
+            * uop.out_c,
+            "k_tiles": (uop.in_c * uop.kernel * uop.kernel + blob_tools.TK - 1) // blob_tools.TK,
+        }
+        for uop in conv_uops
+    ]
+    conv_exec, row_consumers, _fixed, plan, _block5, coverage = blob_tools.build_exec_plan_sections(
+        uops, schedule_ids, weight_offsets, weight_report
+    )
+    assert plan
+    for desc in conv_exec:
+        sched = schedules[desc.window_sched_id]
+        known_flags = (
+            blob_tools.WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2
+            | blob_tools.WINDOW_SCHED_FLAG_ODD_TAIL
+        )
+        assert (sched.flags & ~known_flags) == 0
+        narrow_paired_3x3 = (
+            sched.kernel == 3
+            and sched.loader_class == blob_tools.WIN_LOADER_3X3_NARROW
+            and bool(sched.flags & blob_tools.WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
+        )
+        if narrow_paired_3x3:
+            assert blob_tools.decode_window_loader_runs(sched.reserved, warmup=True)
+            assert blob_tools.decode_window_loader_runs(sched.reserved, warmup=False)
+        else:
+            assert all(int(value) == 0 for value in sched.reserved)
+        assert int(desc.reserved) == 0
+        assert row_consumers[desc.row_consumer_id]
+
+    schedule_audit = coverage["conv_segment_schedule"]
+    assert len(schedule_audit) == len(conv_exec)
+    assert all(record["segment_out_w"] == 0 for record in schedule_audit)
+    assert all(record["segments_per_row"] == 0 for record in schedule_audit)
+    assert all(record["cache_restarts_per_row"] == 0 for record in schedule_audit)
+    assert coverage["compiled_cache_restarts"] == 0
+    assert coverage["compiled_segment_calls"] == 0
+
+
+def test_serial_row_wingen_source_contract() -> None:
+    conv_source = (ROOT / "ESP_INT8_hls" / "src" / "conv_engine.cpp").read_text(encoding="utf-8")
+    win_source = (ROOT / "ESP_INT8_hls" / "src" / "win_gen.cpp").read_text(encoding="utf-8")
+
+    assert "scheduled_window_generator_segment" not in conv_source
+    assert "scheduled_window_generator_segment" not in win_source
+    assert win_source.count("void scheduled_window_generator_row(") == 1
+    assert conv_source.count("scheduled_window_generator_row(") == 2
+
+    for legacy_token in (
+        "u16_t issue_begin",
+        "u16_t issue_count",
+        "bool row_begin",
+        "issue_begin_i",
+        "issue_count_i",
+        "local_issue_i",
+        "local_ow_i",
+        "if (row_begin)",
+    ):
+        assert legacy_token not in win_source
+
+    # Preserve the P7 wide-channel cache, but let PARAM drive all replacement
+    # decisions so no runtime column-tag inference remains in the hot path.
+    assert "s_wide_cache" in win_source
+    assert "s_wide_col_tag" not in win_source
+    assert "s_narrow_col_tag" not in win_source
+
+    # Round 2 keeps one FMBUF reader and one local-cache assembler in a bounded
+    # hierarchical DATAFLOW region. The old combined load/assemble helpers must
+    # not remain as alternate hot paths.
+    for required in (
+        "window_row_loader",
+        "window_row_assembler",
+        "scheduled_3x3_window_row_pipeline",
+        "window_column_meta_t",
+        "window_load_word_t",
+        "narrow_paired_issue_meta_t",
+        "window_row_loader_narrow_paired",
+        "window_row_loader_narrow_reuse",
+        "window_loader_emit_narrow_cached_window",
+        "window_loader_emit_narrow_reuse_window",
+        "window_row_assembler_read_narrow_window",
+        "s_narrow_row_bank0",
+        "s_narrow_row_bank1",
+        "s_narrow_row_bank2",
+    ):
+        assert required in win_source
+    assert "stage_narrow_3x3_window_pair" not in win_source
+    for obsolete in (
+        "prepare_narrow_issue_windows",
+        "update_wide_direct_cache",
+        "load_narrow_cache_column",
+        "load_wide_cache_column",
+        "stage_narrow_3x3_window_select",
+        "s_narrow_cache_row",
+        "window_loader_emit_narrow_run",
+        "window_loader_emit_narrow_run_row",
+    ):
+        assert obsolete not in win_source
+    assert "#pragma HLS STREAM variable=column_meta_stream depth=16" in win_source
+    assert "#pragma HLS STREAM variable=load_word_stream depth=16" in win_source
+    assert "#pragma HLS STREAM variable=act_stream0 depth=40" in conv_source
+    assert "#pragma HLS BIND_STORAGE variable=act_stream0 type=fifo impl=lutram" in conv_source
 
 
 def test_store_layout_schedule_contracts() -> None:
@@ -296,7 +655,17 @@ def test_store_layout_schedule_contracts() -> None:
                 fixed = fixed_exec[entry.desc_id]
                 dst = blob_tools.TENSOR_DESC_BY_ID[fixed.dst_tensor]
                 row_contig = fixed.flags & blob_tools.FIXED_FLAG_ROW_CONTIGUOUS_STORE
+                block5_row_group = fixed.flags & blob_tools.FIXED_FLAG_BLOCK5_ROW_GROUP
+                if block5_row_group:
+                    assert not (fixed.flags & blob_tools.FIXED_FLAG_CBLOCK_MAJOR), (entry, fixed)
+                    assert not (fixed.flags & blob_tools.FIXED_FLAG_ROW_CONTIGUOUS_STORE), (entry, fixed)
+                    continue
                 if row_contig:
+                    assert not (fixed.flags & blob_tools.FIXED_FLAG_CBLOCK_MAJOR), (
+                        entry,
+                        fixed,
+                        "row-contiguous fixed output must remain pixel-major",
+                    )
                     assert fixed.valid_c == dst.c == dst.phys_c, (
                         entry,
                         fixed,
@@ -317,6 +686,11 @@ def test_store_layout_schedule_contracts() -> None:
                         "row-contiguous fixed output row bytes must be 32B aligned",
                     )
                 else:
+                    assert fixed.flags & blob_tools.FIXED_FLAG_CBLOCK_MAJOR, (
+                        entry,
+                        fixed,
+                        "aligned fixed output must carry an explicit compiled cblock-major loop mode",
+                    )
                     assert fixed.valid_c % blob_tools.TM == 0, (
                         entry,
                         fixed,
@@ -375,6 +749,28 @@ def test_weight_pack_contract() -> None:
     assert packed.words[0] == bytes(expected)
 
 
+def test_avgpool_single_pixel_schedule_contract() -> None:
+    source = (ROOT / "ESP_INT8_hls" / "src" / "avgpool_unit.cpp").read_text(
+        encoding="utf-8"
+    )
+
+    for required in (
+        "quantize_c3_avg_pixel(",
+        "sum_c3_cached_pixel(",
+        "store_c3_pixel_to_group_words(",
+        "for (int pix = 0; pix < AVGPOOL_C3_GROUP_PIXELS; ++pix)",
+    ):
+        assert required in source
+
+    for obsolete in (
+        "quantize_c3_avg_pixel_pair",
+        "sum_c3_cached_pixel_pair",
+        "avgpool_group_buffer_t",
+        "avgpool_append_c3_pixel",
+    ):
+        assert obsolete not in source
+
+
 def test_eval_contracts() -> None:
     try:
         eval_fullres.validate_eval_contract("M%04d.BIN", allow_reference_mask_eval=False)
@@ -401,13 +797,18 @@ def main() -> None:
     tests = [
         ("hw_int8_math", test_hw_int8_math),
         ("param_parser_contract", test_param_parser_contract),
+        ("exec_prefix_param_contract", test_exec_prefix_param_contract),
+        ("exec_prefix_app_contract", test_exec_prefix_app_contract),
         ("prefix_replay_contract", test_prefix_replay_contract),
         ("conv_forward_contract", test_conv_forward_contract),
         ("prefix_export_smoke", test_prefix_export_smoke),
         ("precision_audit_contract", test_precision_audit_contract),
         ("window_schedule_contracts", test_window_schedule_contracts),
+        ("serial_row_schedule_contracts", test_serial_row_schedule_contracts),
+        ("serial_row_wingen_source_contract", test_serial_row_wingen_source_contract),
         ("store_layout_schedule_contracts", test_store_layout_schedule_contracts),
         ("weight_pack_contract", test_weight_pack_contract),
+        ("avgpool_single_pixel_schedule_contract", test_avgpool_single_pixel_schedule_contract),
         ("eval_contracts", test_eval_contracts),
     ]
     for name, fn in tests:

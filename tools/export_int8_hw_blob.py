@@ -67,8 +67,14 @@ WIN_MODE_3X3_STAGED_C28 = 9
 WIN_MODE_3X3_STAGED_C64 = 10
 WIN_MODE_3X3_STAGED_C128 = 11
 
+WIN_LOADER_DIRECT_1X1 = 0
+WIN_LOADER_3X3_NARROW = 1
+WIN_LOADER_3X3_WIDE = 2
+
 WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2 = 1 << 0
 WINDOW_SCHED_FLAG_ODD_TAIL = 1 << 1
+
+AXI_WORD_BYTES = 32
 
 PACK_CMD_VALID = 1 << 0
 PACK_CMD_ZERO = 1 << 1
@@ -112,6 +118,18 @@ STORE_LAYOUT_NAMES = {
     STORE_LAYOUT_COLD_RMW_FALLBACK: "COLD_RMW_FALLBACK",
 }
 
+
+def compact_layout_phys_c(layout: int) -> int:
+    return {
+        STORE_LAYOUT_COMPACT_C2: 2,
+        STORE_LAYOUT_COMPACT_C12: 12,
+        STORE_LAYOUT_COMPACT_C16: 16,
+        STORE_LAYOUT_COMPACT_C19: 19,
+        STORE_LAYOUT_COMPACT_C25: 25,
+        STORE_LAYOUT_COMPACT_C28: 28,
+    }.get(int(layout), 0)
+
+
 ROW_CONSUMER_NAMES = {
     ROW_CONSUMER_NONE: "NONE",
     ROW_CONSUMER_STORE: "STORE",
@@ -133,6 +151,7 @@ EXEC_END = 255
 FIXED_FLAG_BLOCK5_AFFINE = 1 << 0
 FIXED_FLAG_BLOCK5_ADD_AFFINE = 1 << 1
 FIXED_FLAG_BLOCK5_ROW_GROUP = 1 << 2
+FIXED_FLAG_CBLOCK_MAJOR = 1 << 3
 FIXED_FLAG_ROW_CONTIGUOUS_STORE = 1 << 7
 
 BLOCK5_ADD_TENSOR_NONE = 0xFF
@@ -351,6 +370,14 @@ class WindowSchedDesc:
     cmd_base: int
     cmd_count: int
     kt_cmd_base: Tuple[int, ...]
+    loader_class: int = WIN_LOADER_DIRECT_1X1
+    loader_request_cols: int = 0
+    loader_warmup_issues: int = 0
+    loader_warmup_new_cols: int = 0
+    loader_steady_new_cols: int = 0
+    loader_words_per_col: int = 0
+    loader_warmup_mask: int = 0
+    loader_steady_mask: int = 0
     reserved: Tuple[int, ...] = ()
 
 
@@ -676,9 +703,9 @@ def pack_window_sched_desc(desc: WindowSchedDesc) -> bytes:
         raise ValueError(f"window schedule has too many kt offsets: {len(kt_bases)}")
     kt_bases += [kt_bases[-1] if kt_bases else 0] * (MAX_K_TILE_COUNT + 1 - len(kt_bases))
     reserved = list(desc.reserved)
-    if len(reserved) > 14:
+    if len(reserved) > 10:
         raise ValueError(f"window schedule has too many reserved words: {len(reserved)}")
-    reserved += [0] * (14 - len(reserved))
+    reserved += [0] * (10 - len(reserved))
     return (
         struct.pack(
             "<8B5H",
@@ -697,7 +724,18 @@ def pack_window_sched_desc(desc: WindowSchedDesc) -> bytes:
             desc.cmd_count,
         )
         + struct.pack("<41H", *kt_bases)
-        + struct.pack("<14H", *reserved)
+        + struct.pack(
+            "<8B",
+            desc.loader_class,
+            desc.loader_request_cols,
+            desc.loader_warmup_issues,
+            desc.loader_warmup_new_cols,
+            desc.loader_steady_new_cols,
+            desc.loader_words_per_col,
+            desc.loader_warmup_mask,
+            desc.loader_steady_mask,
+        )
+        + struct.pack("<10H", *reserved)
     )
 
 
@@ -1309,15 +1347,420 @@ def window_mode_supports_pixel_parallel(mode: int) -> bool:
     )
 
 
+WINDOW_LOADER_RUN_MAX = 3
+WINDOW_LOADER_WARMUP_COUNT_WORD = 0
+WINDOW_LOADER_WARMUP_RUN_WORD = 1
+WINDOW_LOADER_STEADY_COUNT_WORD = 4
+WINDOW_LOADER_STEADY_RUN_WORD = 5
+WINDOW_LOADER_PHASE_SPLIT_WORD = 8
+WINDOW_LOADER_ROW_REUSE_WORD = 9
+WINDOW_LOADER_RESERVED_WORDS = 10
+
+WINDOW_ROW_REUSE_NONE = 0
+WINDOW_ROW_REUSE_STRIDE1_KEEP2 = 1
+WINDOW_ROW_REUSE_STRIDE2_KEEP1 = 2
+WINDOW_ROW_REUSE_MODE_MASK = 0x3
+WINDOW_ROW_REUSE_WORDS_SHIFT = 2
+WINDOW_ROW_REUSE_WORDS_MASK = 0x7F
+WINDOW_ROW_REUSE_RESERVED_SHIFT = 9
+
+
+def compile_window_row_reuse_word(
+    *,
+    source_w: int,
+    in_c: int,
+    kernel: int,
+    stride: int,
+    dilation: int,
+    loader_class: int,
+    flags: int,
+) -> int:
+    if (
+        kernel != 3
+        or dilation != 1
+        or loader_class != WIN_LOADER_3X3_NARROW
+        or not (flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
+    ):
+        return 0
+
+    reuse_mode = WINDOW_ROW_REUSE_NONE
+    if in_c == 12 and stride == 1:
+        reuse_mode = WINDOW_ROW_REUSE_STRIDE1_KEEP2
+    elif in_c == 3 and stride == 2:
+        reuse_mode = WINDOW_ROW_REUSE_STRIDE2_KEEP1
+    if reuse_mode == WINDOW_ROW_REUSE_NONE:
+        return 0
+
+    row_bytes = source_w * in_c
+    if row_bytes % TK:
+        raise ValueError(
+            f"row-reuse source row is not {TK}-byte aligned: "
+            f"source_w={source_w} in_c={in_c}"
+        )
+    packed_words = row_bytes // TK
+    if packed_words <= 0 or packed_words > WINDOW_ROW_REUSE_WORDS_MASK:
+        raise ValueError(
+            f"row-reuse packed word count out of range: {packed_words}"
+        )
+    if packed_words != 96:
+        return 0
+    return reuse_mode | (packed_words << WINDOW_ROW_REUSE_WORDS_SHIFT)
+
+
+def encode_window_loader_run(start_delta: int, count: int) -> int:
+    if start_delta < -128 or start_delta > 127:
+        raise ValueError(f"window loader run start delta out of range: {start_delta}")
+    if count <= 0 or count > 255:
+        raise ValueError(f"window loader run count out of range: {count}")
+    return (count << 8) | (start_delta & 0xFF)
+
+
+def decode_window_loader_run(word: int) -> Tuple[int, int]:
+    start_delta = word & 0xFF
+    if start_delta & 0x80:
+        start_delta -= 0x100
+    count = (word >> 8) & 0xFF
+    if count <= 0:
+        raise ValueError(f"window loader run has zero count: 0x{word:04X}")
+    return start_delta, count
+
+
+def decode_window_loader_runs(
+    reserved: Sequence[int], *, warmup: bool
+) -> Tuple[Tuple[int, int], ...]:
+    words = tuple(int(value) for value in reserved)
+    if len(words) != WINDOW_LOADER_RESERVED_WORDS:
+        raise ValueError(
+            f"window loader run descriptor has {len(words)} words, "
+            f"expected {WINDOW_LOADER_RESERVED_WORDS}"
+        )
+    count_word = (
+        WINDOW_LOADER_WARMUP_COUNT_WORD
+        if warmup
+        else WINDOW_LOADER_STEADY_COUNT_WORD
+    )
+    first_run_word = (
+        WINDOW_LOADER_WARMUP_RUN_WORD
+        if warmup
+        else WINDOW_LOADER_STEADY_RUN_WORD
+    )
+    run_count = words[count_word]
+    if run_count > WINDOW_LOADER_RUN_MAX:
+        raise ValueError(f"window loader run count exceeds {WINDOW_LOADER_RUN_MAX}: {run_count}")
+    runs = tuple(
+        decode_window_loader_run(words[first_run_word + index])
+        for index in range(run_count)
+    )
+    unused = words[first_run_word + run_count : first_run_word + WINDOW_LOADER_RUN_MAX]
+    if any(unused):
+        raise ValueError(f"window loader unused run words must be zero: {unused}")
+    return runs
+
+
+def decode_window_loader_phase_split(
+    reserved: Sequence[int], *, warmup: bool
+) -> int:
+    words = tuple(int(value) for value in reserved)
+    if len(words) != WINDOW_LOADER_RESERVED_WORDS:
+        raise ValueError(
+            f"window loader run descriptor has {len(words)} words, "
+            f"expected {WINDOW_LOADER_RESERVED_WORDS}"
+        )
+    word = words[WINDOW_LOADER_PHASE_SPLIT_WORD]
+    return (word & 0xFF) if warmup else ((word >> 8) & 0xFF)
+
+
+def compile_window_update_runs(
+    *,
+    stride: int,
+    dilation: int,
+    padding: int,
+    out_w: int,
+    issue: int,
+    update_mask: int,
+) -> Tuple[Tuple[int, int], ...]:
+    pixel0 = issue * 2
+    if pixel0 + 1 >= out_w:
+        raise ValueError(
+            f"window loader representative issue must contain a pixel pair: "
+            f"issue={issue} out_w={out_w}"
+        )
+    base_column = pixel0 * stride - padding
+    request_columns = [
+        base_column + kw * dilation
+        for kw in range(3)
+    ]
+    request_columns.extend(
+        (pixel0 + 1) * stride - padding + kw * dilation
+        for kw in range(3)
+    )
+    selected = sorted(
+        {
+            column - base_column
+            for request, column in enumerate(request_columns)
+            if update_mask & (1 << request)
+        }
+    )
+    if not selected:
+        raise ValueError("window loader update mask does not select any columns")
+
+    runs: List[Tuple[int, int]] = []
+    run_start = selected[0]
+    run_count = 1
+    for delta in selected[1:]:
+        if delta == run_start + run_count:
+            run_count += 1
+            continue
+        runs.append((run_start, run_count))
+        run_start = delta
+        run_count = 1
+    runs.append((run_start, run_count))
+    if len(runs) > WINDOW_LOADER_RUN_MAX:
+        raise ValueError(
+            f"window loader needs {len(runs)} update runs, "
+            f"max={WINDOW_LOADER_RUN_MAX}: {runs}"
+        )
+    return tuple(runs)
+
+
+def compile_window_phase_split(
+    *,
+    stride: int,
+    dilation: int,
+    padding: int,
+    out_w: int,
+    cache_col_slots: int,
+    issue: int,
+    update_mask: int,
+) -> int:
+    pixel0 = issue * 2
+    if pixel0 + 1 >= out_w:
+        raise ValueError(
+            f"window loader representative issue must contain a pixel pair: "
+            f"issue={issue} out_w={out_w}"
+        )
+    base_column = pixel0 * stride - padding
+    window0_columns = [
+        base_column + kw * dilation
+        for kw in range(3)
+    ]
+    window1_columns = [
+        (pixel0 + 1) * stride - padding + kw * dilation
+        for kw in range(3)
+    ]
+    phase0_updates = sorted(
+        {
+            column
+            for request, column in enumerate(window0_columns)
+            if update_mask & (1 << request)
+        }
+    )
+    phase1_updates = sorted(
+        {
+            column
+            for request, column in enumerate(window1_columns, start=3)
+            if update_mask & (1 << request)
+        }
+    )
+    aliases_window0 = any(
+        phase1_column != phase0_column
+        and (phase1_column & (cache_col_slots - 1)) ==
+            (phase0_column & (cache_col_slots - 1))
+        for phase1_column in phase1_updates
+        for phase0_column in window0_columns
+    )
+    if not aliases_window0:
+        return 0
+
+    selected = sorted(set(phase0_updates + phase1_updates))
+    if selected[: len(phase0_updates)] != phase0_updates:
+        raise ValueError(
+            "window loader phase split is not representable by ordered physical runs: "
+            f"phase0={phase0_updates} phase1={phase1_updates}"
+        )
+    return len(phase0_updates)
+
+
+def compile_window_loader_run_words(
+    *,
+    stride: int,
+    dilation: int,
+    padding: int,
+    out_w: int,
+    cache_col_slots: int,
+    warmup_issues: int,
+    warmup_mask: int,
+    steady_mask: int,
+) -> Tuple[int, ...]:
+    warmup_runs = compile_window_update_runs(
+        stride=stride,
+        dilation=dilation,
+        padding=padding,
+        out_w=out_w,
+        issue=0,
+        update_mask=warmup_mask,
+    )
+    steady_issue = max(warmup_issues, 1)
+    if steady_issue * 2 + 1 >= out_w:
+        raise ValueError(
+            f"window loader schedule has no representative steady pixel pair: "
+            f"warmup={warmup_issues} out_w={out_w}"
+        )
+    steady_runs = compile_window_update_runs(
+        stride=stride,
+        dilation=dilation,
+        padding=padding,
+        out_w=out_w,
+        issue=steady_issue,
+        update_mask=steady_mask,
+    )
+    warmup_phase_split = compile_window_phase_split(
+        stride=stride,
+        dilation=dilation,
+        padding=padding,
+        out_w=out_w,
+        cache_col_slots=cache_col_slots,
+        issue=0,
+        update_mask=warmup_mask,
+    )
+    steady_phase_split = compile_window_phase_split(
+        stride=stride,
+        dilation=dilation,
+        padding=padding,
+        out_w=out_w,
+        cache_col_slots=cache_col_slots,
+        issue=steady_issue,
+        update_mask=steady_mask,
+    )
+
+    words = [0] * WINDOW_LOADER_RESERVED_WORDS
+    words[WINDOW_LOADER_WARMUP_COUNT_WORD] = len(warmup_runs)
+    for index, (start_delta, count) in enumerate(warmup_runs):
+        words[WINDOW_LOADER_WARMUP_RUN_WORD + index] = encode_window_loader_run(
+            start_delta, count
+        )
+    words[WINDOW_LOADER_STEADY_COUNT_WORD] = len(steady_runs)
+    for index, (start_delta, count) in enumerate(steady_runs):
+        words[WINDOW_LOADER_STEADY_RUN_WORD + index] = encode_window_loader_run(
+            start_delta, count
+        )
+    words[WINDOW_LOADER_PHASE_SPLIT_WORD] = (
+        (steady_phase_split << 8) | warmup_phase_split
+    )
+    return tuple(words)
+
+
+def compile_window_loader_contract(
+    *,
+    in_c: int,
+    kernel: int,
+    stride: int,
+    dilation: int,
+    padding: int,
+    out_w: int,
+    cache_chunks: int,
+    cache_col_slots: int,
+    flags: int,
+) -> Tuple[int, int, int, int, int, int, int, int]:
+    if kernel != 3:
+        return (WIN_LOADER_DIRECT_1X1, 0, 0, 0, 0, 0, 0, 0)
+
+    loader_class = (
+        WIN_LOADER_3X3_NARROW if in_c <= 25 else WIN_LOADER_3X3_WIDE
+    )
+    paired = bool(flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
+    request_cols = 6 if paired else 3
+    issue_count = (out_w + 1) // 2 if paired else out_w
+    if issue_count <= 0:
+        raise ValueError("3x3 window schedule must contain at least one issue")
+    if cache_col_slots <= 0 or cache_col_slots & (cache_col_slots - 1):
+        raise ValueError(f"invalid direct-mapped cache slots: {cache_col_slots}")
+
+    tags: List[Optional[int]] = [None] * cache_col_slots
+    miss_counts: List[int] = []
+    update_masks: List[int] = []
+    for issue in range(issue_count):
+        pixel0 = issue * (2 if paired else 1)
+        columns = [
+            pixel0 * stride - padding + kw * dilation
+            for kw in range(3)
+        ]
+        if paired and pixel0 + 1 < out_w:
+            columns.extend(
+                (pixel0 + 1) * stride - padding + kw * dilation
+                for kw in range(3)
+            )
+
+        misses = 0
+        update_mask = 0
+        for request, column in enumerate(columns):
+            slot = column & (cache_col_slots - 1)
+            if tags[slot] != column:
+                tags[slot] = column
+                misses += 1
+                update_mask |= 1 << request
+        miss_counts.append(misses)
+        update_masks.append(update_mask)
+
+    steady_new_cols = miss_counts[-1]
+    warmup_issues = 0
+    for issue, count in enumerate(miss_counts):
+        if all(value == steady_new_cols for value in miss_counts[issue:]):
+            warmup_issues = issue
+            break
+    warmup_new_cols = (
+        miss_counts[0] if warmup_issues > 0 else steady_new_cols
+    )
+    warmup_mask = update_masks[0] if warmup_issues > 0 else update_masks[-1]
+    steady_mask = update_masks[-1]
+    if any(
+        count != warmup_new_cols for count in miss_counts[:warmup_issues]
+    ):
+        raise ValueError(
+            "window loader miss pattern is not representable by one warmup class: "
+            f"in_c={in_c} stride={stride} dilation={dilation} counts={miss_counts[:32]}"
+        )
+    if any(
+        count != steady_new_cols for count in miss_counts[warmup_issues:]
+    ):
+        raise ValueError(
+            "window loader steady-state miss count is not constant: "
+            f"in_c={in_c} stride={stride} dilation={dilation}"
+        )
+    if any(mask != warmup_mask for mask in update_masks[:warmup_issues]):
+        raise ValueError(
+            "window loader warmup update mask is not constant: "
+            f"in_c={in_c} stride={stride} dilation={dilation}"
+        )
+    if any(mask != steady_mask for mask in update_masks[warmup_issues:]):
+        raise ValueError(
+            "window loader steady update mask is not constant: "
+            f"in_c={in_c} stride={stride} dilation={dilation}"
+        )
+
+    return (
+        loader_class,
+        request_cols,
+        warmup_issues,
+        warmup_new_cols,
+        steady_new_cols,
+        3 * cache_chunks,
+        warmup_mask,
+        steady_mask,
+    )
+
+
 def make_window_pack_schedule(
     in_c: int,
     kernel: int,
+    source_w: int = 0,
     stride: int = 1,
     dilation: int = 1,
     padding: int = 0,
     out_w: int = 0,
     tk: int = TK,
     mode: Optional[int] = None,
+    flags: int = 0,
 ) -> Tuple[WindowSchedDesc, List[WindowPackCmd]]:
     k_total = kernel * kernel * in_c
     k_tiles = math.ceil(k_total / tk)
@@ -1373,21 +1816,88 @@ def make_window_pack_schedule(
     else:
         cache_col_slots = 0
 
+    cache_chunks = window_cache_chunks_for(in_c, kernel)
+    (
+        loader_class,
+        loader_request_cols,
+        loader_warmup_issues,
+        loader_warmup_new_cols,
+        loader_steady_new_cols,
+        loader_words_per_col,
+        loader_warmup_mask,
+        loader_steady_mask,
+    ) = compile_window_loader_contract(
+        in_c=in_c,
+        kernel=kernel,
+        stride=stride,
+        dilation=dilation,
+        padding=padding,
+        out_w=out_w,
+        cache_chunks=cache_chunks,
+        cache_col_slots=cache_col_slots,
+        flags=flags,
+    )
+    paired = bool(flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
+    loader_run_words: Tuple[int, ...] = ()
+    if (
+        kernel == 3
+        and paired
+        and loader_class == WIN_LOADER_3X3_NARROW
+    ):
+        loader_run_words = compile_window_loader_run_words(
+            stride=stride,
+            dilation=dilation,
+            padding=padding,
+            out_w=out_w,
+            cache_col_slots=cache_col_slots,
+            warmup_issues=loader_warmup_issues,
+            warmup_mask=loader_warmup_mask,
+            steady_mask=loader_steady_mask,
+        )
+
+    reserved_words = list(loader_run_words)
+    if len(reserved_words) < WINDOW_LOADER_RESERVED_WORDS:
+        reserved_words.extend(
+            [0] * (WINDOW_LOADER_RESERVED_WORDS - len(reserved_words))
+        )
+    reserved_words[WINDOW_LOADER_ROW_REUSE_WORD] = (
+        compile_window_row_reuse_word(
+            source_w=source_w,
+            in_c=in_c,
+            kernel=kernel,
+            stride=stride,
+            dilation=dilation,
+            loader_class=loader_class,
+            flags=flags,
+        )
+        if source_w > 0
+        else 0
+    )
+
     desc = WindowSchedDesc(
         mode=window_mode_for(in_c, kernel) if mode is None else mode,
         kernel=kernel,
         stride=stride,
         dilation=dilation,
         padding=padding,
-        cache_chunks=window_cache_chunks_for(in_c, kernel),
+        cache_chunks=cache_chunks,
         cache_col_slots=cache_col_slots,
-        flags=0,
+        flags=flags,
         in_c=in_c,
         out_w=out_w,
         k_tiles=k_tiles,
         cmd_base=0,
         cmd_count=len(commands),
         kt_cmd_base=tuple(kt_cmd_base),
+        loader_class=loader_class,
+        loader_request_cols=loader_request_cols,
+        loader_warmup_issues=loader_warmup_issues,
+        loader_warmup_new_cols=loader_warmup_new_cols,
+        loader_steady_new_cols=loader_steady_new_cols,
+        loader_words_per_col=loader_words_per_col,
+        loader_warmup_mask=loader_warmup_mask,
+        loader_steady_mask=loader_steady_mask,
+        reserved=tuple(reserved_words),
     )
     return desc, commands
 
@@ -1807,7 +2317,7 @@ def build_window_schedule_sections(uops: Sequence[Uop]) -> Tuple[List[WindowSche
     schedules: List[WindowSchedDesc] = []
     commands: List[WindowPackCmd] = []
     schedule_ids_by_param: Dict[int, int] = {}
-    cache: Dict[Tuple[int, int, int, int, int, int, int, int], int] = {}
+    cache: Dict[Tuple[int, int, int, int, int, int, int, int, int], int] = {}
 
     for uop in uops:
         if uop.opcode != UOP_CONV:
@@ -1823,16 +2333,28 @@ def build_window_schedule_sections(uops: Sequence[Uop]) -> Tuple[List[WindowSche
             sched_flags |= WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2
             if out_w & 1:
                 sched_flags |= WINDOW_SCHED_FLAG_ODD_TAIL
-        key = (uop.kernel, uop.in_c, mode, uop.stride, uop.dilation, uop.padding, out_w, sched_flags)
+        key = (
+            uop.kernel,
+            uop.in_c,
+            mode,
+            uop.stride,
+            uop.dilation,
+            uop.padding,
+            uop.in_w,
+            out_w,
+            sched_flags,
+        )
         if key not in cache:
             local_desc, _legacy_cmds = make_window_pack_schedule(
                 uop.in_c,
                 uop.kernel,
+                source_w=uop.in_w,
                 stride=uop.stride,
                 dilation=uop.dilation,
                 padding=uop.padding,
                 out_w=out_w,
                 mode=mode,
+                flags=sched_flags,
             )
             global_desc = WindowSchedDesc(
                 mode=local_desc.mode,
@@ -1849,6 +2371,15 @@ def build_window_schedule_sections(uops: Sequence[Uop]) -> Tuple[List[WindowSche
                 cmd_base=0,
                 cmd_count=0,
                 kt_cmd_base=[0] * (MAX_K_TILE_COUNT + 1),
+                loader_class=local_desc.loader_class,
+                loader_request_cols=local_desc.loader_request_cols,
+                loader_warmup_issues=local_desc.loader_warmup_issues,
+                loader_warmup_new_cols=local_desc.loader_warmup_new_cols,
+                loader_steady_new_cols=local_desc.loader_steady_new_cols,
+                loader_words_per_col=local_desc.loader_words_per_col,
+                loader_warmup_mask=local_desc.loader_warmup_mask,
+                loader_steady_mask=local_desc.loader_steady_mask,
+                reserved=local_desc.reserved,
             )
             cache[key] = len(schedules)
             schedules.append(global_desc)
@@ -1884,6 +2415,17 @@ def build_window_schedule_sections(uops: Sequence[Uop]) -> Tuple[List[WindowSche
                 "cache_chunks": desc.cache_chunks,
                 "pixel_parallel": 2 if (desc.flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2) else 1,
                 "odd_tail": bool(desc.flags & WINDOW_SCHED_FLAG_ODD_TAIL),
+                "row_reuse_mode": (
+                    desc.reserved[WINDOW_LOADER_ROW_REUSE_WORD]
+                    & WINDOW_ROW_REUSE_MODE_MASK
+                ),
+                "packed_words_per_source_row": (
+                    desc.reserved[WINDOW_LOADER_ROW_REUSE_WORD]
+                    >> WINDOW_ROW_REUSE_WORDS_SHIFT
+                )
+                & WINDOW_ROW_REUSE_WORDS_MASK,
+                "segment_capable": False,
+                "segment_out_w_max": 0,
                 "k_tiles": desc.k_tiles,
                 "cmd_base": desc.cmd_base,
                 "cmd_count": desc.cmd_count,
@@ -1986,6 +2528,7 @@ def build_exec_plan_sections(
                 k_tiles=k_tiles_by_param[uop.param_id],
                 weight_words=weight_words_by_param[uop.param_id],
                 flags=uop.flags,
+                reserved=0,
             )
         )
         exec_plan.append(ExecPlanEntry(EXEC_CONV, conv_id, idx, 0))
@@ -2025,6 +2568,7 @@ def build_exec_plan_sections(
                 k_tiles=k_tiles_by_param[uop.param_id],
                 weight_words=weight_words_by_param[uop.param_id],
                 flags=uop.flags,
+                reserved=0,
             )
         )
         return conv_id
@@ -2113,7 +2657,9 @@ def build_exec_plan_sections(
         ):
             raise ValueError(f"{spec['name']} BLOCK5 conv qparams must be contiguous")
 
-        flags = affine.flags | FIXED_FLAG_BLOCK5_ROW_GROUP
+        flags = (
+            affine.flags & ~(FIXED_FLAG_CBLOCK_MAJOR | FIXED_FLAG_ROW_CONTIGUOUS_STORE)
+        ) | FIXED_FLAG_BLOCK5_ROW_GROUP
         kind = EXEC_BLOCK_AFFINE
         add_param_id = 0
         add_tensor = BLOCK5_ADD_TENSOR_NONE
@@ -2612,7 +3158,7 @@ def build_exec_plan_sections(
                 and uops[idx].dst == uops[idx + 1].dst == uops[idx + 2].dst == uops[idx + 3].src0
             ):
                 affine = uops[idx + 3]
-                flags = affine.flags
+                flags = affine.flags & ~FIXED_FLAG_CBLOCK_MAJOR
                 if affine.valid_c == 131:
                     flags |= FIXED_FLAG_ROW_CONTIGUOUS_STORE
                 fixed_id = len(fixed_exec_descs)
@@ -2656,6 +3202,9 @@ def build_exec_plan_sections(
                 and uops[idx].dst == uops[idx + 1].dst == uops[idx + 2].src0
             ):
                 affine = uops[idx + 2]
+                flags = (
+                    affine.flags & ~FIXED_FLAG_ROW_CONTIGUOUS_STORE
+                ) | FIXED_FLAG_CBLOCK_MAJOR
                 fixed_id = len(fixed_exec_descs)
                 fixed_exec_descs.append(
                     FixedExecDesc(
@@ -2665,7 +3214,7 @@ def build_exec_plan_sections(
                         dst_tensor=affine.dst,
                         param_id=affine.param_id,
                         act_type=affine.act_type,
-                        flags=affine.flags,
+                        flags=flags,
                         in_h=affine.in_h,
                         in_w=affine.in_w,
                         in_c=uop.valid_c,
@@ -2674,7 +3223,7 @@ def build_exec_plan_sections(
                         reserved0=TID_INVALID,
                     )
                 )
-                exec_plan.append(ExecPlanEntry(EXEC_BLOCK_AFFINE, fixed_id, idx + 2, affine.flags))
+                exec_plan.append(ExecPlanEntry(EXEC_BLOCK_AFFINE, fixed_id, idx + 2, flags))
                 skipped.update({idx + 1, idx + 2})
                 affine_fused += 1
                 fusion_audit.append(
@@ -2687,6 +3236,7 @@ def build_exec_plan_sections(
                         "src": [uop.src0, uops[idx + 1].src0],
                         "dst": affine.dst,
                         "shape": [affine.in_h, affine.in_w, affine.valid_c],
+                        "loop_mode": "CBLOCK_MAJOR",
                     }
                 )
                 continue
@@ -2718,6 +3268,26 @@ def build_exec_plan_sections(
         raise ValueError(
             f"fixed_exec_desc_count={len(fixed_exec_descs)} exceeds MAX_FIXED_EXEC_DESC_COUNT={MAX_FIXED_EXEC_DESC_COUNT}"
         )
+    conv_segment_schedule = []
+    compiled_cache_restarts = 0
+    compiled_segment_calls = 0
+    for conv_id, desc in enumerate(conv_exec_descs):
+        out_h = conv_out_dim(desc.in_h, desc.stride)
+        out_w = conv_out_dim(desc.in_w, desc.stride)
+        conv_segment_schedule.append(
+            {
+                "conv_id": conv_id,
+                "param_id": desc.param_id,
+                "in_c": desc.in_c,
+                "out_c": desc.out_c,
+                "out_h": out_h,
+                "out_w": out_w,
+                "k_tiles": desc.k_tiles,
+                "segment_out_w": 0,
+                "segments_per_row": 0,
+                "cache_restarts_per_row": 0,
+            }
+        )
     coverage = {
         "legacy_uop_count": len(uops),
         "exec_entry_count": len(exec_plan),
@@ -2732,6 +3302,9 @@ def build_exec_plan_sections(
         "affine_total": affine_total,
         "affine_fused": affine_fused,
         "standalone_affine": standalone_affine,
+        "compiled_cache_restarts": compiled_cache_restarts,
+        "compiled_segment_calls": compiled_segment_calls,
+        "conv_segment_schedule": conv_segment_schedule,
         "fusion_audit": fusion_audit,
         "store_layouts": {
             STORE_LAYOUT_NAMES.get(layout, str(layout)): sum(1 for rc in row_consumers if rc.reserved0 == layout)
@@ -3387,7 +3960,7 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
     for sid in range(sched_count):
         off = sched_off + sid * 128
         fields = struct.unpack("<8B5H", data[off : off + 18])
-        mode, kernel, stride, dilation, padding, cache_chunks, cache_col_slots, _flags, in_c, out_w, k_tiles, cmd_base, cmd_len = fields
+        mode, kernel, stride, dilation, padding, cache_chunks, cache_col_slots, flags, in_c, out_w, k_tiles, cmd_base, cmd_len = fields
         schedule_modes.append(mode)
         if mode == WIN_MODE_INVALID or kernel not in (1, 3) or in_c == 0:
             raise ValueError(f"bad window schedule[{sid}] header: {fields}")
@@ -3421,6 +3994,50 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
             raise ValueError(f"window schedule[{sid}] k_tiles={k_tiles} exceeds max")
         if cmd_base + cmd_len > cmd_count:
             raise ValueError(f"window schedule[{sid}] command range out of bounds")
+        loader_class = data[off + 100]
+        reuse_word = struct.unpack(
+            "<H",
+            data[
+                off + 108 + WINDOW_LOADER_ROW_REUSE_WORD * 2 :
+                off + 110 + WINDOW_LOADER_ROW_REUSE_WORD * 2
+            ],
+        )[0]
+        reuse_mode = reuse_word & WINDOW_ROW_REUSE_MODE_MASK
+        packed_words = (
+            reuse_word >> WINDOW_ROW_REUSE_WORDS_SHIFT
+        ) & WINDOW_ROW_REUSE_WORDS_MASK
+        if reuse_word >> WINDOW_ROW_REUSE_RESERVED_SHIFT:
+            raise ValueError(
+                f"window schedule[{sid}] has nonzero reserved row-reuse bits"
+            )
+        if reuse_mode == WINDOW_ROW_REUSE_NONE:
+            if packed_words != 0:
+                raise ValueError(
+                    f"window schedule[{sid}] has words without row-reuse mode"
+                )
+        else:
+            common_reuse = (
+                kernel == 3
+                and dilation == 1
+                and loader_class == WIN_LOADER_3X3_NARROW
+                and bool(flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
+                and packed_words == 96
+            )
+            stride1_ok = (
+                reuse_mode == WINDOW_ROW_REUSE_STRIDE1_KEEP2
+                and in_c == 12
+                and stride == 1
+            )
+            stride2_ok = (
+                reuse_mode == WINDOW_ROW_REUSE_STRIDE2_KEEP1
+                and in_c == 3
+                and stride == 2
+            )
+            if not common_reuse or not (stride1_ok or stride2_ok):
+                raise ValueError(
+                    f"window schedule[{sid}] invalid row-reuse contract: "
+                    f"mode={reuse_mode} words={packed_words}"
+                )
 
     row_consumer_off = offsets["row_consumer_desc"]
     row_consumer_count = counts["row_consumer_desc_count"]

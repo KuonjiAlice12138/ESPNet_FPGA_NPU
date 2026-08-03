@@ -45,11 +45,10 @@ bool alias_tensor_to_slice(u8_t tensor_id,
                            u16_t c);
 void upsample_fused_begin();
 void scheduled_window_generator_row(const tensor_desc_t& src_desc,
-                                    const conv_exec_desc_t& conv_desc,
-                                    const window_sched_desc_t& sched,
-                                    hls::stream<act_vec_t>& act_stream0,
-                                    hls::stream<act_vec_t>& act_stream1,
-                                    u16_t out_row);
+                                     const window_sched_desc_t& sched,
+                                     hls::stream<act_vec_t>& act_stream0,
+                                     hls::stream<act_vec_t>& act_stream1,
+                                     u16_t out_row);
 void systolic_array_core_row(hls::stream<act_vec_t>& act_stream0,
                              hls::stream<act_vec_t>& act_stream1,
                              const wgt_vec_t weight_buf[TM][MAX_K_TILE_COUNT],
@@ -62,14 +61,18 @@ bool ppu_preadd_row(const tensor_desc_t& other,
                     u8_t valid_c,
                     const add_q_t& qparam,
                     act_vec_t row_buf[MAX_FM_W]);
-bool ppu_consume_conv_row(const row_consumer_desc_t& consumer,
-                          const tensor_desc_t& dst,
-                          const tensor_desc_t& add_other,
-                          bool has_add_other,
-                          const conv_cfg_t& cfg,
-                          axi_vec_t* gmem_frame_out,
-                          u16_t out_row,
-                          act_vec_t row_buf[MAX_FM_W]);
+bool ppu_consume_upsample_row(axi_vec_t* gmem_frame_out,
+                              u16_t out_row,
+                              const act_vec_t row_buf[MAX_FM_W]);
+void ppu_consume_conv_stream(const row_consumer_desc_t& consumer,
+                             const tensor_desc_t& dst,
+                             const tensor_desc_t& add_other,
+                             bool has_add_other,
+                             const add_q_t& add_qparam,
+                             const conv_cfg_t& cfg,
+                             u16_t out_row,
+                             hls::stream<act_vec_t>& conv_stream,
+                             u8_t& status);
 bool ppu_consume_block5_final_row(const block5_sched_desc_t& sched,
                                   const tensor_desc_t& scratch0,
                                   const tensor_desc_t& scratch1,
@@ -213,20 +216,21 @@ static u16_t block5_compact_layout(u8_t channels) {
   return static_cast<u16_t>(static_cast<unsigned>(STORE_LAYOUT_NONE));
 }
 
-static void post_process_row_to_buffer(hls::stream<psum_half_vec_t>& psum_stream,
-                                       act_vec_t row_buf[MAX_FM_W],
-                                       const conv_cfg_t& cfg,
-                                       const window_sched_desc_t& sched,
-                                       u8_t act_type,
-                                       const conv_q_t& qparam) {
+static void post_process_conv_row_to_buffer(
+    hls::stream<psum_half_vec_t>& psum_stream,
+    act_vec_t row_buf[MAX_FM_W],
+    const conv_cfg_t& cfg,
+    const window_sched_desc_t& sched,
+    u8_t act_type,
+    const conv_q_t& qparam) {
 #pragma HLS INLINE off
 #pragma HLS ARRAY_PARTITION variable=qparam.bias complete dim=1
 #pragma HLS ARRAY_PARTITION variable=qparam.mult complete dim=1
 #pragma HLS ARRAY_PARTITION variable=qparam.shift complete dim=1
-  constexpr int POST_LANES_PER_CYCLE = 4;
+  constexpr int POST_LANES_PER_CYCLE = 8;
   constexpr int POST_REQUANT_GROUPS = TM / POST_LANES_PER_CYCLE;
   static_assert(TM == 32 && TM % POST_LANES_PER_CYCLE == 0,
-                "Round 3 postprocess assumes 32 lanes in four-lane groups");
+                "Round 1 postprocess assumes 32 lanes in eight-lane groups");
   const u16_t stride = conv_effective_stride(cfg);
   const u16_t out_w = conv_out_dim(cfg.in_w, stride);
   const int out_w_i = static_cast<int>(out_w.to_uint());
@@ -291,44 +295,44 @@ static void post_process_row_to_buffer(hls::stream<psum_half_vec_t>& psum_stream
   }
 }
 
-static void generate_conv_window_row(const tensor_desc_t& src,
-                                     hls::stream<act_vec_t>& act_stream0,
-                                     hls::stream<act_vec_t>& act_stream1,
-                                     hls::stream<conv_cfg_t>& sa_cfg_stream,
-                                     hls::stream<u8_t>& sa_sched_flags_stream,
-                                     const conv_cfg_t& cfg,
-                                     const conv_exec_desc_t& conv_desc,
-                                     const window_sched_desc_t& sched,
-                                     u16_t out_row) {
+static void generate_conv_window_row(
+    const tensor_desc_t& src,
+    hls::stream<act_vec_t>& act_stream0,
+    hls::stream<act_vec_t>& act_stream1,
+    hls::stream<conv_cfg_t>& sa_cfg_stream,
+    hls::stream<u8_t>& sa_sched_flags_stream,
+    const conv_cfg_t& cfg,
+    const window_sched_desc_t& sched,
+    u16_t out_row) {
 #pragma HLS INLINE off
   sa_cfg_stream.write(cfg);
   sa_sched_flags_stream.write(sched.flags);
-  scheduled_window_generator_row(src, conv_desc, sched, act_stream0, act_stream1, out_row);
+  scheduled_window_generator_row(src, sched, act_stream0, act_stream1, out_row);
 }
 
-static void shared_conv_row_engine(const tensor_desc_t& src,
-                                   const conv_cfg_t& cfg,
-                                   const conv_exec_desc_t& conv_desc,
-                                   const window_sched_desc_t& sched,
-                                   u8_t act_type,
-                                   const conv_q_t& qparam,
-                                   u16_t out_row,
-                                   act_vec_t row_buf[MAX_FM_W],
-                                   const wgt_vec_t weight_buf[TM][MAX_K_TILE_COUNT]) {
+static void shared_conv_row_engine(
+    const tensor_desc_t& src,
+    const conv_cfg_t& cfg,
+    const window_sched_desc_t& sched,
+    u8_t act_type,
+    const conv_q_t& qparam,
+    u16_t out_row,
+    act_vec_t row_buf[MAX_FM_W],
+    const wgt_vec_t weight_buf[TM][MAX_K_TILE_COUNT]) {
 #pragma HLS INLINE off
   hls::stream<act_vec_t> act_stream0;
   hls::stream<act_vec_t> act_stream1;
   hls::stream<psum_half_vec_t> psum_stream;
   hls::stream<conv_cfg_t> sa_cfg_stream;
   hls::stream<u8_t> sa_sched_flags_stream;
-#pragma HLS STREAM variable=act_stream0 depth=64
-#pragma HLS STREAM variable=act_stream1 depth=64
-#pragma HLS STREAM variable=psum_stream depth=16
+#pragma HLS STREAM variable=act_stream0 depth=40
+#pragma HLS STREAM variable=act_stream1 depth=8
+#pragma HLS STREAM variable=psum_stream depth=8
 #pragma HLS STREAM variable=sa_cfg_stream depth=2
 #pragma HLS STREAM variable=sa_sched_flags_stream depth=2
-#pragma HLS BIND_STORAGE variable=act_stream0 type=fifo impl=bram
-#pragma HLS BIND_STORAGE variable=act_stream1 type=fifo impl=bram
-#pragma HLS BIND_STORAGE variable=psum_stream type=fifo impl=bram
+#pragma HLS BIND_STORAGE variable=act_stream0 type=fifo impl=lutram
+#pragma HLS BIND_STORAGE variable=act_stream1 type=fifo impl=lutram
+#pragma HLS BIND_STORAGE variable=psum_stream type=fifo impl=lutram
 #pragma HLS DATAFLOW
   generate_conv_window_row(src,
                            act_stream0,
@@ -336,7 +340,6 @@ static void shared_conv_row_engine(const tensor_desc_t& src,
                            sa_cfg_stream,
                            sa_sched_flags_stream,
                            cfg,
-                           conv_desc,
                            sched,
                            out_row);
   systolic_array_core_row(act_stream0,
@@ -345,7 +348,48 @@ static void shared_conv_row_engine(const tensor_desc_t& src,
                           psum_stream,
                           sa_cfg_stream,
                           sa_sched_flags_stream);
-  post_process_row_to_buffer(psum_stream, row_buf, cfg, sched, act_type, qparam);
+  post_process_conv_row_to_buffer(psum_stream, row_buf, cfg, sched, act_type, qparam);
+}
+
+static void replay_conv_row_to_stream(const act_vec_t row_buf[MAX_FM_W],
+                                      const conv_cfg_t& cfg,
+                                      hls::stream<act_vec_t>& conv_stream) {
+#pragma HLS INLINE off
+  const u16_t out_w = conv_out_dim(cfg.in_w, conv_effective_stride(cfg));
+  const int out_w_i = static_cast<int>(out_w.to_uint());
+  for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
+#pragma HLS PIPELINE II=1
+    if (ow_i >= out_w_i) {
+      break;
+    }
+    conv_stream.write(row_buf[ow_i]);
+  }
+}
+
+static void consume_compact_conv_row(const row_consumer_desc_t& consumer,
+                                     const tensor_desc_t& dst,
+                                     const tensor_desc_t& add_other,
+                                     bool has_add_other,
+                                     const add_q_t& add_qparam,
+                                     const conv_cfg_t& cfg,
+                                     u16_t out_row,
+                                     const act_vec_t row_buf[MAX_FM_W],
+                                     u8_t& status) {
+#pragma HLS INLINE off
+  hls::stream<act_vec_t> conv_stream;
+#pragma HLS STREAM variable=conv_stream depth=16
+#pragma HLS BIND_STORAGE variable=conv_stream type=fifo impl=lutram
+#pragma HLS DATAFLOW
+  replay_conv_row_to_stream(row_buf, cfg, conv_stream);
+  ppu_consume_conv_stream(consumer,
+                          dst,
+                          add_other,
+                          has_add_other,
+                          add_qparam,
+                          cfg,
+                          out_row,
+                          conv_stream,
+                          status);
 }
 
 static void load_conv_weight_buffer(const conv_exec_desc_t& conv_desc,
@@ -374,6 +418,7 @@ static bool run_conv_rows_task(const conv_rows_task_t& task,
 #pragma HLS BIND_STORAGE variable=s_shared_conv_row_buf type=ram_2p impl=bram
 #pragma HLS ARRAY_PARTITION variable=s_shared_weight_buf cyclic factor=16 dim=1
 #pragma HLS BIND_STORAGE variable=s_shared_weight_buf type=ram_2p impl=bram
+#pragma HLS RESET variable=s_shared_weight_buf off
   npu_profile_set_stage(prof_stage_id, PROF_STAGE_CONV_WEIGHT_LOAD);
   load_conv_weight_buffer(task.conv_desc, s_shared_weight_buf);
 
@@ -382,6 +427,11 @@ static bool run_conv_rows_task(const conv_rows_task_t& task,
   }
 
   bool write_ok = true;
+  const unsigned consumer_mode = task.consumer.mode.to_uint();
+  const bool compact_consumer_enabled =
+      !task.block5_finalize &&
+      (consumer_mode == static_cast<unsigned>(ROW_CONSUMER_NONE) ||
+       consumer_mode == static_cast<unsigned>(ROW_CONSUMER_CAT_AFFINE_STORE));
   const int row_count_i = static_cast<int>(task.row_count.to_uint());
   for (int oh_i = 0; oh_i < MAX_FM_H; ++oh_i) {
     if (oh_i >= row_count_i) {
@@ -394,7 +444,6 @@ static bool run_conv_rows_task(const conv_rows_task_t& task,
     npu_profile_set_stage(prof_stage_id, PROF_STAGE_CONV_ROW_DATAPATH);
     shared_conv_row_engine(task.src,
                            task.cfg,
-                           task.conv_desc,
                            task.sched,
                            conv_act_type_from_flags(task.conv_desc.flags),
                            task.qparam,
@@ -404,13 +453,27 @@ static bool run_conv_rows_task(const conv_rows_task_t& task,
     if (!csim_dump_u40_prestore_row(task.conv_desc, conv_row, task.cfg, s_shared_conv_row_buf)) {
       write_ok = false;
     }
+    if (compact_consumer_enabled) {
+      npu_profile_set_stage(prof_stage_id, PROF_STAGE_PPU_ROW_CONSUME);
+      u8_t compact_status = 0;
+      consume_compact_conv_row(task.consumer,
+                               task.dst,
+                               task.add_other,
+                               task.has_add_other,
+                               task.add_qparam,
+                               task.cfg,
+                               consumer_row,
+                               s_shared_conv_row_buf,
+                               compact_status);
+      if (compact_status.to_uint() == 0U) {
+        write_ok = false;
+      }
+      continue;
+    }
     npu_profile_set_stage(prof_stage_id,
                           task.block5_finalize ? PROF_STAGE_PPU_BLOCK5_FINAL
                                                 : PROF_STAGE_PPU_ROW_CONSUME);
-    const bool normal_preadd =
-        task.has_add_other &&
-        task.consumer.mode.to_uint() == static_cast<unsigned>(ROW_CONSUMER_NONE);
-    const bool preadd_enable = task.block5_finalize || normal_preadd;
+    const bool preadd_enable = task.block5_finalize;
     bool preadd_ok = true;
     if (preadd_enable) {
       const tensor_desc_t& preadd_other =
@@ -431,31 +494,27 @@ static bool run_conv_rows_task(const conv_rows_task_t& task,
         write_ok = false;
       }
     }
-    const bool ppu_ok =
-        preadd_ok &&
-        (task.block5_finalize
-            ? ppu_consume_block5_final_row(task.block5_sched,
-                                           task.block5_scratch0,
-                                           task.block5_scratch1,
-                                           task.block5_scratch2,
-                                           task.block5_scratch3,
-                                           task.block5_residual,
-                                           task.block5_final_dst,
-                                           task.block5_has_residual,
-                                           task.block5_residual_add_qparam,
-                                           task.cfg,
-                                           task.block5_act_type,
-                                           consumer_row,
-                                           conv_row,
-                                           s_shared_conv_row_buf)
-            : ppu_consume_conv_row(task.consumer,
-                                   task.dst,
-                                   task.add_other,
-                                   task.has_add_other,
-                                   task.cfg,
-                                   gmem_frame_out,
-                                   consumer_row,
-                                   s_shared_conv_row_buf));
+    bool ppu_ok = false;
+    if (preadd_ok && task.block5_finalize) {
+      ppu_ok = ppu_consume_block5_final_row(task.block5_sched,
+                                            task.block5_scratch0,
+                                            task.block5_scratch1,
+                                            task.block5_scratch2,
+                                            task.block5_scratch3,
+                                            task.block5_residual,
+                                            task.block5_final_dst,
+                                            task.block5_has_residual,
+                                            task.block5_residual_add_qparam,
+                                            task.cfg,
+                                            task.block5_act_type,
+                                            consumer_row,
+                                            conv_row,
+                                            s_shared_conv_row_buf);
+    } else if (preadd_ok &&
+               consumer_mode == static_cast<unsigned>(ROW_CONSUMER_UPSAMPLE_OUT)) {
+      ppu_ok = ppu_consume_upsample_row(
+          gmem_frame_out, consumer_row, s_shared_conv_row_buf);
+    }
     if (!ppu_ok) {
       write_ok = false;
     }

@@ -354,9 +354,12 @@ static bool avgpool_c3_group32_pack_write(const tensor_desc_t& src,
 
     const i32_t base_h = static_cast<i32_t>(oh_i) * 2 - 1;
     const i32_t base_w = static_cast<i32_t>(ow_start) * 2 - 1;
-    if (!read_c3_group_cache_row(src, base_h + 0, base_w, row0, byte0, left0, valid0) ||
-        !read_c3_group_cache_row(src, base_h + 1, base_w, row1, byte1, left1, valid1) ||
-        !read_c3_group_cache_row(src, base_h + 2, base_w, row2, byte2, left2, valid2)) {
+    if (!read_c3_group_cache_row(
+            src, base_h + 0, base_w, row0, byte0, left0, valid0) ||
+        !read_c3_group_cache_row(
+            src, base_h + 1, base_w, row1, byte1, left1, valid1) ||
+        !read_c3_group_cache_row(
+            src, base_h + 2, base_w, row2, byte2, left2, valid2)) {
         return false;
     }
 

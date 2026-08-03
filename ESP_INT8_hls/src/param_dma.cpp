@@ -365,11 +365,58 @@ static window_sched_desc_t load_window_sched_desc(const axi_vec_t* gmem_param, u
 #pragma HLS PIPELINE off
         desc.kt_cmd_base[i] = read_u16_le(gmem_param, offset + 18 + i * 2);
     }
-    for (int i = 0; i < 14; ++i) {
+    desc.loader_class = read_u8(gmem_param, offset + 100);
+    desc.loader_request_cols = read_u8(gmem_param, offset + 101);
+    desc.loader_warmup_issues = read_u8(gmem_param, offset + 102);
+    desc.loader_warmup_new_cols = read_u8(gmem_param, offset + 103);
+    desc.loader_steady_new_cols = read_u8(gmem_param, offset + 104);
+    desc.loader_words_per_col = read_u8(gmem_param, offset + 105);
+    desc.loader_warmup_mask = read_u8(gmem_param, offset + 106);
+    desc.loader_steady_mask = read_u8(gmem_param, offset + 107);
+    for (int i = 0; i < WINDOW_LOADER_RESERVED_WORDS; ++i) {
 #pragma HLS PIPELINE off
-        desc.reserved[i] = read_u16_le(gmem_param, offset + 100 + i * 2);
+        desc.reserved[i] = read_u16_le(gmem_param, offset + 108 + i * 2);
     }
     return desc;
+}
+
+static bool window_row_reuse_contract_valid(
+    const window_sched_desc_t& desc) {
+#pragma HLS INLINE
+    const unsigned word =
+        desc.reserved[WINDOW_LOADER_ROW_REUSE_WORD].to_uint();
+    const unsigned reuse_mode = word & WINDOW_ROW_REUSE_MODE_MASK;
+    const unsigned packed_words =
+        (word >> WINDOW_ROW_REUSE_WORDS_SHIFT) &
+        WINDOW_ROW_REUSE_WORDS_MASK;
+    if ((word >> WINDOW_ROW_REUSE_RESERVED_SHIFT) != 0U) {
+        return false;
+    }
+    if (reuse_mode == static_cast<unsigned>(WINDOW_ROW_REUSE_NONE)) {
+        return packed_words == 0U;
+    }
+    const bool common =
+        desc.kernel.to_uint() == 3U &&
+        desc.dilation.to_uint() == 1U &&
+        desc.loader_class.to_uint() ==
+            static_cast<unsigned>(WIN_LOADER_3X3_NARROW) &&
+        (desc.flags.to_uint() &
+         static_cast<unsigned>(WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)) != 0U &&
+        packed_words == static_cast<unsigned>(WINGEN_NARROW_ROW_WORDS);
+    if (!common) {
+        return false;
+    }
+    if (reuse_mode ==
+        static_cast<unsigned>(WINDOW_ROW_REUSE_STRIDE1_KEEP2)) {
+        return desc.in_c.to_uint() == 12U &&
+               desc.stride.to_uint() == 1U;
+    }
+    if (reuse_mode ==
+        static_cast<unsigned>(WINDOW_ROW_REUSE_STRIDE2_KEEP1)) {
+        return desc.in_c.to_uint() == 3U &&
+               desc.stride.to_uint() == 2U;
+    }
+    return false;
 }
 
 static conv_exec_desc_t load_conv_exec_desc(const axi_vec_t* gmem_param, u32_t offset) {
@@ -691,7 +738,7 @@ bool param_dma_get_window_sched(u8_t id, window_sched_desc_t& desc) {
         return false;
     }
     desc = s_window_sched_desc[idx];
-    return true;
+    return window_row_reuse_contract_valid(desc);
 }
 
 bool param_dma_get_row_consumer(u8_t id, row_consumer_desc_t& desc) {

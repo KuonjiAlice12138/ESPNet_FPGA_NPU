@@ -267,19 +267,18 @@ int main() {
               mismatches,
               golden_mask.size(),
               invalid_labels);
-  static constexpr int MAX_ALLOWED_MASK_MISMATCHES_NEW = 4096;
-  if (mismatches > MAX_ALLOWED_MASK_MISMATCHES_NEW || invalid_labels != 0) {
-    std::printf("[WARN] fullres mask check: mismatches=%d/%zu threshold=%d invalid=%d\n",
+  if (mismatches > MAX_ALLOWED_MASK_MISMATCHES || invalid_labels != 0) {
+    std::printf("[FAIL] fullres mask check: mismatches=%d/%zu threshold=%d invalid=%d\n",
                 mismatches,
                 golden_mask.size(),
-                MAX_ALLOWED_MASK_MISMATCHES_NEW,
+                MAX_ALLOWED_MASK_MISMATCHES,
                 invalid_labels);
-    std::printf("[INFO] result not meeting threshold but continuing (round-shift fix test)\n");
+    return 1;
   } else {
     std::printf("[PASS] fullres mask mismatches=%d/%zu threshold=%d\n",
                 mismatches,
                 golden_mask.size(),
-                MAX_ALLOWED_MASK_MISMATCHES_NEW);
+                MAX_ALLOWED_MASK_MISMATCHES);
   }
 
   std::printf("top_golden_sample_tb finished: mismatches=%d\n", mismatches);

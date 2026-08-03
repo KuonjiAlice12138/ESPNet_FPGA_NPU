@@ -10,6 +10,10 @@
 #include "xparameters.h"
 #include "xstatus.h"
 
+#if INT8_APP_ENABLE_EXEC_PREFIX_PROFILE && INT8_APP_ENABLE_VAL_SET_TEST
+#error "exec-prefix profiling and validation-set mode are mutually exclusive"
+#endif
+
 static inline u64 read_timer_counter(void)
 {
     u64 val;
@@ -81,6 +85,19 @@ typedef struct {
 static PerfEntry s_perf[32];
 static u32 s_perf_count = 0U;
 
+typedef struct {
+    u32 prefix_index;
+    u32 active_exec_count;
+    u32 new_exec_index;
+    Int8ExecPlanEntry new_exec;
+    u64 arm_ticks;
+    u64 rtl_total;
+    u64 rtl_window;
+    u64 stage[INT8_STAGE_COUNTER_STAGE_COUNT];
+    u32 current_stage;
+    u32 status;
+} ExecPrefixProfile;
+
 static void record_perf_value(const char *tag, u32 stop_after, u64 ticks)
 {
     if (s_perf_count >= 32U) return;
@@ -138,8 +155,85 @@ static int make_val_filename(const char *prefix, u32 index, char *out,
     return XST_SUCCESS;
 }
 
-static int run_full_infer_once(Int8NpuContext *npu, u32 uop_count,
-                               u64 *cycles)
+static int make_exec_prefix_filename(u32 prefix_index, char *out,
+                                     u32 out_size)
+{
+    int n;
+
+    if (out == NULL || out_size == 0U || prefix_index > 99U) {
+        return XST_FAILURE;
+    }
+    n = snprintf(out, out_size, "P%02u.BIN", prefix_index);
+    if (n < 0 || (u32)n >= out_size) {
+        return XST_FAILURE;
+    }
+    return XST_SUCCESS;
+}
+
+static void capture_exec_prefix_profile(ExecPrefixProfile *profile)
+{
+    u32 stage;
+
+    profile->rtl_total = stage_counter_read_total();
+    profile->rtl_window = stage_counter_read_active();
+    for (stage = 0U; stage < INT8_STAGE_COUNTER_STAGE_COUNT; ++stage) {
+        profile->stage[stage] = stage_counter_read_stage(stage);
+    }
+    profile->current_stage = stage_counter_read_current();
+    profile->status = stage_counter_read_status();
+}
+
+static void print_exec_prefix_metadata(const ExecPrefixProfile *profile)
+{
+    xil_printf("P%02u,%u,", profile->prefix_index,
+               profile->active_exec_count);
+    if (profile->active_exec_count == 0U) {
+        xil_printf("NA,NA,NA");
+    } else {
+        xil_printf("%u,%u,%u", profile->new_exec_index,
+                   profile->new_exec.logical_uop_id,
+                   profile->new_exec.kind);
+    }
+}
+
+static void print_csv_delta(u64 current, u64 previous)
+{
+    if (current >= previous) {
+        xil_printf(",%llu", current - previous);
+    } else {
+        xil_printf(",-%llu", previous - current);
+    }
+}
+
+static void print_exec_prefix_rows(const ExecPrefixProfile *current,
+                                   const ExecPrefixProfile *previous)
+{
+    u32 stage;
+
+    xil_printf("PREFIX_CUM,");
+    print_exec_prefix_metadata(current);
+    xil_printf(",%llu,%llu,%llu", current->arm_ticks, current->rtl_total,
+               current->rtl_window);
+    for (stage = 0U; stage < INT8_STAGE_COUNTER_STAGE_COUNT; ++stage) {
+        xil_printf(",%llu", current->stage[stage]);
+    }
+    xil_printf(",0x%08x,0x%08x\r\n", current->current_stage,
+               current->status);
+
+    xil_printf("PREFIX_DELTA,");
+    print_exec_prefix_metadata(current);
+    print_csv_delta(current->arm_ticks, previous->arm_ticks);
+    print_csv_delta(current->rtl_total, previous->rtl_total);
+    print_csv_delta(current->rtl_window, previous->rtl_window);
+    for (stage = 0U; stage < INT8_STAGE_COUNTER_STAGE_COUNT; ++stage) {
+        print_csv_delta(current->stage[stage], previous->stage[stage]);
+    }
+    xil_printf(",0x%08x,0x%08x\r\n", current->current_stage,
+               current->status);
+}
+
+static int run_infer_once(Int8NpuContext *npu, u32 uop_count,
+                          u64 *cycles, u32 dump_stage_csv)
 {
     u64 start;
     u64 end;
@@ -169,8 +263,187 @@ static int run_full_infer_once(Int8NpuContext *npu, u32 uop_count,
     if (cycles != NULL) {
         *cycles = (end >= start) ? (end - start) : 0ULL;
     }
-    stage_counter_dump_csv();
+    if (dump_stage_csv != 0U) {
+        stage_counter_dump_csv();
+    }
     return XST_SUCCESS;
+}
+
+static int run_full_infer_once(Int8NpuContext *npu, u32 uop_count,
+                               u64 *cycles)
+{
+    return run_infer_once(npu, uop_count, cycles, 1U);
+}
+
+static int run_exec_prefix_profile(Int8NpuContext *npu)
+{
+    ExecPrefixProfile current;
+    ExecPrefixProfile previous;
+    Int8ParamBlobHeader header;
+    Int8ExecPlanEntry entry;
+    char param_file[16];
+    u32 expected_param_size = 0U;
+    u32 input_size = 0U;
+    u32 param_size;
+    u32 prefix_index;
+    u32 performance_gate_failed = 0U;
+
+    memset(&previous, 0, sizeof(previous));
+    if (SD_LoadFileToMemory(INT8_APP_SINGLE_PERF_INPUT_FILE,
+                            (UINTPTR)g_input, INT8_INPUT_BYTES,
+                            &input_size) != XST_SUCCESS ||
+        input_size != INT8_INPUT_BYTES) {
+        xil_printf("APP: prefix input load failed, size=%u expected=%u\r\n",
+                   input_size, INT8_INPUT_BYTES);
+        return XST_FAILURE;
+    }
+
+    xil_printf("APP: exec-prefix profiling files=P00.BIN..P15.BIN\r\n");
+    xil_printf("EXEC_PREFIX_CYCLES_BEGIN\r\n");
+    xil_printf("record,prefix,active_execs,new_exec_index,logical_uop,kind,"
+               "arm_ticks,rtl_total,rtl_window,"
+               "s0_idle,s1_param,s2_frame,s3_ctrl,s4_wgt,s5_conv,s6_ppu,"
+               "s7_b5,s8_vec,s9_pool,s10_up,s11_store,s12_error,"
+               "current,status\r\n");
+
+    for (prefix_index = 0U;
+         prefix_index < INT8_APP_EXEC_PREFIX_COUNT;
+         ++prefix_index) {
+        u32 i;
+
+        if (make_exec_prefix_filename(prefix_index, param_file,
+                                      sizeof(param_file)) != XST_SUCCESS) {
+            xil_printf("APP: bad prefix filename index=%u\r\n",
+                       prefix_index);
+            return XST_FAILURE;
+        }
+        param_size = 0U;
+        if (SD_LoadFileToMemory(param_file, (UINTPTR)g_param,
+                                INT8_PARAM_HW_MAX_BYTES,
+                                &param_size) != XST_SUCCESS) {
+            xil_printf("APP: prefix param load failed: %s\r\n", param_file);
+            return XST_FAILURE;
+        }
+        if (expected_param_size == 0U) {
+            expected_param_size = param_size;
+        } else if (param_size != expected_param_size) {
+            xil_printf("APP: prefix param size mismatch: %s size=%u expected=%u\r\n",
+                       param_file, param_size, expected_param_size);
+            return XST_FAILURE;
+        }
+        if (int8_npu_read_param_header(g_param, param_size, &header) !=
+                XST_SUCCESS ||
+            int8_npu_validate_param_header(&header, param_size) !=
+                XST_SUCCESS) {
+            xil_printf("APP: prefix param validation failed: %s\r\n",
+                       param_file);
+            return XST_FAILURE;
+        }
+        if (header.exec_plan_count != INT8_APP_EXEC_PREFIX_COUNT) {
+            xil_printf("APP: prefix exec count=%u expected=%u file=%s\r\n",
+                       header.exec_plan_count, INT8_APP_EXEC_PREFIX_COUNT,
+                       param_file);
+            return XST_FAILURE;
+        }
+
+        for (i = 0U; i < prefix_index; ++i) {
+            if (int8_npu_read_exec_plan_entry(g_param, param_size, &header,
+                                              i, &entry) != XST_SUCCESS ||
+                entry.kind == INT8_EXEC_KIND_END) {
+                xil_printf("APP: early END before pc=%u in %s\r\n",
+                           prefix_index, param_file);
+                return XST_FAILURE;
+            }
+        }
+        if (int8_npu_read_exec_plan_entry(g_param, param_size, &header,
+                                          prefix_index, &entry) !=
+                XST_SUCCESS ||
+            entry.kind != INT8_EXEC_KIND_END) {
+            xil_printf("APP: missing END at pc=%u in %s\r\n",
+                       prefix_index, param_file);
+            return XST_FAILURE;
+        }
+
+        memset(&current, 0, sizeof(current));
+        current.prefix_index = prefix_index;
+        current.active_exec_count = prefix_index;
+        if (prefix_index > 0U) {
+            current.new_exec_index = prefix_index - 1U;
+            if (int8_npu_read_exec_plan_entry(
+                    g_param, param_size, &header, current.new_exec_index,
+                    &current.new_exec) != XST_SUCCESS ||
+                current.new_exec.kind == INT8_EXEC_KIND_END) {
+                xil_printf("APP: invalid new exec at pc=%u in %s\r\n",
+                           current.new_exec_index, param_file);
+                return XST_FAILURE;
+            }
+        }
+
+        Xil_DCacheFlushRange((UINTPTR)g_param, param_size);
+        xil_printf("APP: prefix P%02u active=%u init/run\r\n",
+                   prefix_index, prefix_index);
+        if (int8_npu_run_init(npu, (UINTPTR)g_param, header.uop_count,
+                              INT8_NPU_TIMEOUT_POLLS) != XST_SUCCESS) {
+            xil_printf("APP: prefix MODE_INIT failed: %s\r\n", param_file);
+            return XST_FAILURE;
+        }
+        if (run_infer_once(npu, header.uop_count, &current.arm_ticks, 0U) !=
+            XST_SUCCESS) {
+            xil_printf("APP: prefix MODE_RUN failed: %s\r\n", param_file);
+            return XST_FAILURE;
+        }
+        capture_exec_prefix_profile(&current);
+        print_exec_prefix_rows(&current, &previous);
+        if (current.stage[12] != 0ULL || current.current_stage != 0U) {
+            xil_printf("APP: prefix terminal state failed: %s error=%llu current=%u\r\n",
+                       param_file, current.stage[12],
+                       current.current_stage);
+            return XST_FAILURE;
+        }
+        previous = current;
+    }
+    xil_printf("EXEC_PREFIX_CYCLES_END\r\n");
+
+    {
+        const u64 reference =
+            INT8_APP_EXEC_PREFIX_REFERENCE_FULL_RTL_CYCLES;
+        const u64 target =
+            INT8_APP_EXEC_PREFIX_TARGET_MAX_RTL_CYCLES;
+        if (previous.rtl_total <= reference) {
+            const u64 saved = reference - previous.rtl_total;
+            const u64 improvement_ppm =
+                (reference > 0ULL) ?
+                    ((saved * 1000000ULL) / reference) : 0ULL;
+            xil_printf("APP: prefix baseline cycles=%llu reference=%llu "
+                       "saved=%llu improvement_ppm=%llu\r\n",
+                       previous.rtl_total, reference, saved,
+                       improvement_ppm);
+        } else {
+            const u64 regression = previous.rtl_total - reference;
+            const u64 regression_ppm =
+                (reference > 0ULL) ?
+                    ((regression * 1000000ULL) / reference) : 0ULL;
+            xil_printf("APP: prefix baseline cycles=%llu reference=%llu "
+                       "regression=%llu regression_ppm=%llu\r\n",
+                       previous.rtl_total, reference, regression,
+                       regression_ppm);
+        }
+        xil_printf("APP: prefix target cycles=%llu max=%llu %s\r\n",
+                   previous.rtl_total, target,
+                   (previous.rtl_total <= target) ? "PASS" : "FAIL");
+        if (previous.rtl_total > target) {
+            performance_gate_failed = 1U;
+        }
+    }
+
+    if (SD_SaveMemoryToFile(INT8_APP_SINGLE_PERF_OUTPUT_FILE, g_output,
+                            INT8_OUTPUT_BYTES) != XST_SUCCESS) {
+        xil_printf("APP: prefix final output save failed\r\n");
+        return XST_FAILURE;
+    }
+    xil_printf("APP: prefix profiling done, final output=%s\r\n",
+               INT8_APP_SINGLE_PERF_OUTPUT_FILE);
+    return (performance_gate_failed == 0U) ? XST_SUCCESS : XST_FAILURE;
 }
 
 static int run_single_image(Int8NpuContext *npu, u32 uop_count)
@@ -320,8 +593,10 @@ static int run_val_set(Int8NpuContext *npu, u32 uop_count)
 int main(void)
 {
     Int8NpuContext npu;
+#if !INT8_APP_ENABLE_EXEC_PREFIX_PROFILE
     Int8ParamBlobHeader header;
     u32 param_size = 0U;
+#endif
 
     xil_printf("\r\nESP INT8 app %s\r\n", INT8_APP_BUILD_TAG);
     print_addr("input", (UINTPTR)g_input, INT8_INPUT_BYTES);
@@ -333,6 +608,14 @@ int main(void)
         xil_printf("APP: SD init failed\r\n");
         return XST_FAILURE;
     }
+
+    if (int8_npu_init(&npu) != XST_SUCCESS) {
+        return XST_FAILURE;
+    }
+
+#if INT8_APP_ENABLE_EXEC_PREFIX_PROFILE
+    return run_exec_prefix_profile(&npu);
+#else
     if (SD_LoadFileToMemory(INT8_PARAM_FILE, (UINTPTR)g_param,
                             INT8_PARAM_HW_MAX_BYTES,
                             &param_size) != XST_SUCCESS) {
@@ -349,10 +632,6 @@ int main(void)
     }
 
     memset(g_output, 0, sizeof(g_output));
-
-    if (int8_npu_init(&npu) != XST_SUCCESS) {
-        return XST_FAILURE;
-    }
 
     Xil_DCacheFlushRange((UINTPTR)g_param, param_size);
     Xil_DCacheFlushRange((UINTPTR)g_input, INT8_INPUT_BYTES);
@@ -375,5 +654,6 @@ int main(void)
     return run_val_set(&npu, header.uop_count);
 #else
     return run_single_image(&npu, header.uop_count);
+#endif
 #endif
 }

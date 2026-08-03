@@ -82,34 +82,36 @@ def load_golden_nhwc(path: Path) -> np.ndarray:
 
 def prefix_replay_golden_checks(artifact_dir: Path, qat_dir: Path, stop_logical_uop: int) -> Dict[str, object]:
     blob = ParamBlob(artifact_dir / "PARAM.BIN")
-    replay = replay_prefix(blob, artifact_dir / "input_q.bin", stop_logical_uop=stop_logical_uop)
+    input_path = artifact_dir / "input_q.bin"
     golden_dir = qat_dir / "golden_sample"
     checks = {}
+    executed_by_check = {}
+    # PARAM v4 fuses the old U2/U3/U4 Conv/CAT/AFFINE sequence into logical U2,
+    # so the intermediate CAT tensor is intentionally not materialized.
     nodes = [
-        ("U03_B1_CAT", 3, 2, golden_dir / "b1_cat_ff" / "output_int.npy"),
-        ("U04_B1_ACT", 4, 3, golden_dir / "b1_bn" / "output_int.npy"),
+        ("U02_B1_FUSED_ACT", 2, 3, golden_dir / "b1_bn" / "output_int.npy"),
         ("U20_L20_ACT", 20, 5, golden_dir / "level2_0_bn" / "output_int.npy"),
         ("U72_CLASSIFIER", 72, 17, golden_dir / "classifier" / "output_int.npy"),
     ]
     for name, required_stop, tensor_id, golden_path in nodes:
         if required_stop > stop_logical_uop:
             continue
+        # Tensor aliases are intentionally recycled by the compiled P7 plan. Replay
+        # each checkpoint at its own logical boundary instead of reading a stale
+        # tensor ID after the complete network has overwritten that lifetime.
+        replay = replay_prefix(blob, input_path, stop_logical_uop=required_stop)
         got = replay.read_tensor(tensor_id)
+        executed_by_check[name] = replay.executed
         golden = load_golden_nhwc(golden_path)
         record = {
             "tensor_id": tensor_id,
             "golden": str(golden_path),
             **compare_i8_arrays(got, golden),
         }
-        if name == "U03_B1_CAT":
-            record["channel_slices"] = {
-                "level1_conv_relu_c0_15": compare_i8_arrays(got[:, :, :16], golden[:, :, :16]),
-                "pool_b1_c16_18": compare_i8_arrays(got[:, :, 16:19], golden[:, :, 16:19]),
-            }
         checks[name] = record
     return {
         "stop_logical_uop": stop_logical_uop,
-        "executed_logical_uops": replay.executed,
+        "executed_logical_uops_by_check": executed_by_check,
         "checks": checks,
     }
 

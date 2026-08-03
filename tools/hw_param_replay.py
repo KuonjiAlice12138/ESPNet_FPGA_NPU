@@ -21,7 +21,7 @@ import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -41,6 +41,50 @@ SECTION_ALIGN = 64
 FMBUF_BYTES = 0x598000
 FMBUF_URAM_BYTES = 0x380000
 MAX_BLOCK5_SCHED_COUNT = 8
+WINDOW_LOADER_RUN_MAX = 3
+WINDOW_LOADER_RESERVED_WORDS = 10
+
+
+def decode_window_loader_runs(
+    reserved: Sequence[int], *, warmup: bool
+) -> Tuple[Tuple[int, int], ...]:
+    words = tuple(int(value) for value in reserved)
+    if len(words) != WINDOW_LOADER_RESERVED_WORDS:
+        raise ValueError(
+            f"window loader run descriptor has {len(words)} words, "
+            f"expected {WINDOW_LOADER_RESERVED_WORDS}"
+        )
+    count_word = 0 if warmup else 4
+    first_run_word = 1 if warmup else 5
+    run_count = words[count_word]
+    if run_count > WINDOW_LOADER_RUN_MAX:
+        raise ValueError(f"window loader run count exceeds {WINDOW_LOADER_RUN_MAX}: {run_count}")
+    runs: List[Tuple[int, int]] = []
+    for index in range(run_count):
+        word = words[first_run_word + index]
+        start_delta = word & 0xFF
+        if start_delta & 0x80:
+            start_delta -= 0x100
+        count = (word >> 8) & 0xFF
+        if count <= 0:
+            raise ValueError(f"window loader run has zero count: 0x{word:04X}")
+        runs.append((start_delta, count))
+    if any(words[first_run_word + run_count : first_run_word + WINDOW_LOADER_RUN_MAX]):
+        raise ValueError("window loader unused run words must be zero")
+    return tuple(runs)
+
+
+def decode_window_loader_phase_split(
+    reserved: Sequence[int], *, warmup: bool
+) -> int:
+    words = tuple(int(value) for value in reserved)
+    if len(words) != WINDOW_LOADER_RESERVED_WORDS:
+        raise ValueError(
+            f"window loader run descriptor has {len(words)} words, "
+            f"expected {WINDOW_LOADER_RESERVED_WORDS}"
+        )
+    word = words[8]
+    return (word & 0xFF) if warmup else ((word >> 8) & 0xFF)
 
 # ── enums ──────────────────────────────────────────────────
 UOP_NOP, UOP_LOAD_FM, UOP_CONV, UOP_POOL = 0, 1, 2, 3
@@ -55,6 +99,7 @@ REMOVED_P6_EXEC_KINDS = {3, 4, 5}
 FIXED_FLAG_BLOCK5_AFFINE = 1 << 0
 FIXED_FLAG_BLOCK5_ADD_AFFINE = 1 << 1
 FIXED_FLAG_BLOCK5_ROW_GROUP = 1 << 2
+FIXED_FLAG_CBLOCK_MAJOR = 1 << 3
 FIXED_FLAG_ROW_CONTIGUOUS_STORE = 1 << 7
 
 BLOCK5_ADD_TENSOR_NONE = 0xFF
@@ -82,6 +127,41 @@ WIN_MODE_3X3_STAGED_C131 = 8
 WIN_MODE_3X3_STAGED_C28 = 9
 WIN_MODE_3X3_STAGED_C64 = 10
 WIN_MODE_3X3_STAGED_C128 = 11
+
+WIN_LOADER_3X3_NARROW = 1
+WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2 = 1 << 0
+WINDOW_LOADER_ROW_REUSE_WORD = 9
+WINDOW_ROW_REUSE_NONE = 0
+WINDOW_ROW_REUSE_STRIDE1_KEEP2 = 1
+WINDOW_ROW_REUSE_STRIDE2_KEEP1 = 2
+WINDOW_ROW_REUSE_MODE_MASK = 0x3
+WINDOW_ROW_REUSE_WORDS_SHIFT = 2
+WINDOW_ROW_REUSE_WORDS_MASK = 0x7F
+WINDOW_ROW_REUSE_RESERVED_SHIFT = 9
+
+
+def window_row_reuse_contract_valid(desc: "WindowSchedDesc") -> bool:
+    word = desc.reserved[WINDOW_LOADER_ROW_REUSE_WORD]
+    if word >> WINDOW_ROW_REUSE_RESERVED_SHIFT:
+        return False
+    mode = desc.row_reuse_mode
+    words = desc.packed_words_per_source_row
+    if mode == WINDOW_ROW_REUSE_NONE:
+        return words == 0
+    common = (
+        desc.kernel == 3
+        and desc.dilation == 1
+        and desc.loader_class == WIN_LOADER_3X3_NARROW
+        and bool(desc.flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
+        and words == 96
+    )
+    if not common:
+        return False
+    if mode == WINDOW_ROW_REUSE_STRIDE1_KEEP2:
+        return desc.in_c == 12 and desc.stride == 1
+    if mode == WINDOW_ROW_REUSE_STRIDE2_KEEP1:
+        return desc.in_c == 3 and desc.stride == 2
+    return False
 STAGED_3X3_MODES = {
     WIN_MODE_3X3_STAGED_C3,
     WIN_MODE_3X3_STAGED_C12,
@@ -154,9 +234,38 @@ class WindowSchedDesc:
     cmd_base: int = 0
     cmd_count: int = 0
     kt_cmd_base: List[int] = None
+    loader_class: int = 0
+    loader_request_cols: int = 0
+    loader_warmup_issues: int = 0
+    loader_warmup_new_cols: int = 0
+    loader_steady_new_cols: int = 0
+    loader_words_per_col: int = 0
+    loader_warmup_mask: int = 0
+    loader_steady_mask: int = 0
+    reserved: List[int] = None
     def __post_init__(self):
         if self.kt_cmd_base is None:
             self.kt_cmd_base = []
+        if self.reserved is None:
+            self.reserved = []
+
+    @property
+    def row_reuse_mode(self) -> int:
+        if len(self.reserved) <= WINDOW_LOADER_ROW_REUSE_WORD:
+            return WINDOW_ROW_REUSE_NONE
+        return (
+            self.reserved[WINDOW_LOADER_ROW_REUSE_WORD]
+            & WINDOW_ROW_REUSE_MODE_MASK
+        )
+
+    @property
+    def packed_words_per_source_row(self) -> int:
+        if len(self.reserved) <= WINDOW_LOADER_ROW_REUSE_WORD:
+            return 0
+        return (
+            self.reserved[WINDOW_LOADER_ROW_REUSE_WORD]
+            >> WINDOW_ROW_REUSE_WORDS_SHIFT
+        ) & WINDOW_ROW_REUSE_WORDS_MASK
 
 
 @dataclass
@@ -181,6 +290,7 @@ class ConvExecDesc:
     k_tiles: int = 0
     weight_words: int = 0
     flags: int = 0
+    reserved: int = 0
 
 
 @dataclass
@@ -434,6 +544,7 @@ class ParamBlob:
                 packed_weight_word_offset=self._u32(bo + 22),
                 k_tiles=self._u16(bo + 26), weight_words=self._u16(bo + 28),
                 flags=self._u16(bo + 30),
+                reserved=self._u16(bo + 32),
             )
             self.conv_exec[desc.param_id] = desc
             self.conv_exec_by_index.append(desc)
@@ -456,7 +567,22 @@ class ParamBlob:
                 k_tiles=self._u16(bo + 12),
                 cmd_base=self._u16(bo + 14), cmd_count=self._u16(bo + 16),
                 kt_cmd_base=kt_bases,
+                loader_class=self._u8(bo + 100),
+                loader_request_cols=self._u8(bo + 101),
+                loader_warmup_issues=self._u8(bo + 102),
+                loader_warmup_new_cols=self._u8(bo + 103),
+                loader_steady_new_cols=self._u8(bo + 104),
+                loader_words_per_col=self._u8(bo + 105),
+                loader_warmup_mask=self._u8(bo + 106),
+                loader_steady_mask=self._u8(bo + 107),
+                reserved=[self._u16(bo + 108 + j * 2) for j in range(10)],
             )
+            if not window_row_reuse_contract_valid(desc):
+                raise ValueError(
+                    f"window_sched[{i}] has invalid row-reuse contract: "
+                    f"mode={desc.row_reuse_mode} "
+                    f"words={desc.packed_words_per_source_row}"
+                )
             self.window_sched[i] = desc
             self.window_sched_by_index.append(desc)
         # Read window pack commands
