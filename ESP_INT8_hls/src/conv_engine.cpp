@@ -63,6 +63,7 @@ bool ppu_preadd_row(const tensor_desc_t& other,
                     act_vec_t row_buf[MAX_FM_W]);
 bool ppu_consume_upsample_row(axi_vec_t* gmem_frame_out,
                               u16_t out_row,
+                              u8_t valid_c,
                               const act_vec_t row_buf[MAX_FM_W]);
 void ppu_consume_conv_stream(const row_consumer_desc_t& consumer,
                              const tensor_desc_t& dst,
@@ -513,7 +514,10 @@ static bool run_conv_rows_task(const conv_rows_task_t& task,
     } else if (preadd_ok &&
                consumer_mode == static_cast<unsigned>(ROW_CONSUMER_UPSAMPLE_OUT)) {
       ppu_ok = ppu_consume_upsample_row(
-          gmem_frame_out, consumer_row, s_shared_conv_row_buf);
+          gmem_frame_out,
+          consumer_row,
+          static_cast<u8_t>(task.consumer.valid_c.to_uint()),
+          s_shared_conv_row_buf);
     }
     if (!ppu_ok) {
       write_ok = false;
@@ -586,7 +590,9 @@ static bool build_normal_conv_task(const conv_issue_t& issue,
   }
 
   if (emit_fullres_mask) {
-    if (cfg.out_c.to_uint() != static_cast<unsigned>(ENCODER_OUT_C) ||
+    if (cfg.out_c.to_uint() < 2U ||
+        cfg.out_c.to_uint() > static_cast<unsigned>(MAX_CLASS_C) ||
+        cfg.out_c.to_uint() != consumer.valid_c.to_uint() ||
         out_h.to_uint() != static_cast<unsigned>(ENCODER_OUT_H) ||
         out_w.to_uint() != static_cast<unsigned>(ENCODER_OUT_W)) {
       return false;

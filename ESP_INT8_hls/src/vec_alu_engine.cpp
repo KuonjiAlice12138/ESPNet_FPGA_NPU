@@ -38,26 +38,6 @@ bool read_b2_backup_src1_tile(u16_t h,
 static axi_vec_t s_shared_row_contig_words[ROW_CONTIG_MAX_WORDS];
 static bool s_shared_b2_src1_saved[MAX_FM_H];
 
-static i8_t vec_get_act_i8_dynamic(const act_vec_t& word, int lane) {
-#pragma HLS INLINE
-  const u8_t raw = word.range(lane * 8 + 7, lane * 8);
-  i8_t value = 0;
-  value.range(7, 0) = raw;
-  return value;
-}
-
-static void vec_pack_i8_lanes(const i8_t lanes[TM], act_vec_t& word) {
-#pragma HLS INLINE
-#pragma HLS ARRAY_PARTITION variable=lanes complete dim=1
-  word = 0;
-  for (int lane = 0; lane < TM; ++lane) {
-#pragma HLS UNROLL
-    u8_t raw = 0;
-    raw.range(7, 0) = lanes[lane].range(7, 0);
-    word.range(lane * 8 + 7, lane * 8) = raw;
-  }
-}
-
 constexpr int VEC_AFF_HALF_LANES = TM / 2;
 constexpr int VEC_AFF_HALF_COUNT = TM / VEC_AFF_HALF_LANES;
 constexpr int VEC_AFF_RESIDENT_BLOCKS = MAX_C_TILE_COUNT;
@@ -514,6 +494,8 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
 #pragma HLS INLINE off
 #pragma HLS BIND_STORAGE variable=s_shared_row_contig_words type=ram_2p impl=bram
 #pragma HLS BIND_STORAGE variable=s_shared_b2_src1_saved type=ram_2p impl=bram
+#pragma HLS RESET variable=s_shared_row_contig_words off
+#pragma HLS RESET variable=s_shared_b2_src1_saved off
   if (row_contiguous) {
     if (!conv_store_row_contiguous_plan_ok(dst, desc.in_w, desc.valid_c)) {
       return ERR_BANK_OVERFLOW;

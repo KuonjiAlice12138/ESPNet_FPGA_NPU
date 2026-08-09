@@ -275,6 +275,34 @@ static int run_full_infer_once(Int8NpuContext *npu, u32 uop_count,
     return run_infer_once(npu, uop_count, cycles, 1U);
 }
 
+static int validate_output_classes(void)
+{
+    u32 class_counts[INT8_APP_EXPECTED_CLASS_COUNT];
+    u32 invalid_count = 0U;
+    u32 i;
+
+    memset(class_counts, 0, sizeof(class_counts));
+    for (i = 0U; i < INT8_OUTPUT_BYTES; ++i) {
+        const u32 class_id = (u32)g_output[i];
+        if (class_id < INT8_APP_EXPECTED_CLASS_COUNT) {
+            ++class_counts[class_id];
+        } else {
+            ++invalid_count;
+        }
+    }
+
+    xil_printf("APP: output profile=%s classes=%u invalid=%u\r\n",
+               INT8_APP_DEPLOYMENT_NAME,
+               INT8_APP_EXPECTED_CLASS_COUNT,
+               invalid_count);
+    xil_printf("APP: output class histogram");
+    for (i = 0U; i < INT8_APP_EXPECTED_CLASS_COUNT; ++i) {
+        xil_printf(" c%u=%u", i, class_counts[i]);
+    }
+    xil_printf("\r\n");
+    return (invalid_count == 0U) ? XST_SUCCESS : XST_FAILURE;
+}
+
 static int run_exec_prefix_profile(Int8NpuContext *npu)
 {
     ExecPrefixProfile current;
@@ -409,7 +437,10 @@ static int run_exec_prefix_profile(Int8NpuContext *npu)
             INT8_APP_EXEC_PREFIX_REFERENCE_FULL_RTL_CYCLES;
         const u64 target =
             INT8_APP_EXEC_PREFIX_TARGET_MAX_RTL_CYCLES;
-        if (previous.rtl_total <= reference) {
+        if (reference == 0ULL) {
+            xil_printf("APP: prefix baseline cycles=%llu reference=UNSET\r\n",
+                       previous.rtl_total);
+        } else if (previous.rtl_total <= reference) {
             const u64 saved = reference - previous.rtl_total;
             const u64 improvement_ppm =
                 (reference > 0ULL) ?
@@ -428,12 +459,22 @@ static int run_exec_prefix_profile(Int8NpuContext *npu)
                        previous.rtl_total, reference, regression,
                        regression_ppm);
         }
-        xil_printf("APP: prefix target cycles=%llu max=%llu %s\r\n",
-                   previous.rtl_total, target,
-                   (previous.rtl_total <= target) ? "PASS" : "FAIL");
-        if (previous.rtl_total > target) {
+        if (target == 0ULL) {
+            xil_printf("APP: prefix target cycles=%llu max=UNSET INFO\r\n",
+                       previous.rtl_total);
+        } else {
+            xil_printf("APP: prefix target cycles=%llu max=%llu %s\r\n",
+                       previous.rtl_total, target,
+                       (previous.rtl_total <= target) ? "PASS" : "FAIL");
+        }
+        if (target != 0ULL && previous.rtl_total > target) {
             performance_gate_failed = 1U;
         }
+    }
+
+    if (validate_output_classes() != XST_SUCCESS) {
+        xil_printf("APP: prefix final output class validation failed\r\n");
+        return XST_FAILURE;
     }
 
     if (SD_SaveMemoryToFile(INT8_APP_SINGLE_PERF_OUTPUT_FILE, g_output,

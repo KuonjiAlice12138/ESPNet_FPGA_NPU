@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <string>
 #include <vector>
 
 namespace esp_int8 {
@@ -12,6 +13,10 @@ bool param_dma_ready();
 unsigned csim_last_uop();
 unsigned csim_last_error();
 }
+
+#ifndef ESP_INT8_CSIM_CLASS_COUNT
+#define ESP_INT8_CSIM_CLASS_COUNT 2
+#endif
 
 static bool read_binary(const char* path, std::vector<std::uint8_t>& bytes) {
   std::ifstream in(path, std::ios::binary);
@@ -89,17 +94,21 @@ static void bilinear_axis_map(int out_idx,
   w0 = 16 - w1;
 }
 
-static int logit_diff_at(const std::vector<std::uint8_t>& logits_nhwc, int row, int col) {
+static int logit_at(const std::vector<std::uint8_t>& logits_nhwc,
+                    int row,
+                    int col,
+                    int class_id,
+                    int class_count) {
   const std::size_t off =
       (static_cast<std::size_t>(row) * esp_int8::ENCODER_OUT_W +
        static_cast<std::size_t>(col)) *
-      2U;
-  return static_cast<int>(as_i8(logits_nhwc[off])) -
-         static_cast<int>(as_i8(logits_nhwc[off + 1U]));
+      static_cast<std::size_t>(class_count);
+  return static_cast<int>(as_i8(logits_nhwc[off + static_cast<std::size_t>(class_id)]));
 }
 
 static std::vector<std::uint8_t> make_fullres_mask_golden(
-    const std::vector<std::uint8_t>& logits_nhwc) {
+    const std::vector<std::uint8_t>& logits_nhwc,
+    int class_count) {
   std::vector<std::uint8_t> mask(esp_int8::FULLRES_MASK_BYTES, 0);
   for (int y = 0; y < esp_int8::FULLRES_MASK_H; ++y) {
     int y0 = 0;
@@ -114,13 +123,21 @@ static std::vector<std::uint8_t> make_fullres_mask_golden(
       int wx1 = 0;
       bilinear_axis_map(x, esp_int8::ENCODER_OUT_W, x0, x1, wx0, wx1);
 
-      const int top = logit_diff_at(logits_nhwc, y0, x0) * wx0 +
-                      logit_diff_at(logits_nhwc, y0, x1) * wx1;
-      const int bottom = logit_diff_at(logits_nhwc, y1, x0) * wx0 +
-                         logit_diff_at(logits_nhwc, y1, x1) * wx1;
-      const int interp = top * wy0 + bottom * wy1;
+      int best_value = -0x7fffffff;
+      std::uint8_t best_class = 0;
+      for (int class_id = 0; class_id < class_count; ++class_id) {
+        const int top = logit_at(logits_nhwc, y0, x0, class_id, class_count) * wx0 +
+                        logit_at(logits_nhwc, y0, x1, class_id, class_count) * wx1;
+        const int bottom = logit_at(logits_nhwc, y1, x0, class_id, class_count) * wx0 +
+                           logit_at(logits_nhwc, y1, x1, class_id, class_count) * wx1;
+        const int interp = top * wy0 + bottom * wy1;
+        if (interp > best_value) {
+          best_value = interp;
+          best_class = static_cast<std::uint8_t>(class_id);
+        }
+      }
       mask[static_cast<std::size_t>(y) * esp_int8::FULLRES_MASK_W +
-           static_cast<std::size_t>(x)] = (interp >= 0) ? 0U : 1U;
+           static_cast<std::size_t>(x)] = best_class;
     }
   }
   return mask;
@@ -154,30 +171,37 @@ int main() {
   // bit-exact logits. The current HLS integer path has a stable ~0.68% mask
   // delta versus software bilinear-logit golden, with <0.5pp mIoU drop.
   static constexpr int MAX_ALLOWED_MASK_MISMATCHES = 4096;
+#if ESP_INT8_CSIM_CLASS_COUNT == 20
+  const char* artifact_dir = "D:/ESP_INT8/hw_artifacts/cityscapes20_p7_qat_final";
+#else
   const char* artifact_dir = "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702";
-  const char* param_path = "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/PARAM.BIN";
-  const char* input_path = "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/input_q.bin";
-  const char* golden_logits_path =
-      "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/golden_output_q.bin";
+#endif
+  const std::string param_path = std::string(artifact_dir) + "/PARAM.BIN";
+  const std::string input_path = std::string(artifact_dir) + "/input_q.bin";
+  const std::string golden_logits_path =
+      std::string(artifact_dir) + "/golden_output_q.bin";
   const char* hls_output_path = "hls_output_mask.bin";
 
   std::vector<std::uint8_t> param_bytes;
   std::vector<std::uint8_t> input_bytes;
   std::vector<std::uint8_t> golden_logits;
-  if (!read_binary(param_path, param_bytes) ||
-      !read_binary(input_path, input_bytes) ||
-      !read_binary(golden_logits_path, golden_logits)) {
+  if (!read_binary(param_path.c_str(), param_bytes) ||
+      !read_binary(input_path.c_str(), input_bytes) ||
+      !read_binary(golden_logits_path.c_str(), golden_logits)) {
     return 1;
   }
   if (input_bytes.size() != static_cast<std::size_t>(esp_int8::INPUT_FRAME_BYTES) ||
-      golden_logits.size() != static_cast<std::size_t>(esp_int8::ENCODER_LOGITS_BYTES)) {
+      golden_logits.size() != static_cast<std::size_t>(
+          esp_int8::ENCODER_OUT_H * esp_int8::ENCODER_OUT_W *
+          ESP_INT8_CSIM_CLASS_COUNT)) {
     std::printf("[FAIL] unexpected artifact sizes in %s: input=%zu golden_logits=%zu\n",
                 artifact_dir,
                 input_bytes.size(),
                 golden_logits.size());
     return 1;
   }
-  const std::vector<std::uint8_t> golden_mask = make_fullres_mask_golden(golden_logits);
+  const std::vector<std::uint8_t> golden_mask =
+      make_fullres_mask_golden(golden_logits, ESP_INT8_CSIM_CLASS_COUNT);
 
   const std::size_t param_words =
       (param_bytes.size() + esp_int8::AXI_WORD_BYTES - 1U) / esp_int8::AXI_WORD_BYTES;
@@ -223,6 +247,18 @@ int main() {
     return 1;
   }
 
+  std::vector<std::uint8_t> upsample_reference_mask = golden_mask;
+#if ESP_INT8_CSIM_CLASS_COUNT == 20
+  std::vector<std::uint8_t> hls_lowres_logits;
+  if (!read_binary("csim_u72_lowres_logits.bin", hls_lowres_logits) ||
+      hls_lowres_logits.size() != golden_logits.size()) {
+    std::printf("[FAIL] missing or malformed HLS lowres logits side dump\n");
+    return 1;
+  }
+  upsample_reference_mask =
+      make_fullres_mask_golden(hls_lowres_logits, ESP_INT8_CSIM_CLASS_COUNT);
+#endif
+
   int golden_zeros = 0;
   int golden_ones = 0;
   int golden_others = 0;
@@ -244,11 +280,12 @@ int main() {
               output_aa);
 
   int mismatches = 0;
+  int upsample_mismatches = 0;
   int invalid_labels = 0;
   for (std::size_t i = 0; i < golden_mask.size(); ++i) {
     const std::uint8_t got = hls_output[i];
     const std::uint8_t expected = golden_mask[i];
-    if (got > 1U) {
+    if (got >= static_cast<std::uint8_t>(ESP_INT8_CSIM_CLASS_COUNT)) {
       ++invalid_labels;
     }
     if (got != expected) {
@@ -260,6 +297,9 @@ int main() {
       }
       ++mismatches;
     }
+    if (got != upsample_reference_mask[i]) {
+      ++upsample_mismatches;
+    }
   }
 
   std::printf("wrote HLS output: %s bytes=%zu\n", hls_output_path, hls_output.size());
@@ -267,6 +307,20 @@ int main() {
               mismatches,
               golden_mask.size(),
               invalid_labels);
+#if ESP_INT8_CSIM_CLASS_COUNT == 20
+  std::printf("top multiclass upsample stats: mismatches=%d/%zu\n",
+              upsample_mismatches,
+              hls_output.size());
+  if (upsample_mismatches != 0 || invalid_labels != 0) {
+    std::printf("[FAIL] multiclass upsample/reference mismatch=%d invalid=%d\n",
+                upsample_mismatches,
+                invalid_labels);
+    return 1;
+  }
+  std::printf("[PASS] multiclass upsample is bit-exact; software mask delta=%d/%zu\n",
+              mismatches,
+              golden_mask.size());
+#else
   if (mismatches > MAX_ALLOWED_MASK_MISMATCHES || invalid_labels != 0) {
     std::printf("[FAIL] fullres mask check: mismatches=%d/%zu threshold=%d invalid=%d\n",
                 mismatches,
@@ -280,6 +334,7 @@ int main() {
                 golden_mask.size(),
                 MAX_ALLOWED_MASK_MISMATCHES);
   }
+#endif
 
   std::printf("top_golden_sample_tb finished: mismatches=%d\n", mismatches);
   return 0;

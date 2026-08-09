@@ -40,6 +40,7 @@ bool conv_store_write_aligned_tile(const tensor_desc_t& dst,
                                    const act_vec_t& word);
 void upsample_fused_consume_logits_row(axi_vec_t* gmem_frame_out,
                                        u16_t encoder_row,
+                                       u8_t valid_c,
                                        const act_vec_t row_buf[MAX_FM_W]);
 
 static u16_t ppu_ceil_div_u16(u16_t a, u16_t b) {
@@ -1094,14 +1095,19 @@ static bool ppu_finalize_block5_static_row(const block5_sched_desc_t& sched,
 #ifdef ESP_INT8_CSIM_DUMP_UPSAMPLE_INPUT
 static void csim_dump_upsample_input_row(axi_vec_t* gmem_frame_out,
                                          u16_t out_row,
+                                         u8_t valid_c,
                                          const act_vec_t row_buf[MAX_FM_W]) {
+  const unsigned class_count = valid_c.to_uint();
   for (int ow_i = 0; ow_i < ENCODER_OUT_W; ++ow_i) {
     const act_vec_t packed = row_buf[ow_i];
     const unsigned base_byte =
         (out_row.to_uint() * static_cast<unsigned>(ENCODER_OUT_W) +
          static_cast<unsigned>(ow_i)) *
-        static_cast<unsigned>(ENCODER_OUT_C);
-    for (int lane = 0; lane < ENCODER_OUT_C; ++lane) {
+        class_count;
+    for (int lane = 0; lane < MAX_CLASS_C; ++lane) {
+      if (static_cast<unsigned>(lane) >= class_count) {
+        break;
+      }
       const unsigned byte_idx = base_byte + static_cast<unsigned>(lane);
       const unsigned word_idx = byte_idx / static_cast<unsigned>(AXI_WORD_BYTES);
       const unsigned byte_lane = byte_idx % static_cast<unsigned>(AXI_WORD_BYTES);
@@ -1118,6 +1124,7 @@ static void csim_dump_upsample_input_row(axi_vec_t* gmem_frame_out,
 static unsigned s_csim_lowres_logits_rows = 0;
 
 static bool csim_dump_lowres_logits_row(u16_t out_row,
+                                        u8_t valid_c,
                                         const act_vec_t row_buf[MAX_FM_W]) {
   const unsigned row = out_row.to_uint();
   const bool first_row = row == 0U || s_csim_lowres_logits_rows == 0U;
@@ -1128,14 +1135,15 @@ static bool csim_dump_lowres_logits_row(u16_t out_row,
     return false;
   }
 
-  std::uint8_t bytes[ENCODER_OUT_C];
+  const unsigned class_count = valid_c.to_uint();
+  std::uint8_t bytes[MAX_CLASS_C];
   for (unsigned ow = 0; ow < static_cast<unsigned>(ENCODER_OUT_W); ++ow) {
     const act_vec_t packed = row_buf[ow];
-    for (unsigned lane = 0; lane < static_cast<unsigned>(ENCODER_OUT_C); ++lane) {
+    for (unsigned lane = 0; lane < class_count; ++lane) {
       bytes[lane] = static_cast<std::uint8_t>(packed.range(lane * 8 + 7, lane * 8).to_uint());
     }
     out.write(reinterpret_cast<const char*>(bytes),
-              static_cast<std::streamsize>(ENCODER_OUT_C));
+              static_cast<std::streamsize>(class_count));
   }
 
   ++s_csim_lowres_logits_rows;
@@ -1144,8 +1152,8 @@ static bool csim_dump_lowres_logits_row(u16_t out_row,
                 s_csim_lowres_logits_rows,
                 static_cast<unsigned>(ENCODER_OUT_H),
                 static_cast<unsigned>(ENCODER_OUT_W),
-                static_cast<unsigned>(ENCODER_OUT_C),
-                static_cast<unsigned>(ENCODER_LOGITS_BYTES));
+                class_count,
+                static_cast<unsigned>(ENCODER_OUT_H * ENCODER_OUT_W) * class_count);
   }
   return true;
 }
@@ -1153,17 +1161,18 @@ static bool csim_dump_lowres_logits_row(u16_t out_row,
 
 bool ppu_consume_upsample_row(axi_vec_t* gmem_frame_out,
                               u16_t out_row,
+                              u8_t valid_c,
                               const act_vec_t row_buf[MAX_FM_W]) {
 #pragma HLS INLINE off
 #if !defined(__SYNTHESIS__) && defined(ESP_INT8_CSIM_DUMP_LOWRES_LOGITS_SIDE)
-  if (!csim_dump_lowres_logits_row(out_row, row_buf)) {
+  if (!csim_dump_lowres_logits_row(out_row, valid_c, row_buf)) {
     return false;
   }
 #endif
 #ifdef ESP_INT8_CSIM_DUMP_UPSAMPLE_INPUT
-  csim_dump_upsample_input_row(gmem_frame_out, out_row, row_buf);
+  csim_dump_upsample_input_row(gmem_frame_out, out_row, valid_c, row_buf);
 #else
-  upsample_fused_consume_logits_row(gmem_frame_out, out_row, row_buf);
+  upsample_fused_consume_logits_row(gmem_frame_out, out_row, valid_c, row_buf);
 #endif
   return true;
 }

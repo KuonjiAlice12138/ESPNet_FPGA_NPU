@@ -353,18 +353,9 @@ bool on_chip_memory_write_fmbuf_abs_word(u8_t bank_id,
         return false;
     }
 
-    u32_t phys_addr = byte_offset;
-    switch (static_cast<unsigned>(bank_id.to_uint())) {
-        case BANK_FMEM0:
-        case BANK_FMEM1:
-        case BANK_FMEM2:
-            phys_addr = byte_offset;
-            break;
-        case BANK_BRAM_SCR0:
-            phys_addr = static_cast<u32_t>(FMBUF_POOL_TMP_BASE) + byte_offset;
-            break;
-        default:
-            return false;
+    u32_t phys_addr = 0;
+    if (!resolve_phys_addr(bank_id, byte_offset, phys_addr)) {
+        return false;
     }
     return write_phys_word(phys_addr, packed);
 }
@@ -379,19 +370,10 @@ bool on_chip_memory_read_fmbuf_abs_word(u8_t bank_id,
         return false;
     }
 
-    u32_t phys_addr = byte_offset;
-    switch (static_cast<unsigned>(bank_id.to_uint())) {
-        case BANK_FMEM0:
-        case BANK_FMEM1:
-        case BANK_FMEM2:
-            phys_addr = byte_offset;
-            break;
-        case BANK_BRAM_SCR0:
-            phys_addr = static_cast<u32_t>(FMBUF_POOL_TMP_BASE) + byte_offset;
-            break;
-        default:
-            packed = 0;
-            return false;
+    u32_t phys_addr = 0;
+    if (!resolve_phys_addr(bank_id, byte_offset, phys_addr)) {
+        packed = 0;
+        return false;
     }
     return read_phys_word(phys_addr, packed);
 }

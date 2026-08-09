@@ -178,6 +178,15 @@ struct window_row_cfg_t {
     u16_t k_tiles;
 };
 
+struct window_assembler_cfg_t {
+    u8_t mode;
+    u8_t loader_class;
+    u8_t flags;
+    u16_t out_w;
+    u8_t loader_request_cols;
+    u8_t loader_words_per_col;
+};
+
 static u32_t window_cfg_row_base(const window_row_cfg_t& cfg, int row) {
 #pragma HLS INLINE
     if (row == 0) {
@@ -224,7 +233,7 @@ static void configure_window_row(const tensor_desc_t& src_desc,
                                  const window_sched_desc_t& sched,
                                  u16_t out_row,
                                  hls::stream<window_row_cfg_t>& loader_cfg_stream,
-                                 hls::stream<window_row_cfg_t>& assembler_cfg_stream) {
+                                 hls::stream<window_assembler_cfg_t>& assembler_cfg_stream) {
 #pragma HLS INLINE off
     window_row_cfg_t cfg;
     cfg.src_desc = src_desc;
@@ -302,7 +311,14 @@ static void configure_window_row(const tensor_desc_t& src_desc,
     }
 
     loader_cfg_stream.write(cfg);
-    assembler_cfg_stream.write(cfg);
+    window_assembler_cfg_t assembler_cfg;
+    assembler_cfg.mode = cfg.mode;
+    assembler_cfg.loader_class = cfg.loader_class;
+    assembler_cfg.flags = cfg.flags;
+    assembler_cfg.out_w = cfg.out_w;
+    assembler_cfg.loader_request_cols = cfg.loader_request_cols;
+    assembler_cfg.loader_words_per_col = cfg.loader_words_per_col;
+    assembler_cfg_stream.write(assembler_cfg);
 }
 
 static act_vec_t win_low_byte_mask(unsigned byte_count) {
@@ -1844,7 +1860,7 @@ static void window_row_assembler_read_narrow_window(
 }
 
 static void window_row_assembler(
-    hls::stream<window_row_cfg_t>& assembler_cfg_stream,
+    hls::stream<window_assembler_cfg_t>& assembler_cfg_stream,
     hls::stream<window_column_meta_t>& column_meta_stream,
     hls::stream<narrow_paired_issue_meta_t>& narrow_issue_stream,
     hls::stream<window_load_word_t>& load_word_stream,
@@ -1856,7 +1872,7 @@ static void window_row_assembler(
 #pragma HLS BIND_STORAGE variable=s_wide_cache.data type=ram_2p impl=lutram
 #pragma HLS RESET variable=s_wide_cache off
 
-    const window_row_cfg_t cfg = assembler_cfg_stream.read();
+    const window_assembler_cfg_t cfg = assembler_cfg_stream.read();
     const unsigned mode = cfg.mode.to_uint();
     const bool narrow =
         cfg.loader_class.to_uint() ==
@@ -1864,7 +1880,8 @@ static void window_row_assembler(
     const bool paired =
         (cfg.flags.to_uint() &
          static_cast<unsigned>(WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)) != 0U;
-    const int issue_count = window_issue_count(cfg);
+    const int out_w = static_cast<int>(cfg.out_w.to_uint());
+    const int issue_count = paired ? ((out_w + 1) / 2) : out_w;
     const int request_cols =
         static_cast<int>(cfg.loader_request_cols.to_uint());
     const int words_per_col =
@@ -1961,7 +1978,7 @@ static void scheduled_3x3_window_row_pipeline(
     u16_t out_row) {
 #pragma HLS INLINE off
     hls::stream<window_row_cfg_t> loader_cfg_stream;
-    hls::stream<window_row_cfg_t> assembler_cfg_stream;
+    hls::stream<window_assembler_cfg_t> assembler_cfg_stream;
     hls::stream<window_column_meta_t> column_meta_stream;
     hls::stream<narrow_paired_issue_meta_t> narrow_issue_stream;
     hls::stream<window_load_word_t> load_word_stream;

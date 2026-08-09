@@ -7,6 +7,7 @@ namespace esp_int8 {
 constexpr int MAX_SA_K_TILES = MAX_K_TILE_COUNT;
 constexpr int SA_ACTIVE_TM = 32;
 constexpr int SA_OUTPUT_TM = 16;
+constexpr int SA_K_TILE_II = 1;
 constexpr int SA_OUTPUT_GROUP_COUNT = TM / SA_OUTPUT_TM;
 static_assert(TM == 32 && TK == 32 && SA_ACTIVE_TM == 32,
               "Full SA assumes the P7 32x32 organization");
@@ -120,7 +121,7 @@ void systolic_array_core_row(
             if (kt_i >= k_tiles_i) {
                 break;
             }
-#pragma HLS PIPELINE II=1
+#pragma HLS PIPELINE II=SA_K_TILE_II
             const act_vec_t act_word0 = act_stream0.read();
             const act_vec_t act_word1 = paired ? act_stream1.read() : act_vec_t(0);
             i8_t act_lane0[TK];

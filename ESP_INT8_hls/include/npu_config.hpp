@@ -31,6 +31,9 @@ constexpr int INPUT_FRAME_W = 1024;
 constexpr int INPUT_FRAME_C = 3;
 constexpr int ENCODER_OUT_H = 64;
 constexpr int ENCODER_OUT_W = 128;
+constexpr int MAX_CLASS_C = TM;
+constexpr int UPSAMPLE_CLASS_LANES = 4;
+// Binary golden/debug TB compatibility only; the synthesized path uses valid_c.
 constexpr int ENCODER_OUT_C = 2;
 constexpr int UPSAMPLE_SCALE = 8;
 constexpr int FULLRES_MASK_H = INPUT_FRAME_H;
@@ -39,6 +42,7 @@ constexpr int FULLRES_MASK_C = 1;
 
 constexpr int INPUT_FRAME_BYTES = INPUT_FRAME_H * INPUT_FRAME_W * INPUT_FRAME_C;
 constexpr int INPUT_FRAME_AXI_WORDS = (INPUT_FRAME_BYTES + AXI_WORD_BYTES - 1) / AXI_WORD_BYTES;
+constexpr int ENCODER_LOGITS_MAX_BYTES = ENCODER_OUT_H * ENCODER_OUT_W * MAX_CLASS_C;
 constexpr int ENCODER_LOGITS_BYTES = ENCODER_OUT_H * ENCODER_OUT_W * ENCODER_OUT_C;
 constexpr int FULLRES_MASK_BYTES = FULLRES_MASK_H * FULLRES_MASK_W * FULLRES_MASK_C;
 constexpr int OUTPUT_FRAME_BYTES = FULLRES_MASK_BYTES;
@@ -90,7 +94,7 @@ constexpr int BRAM_SCR0_AXI_WORDS = (BRAM_SCR0_BYTES + AXI_WORD_BYTES - 1) / AXI
 constexpr int BRAM_SCR1_AXI_WORDS = (BRAM_SCR1_BYTES + AXI_WORD_BYTES - 1) / AXI_WORD_BYTES;
 constexpr int FMBUF_POOL2_ALIAS_BASE = FMBUF_POOL1_BASE;
 constexpr int FMBUF_POOL2_ALIAS_BYTES = BRAM_SCR1_BYTES;
-constexpr int WBUF_BYTES = 120 * 1024;
+constexpr int WBUF_BYTES = 124 * 1024;
 constexpr int WBUF_AXI_WORDS = (WBUF_BYTES + AXI_WORD_BYTES - 1) / AXI_WORD_BYTES;
 constexpr int QBUF0_BYTES = 64 * 1024;
 constexpr int QBUF1_BYTES = 64 * 1024;
