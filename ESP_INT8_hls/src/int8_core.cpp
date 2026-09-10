@@ -90,14 +90,6 @@ bool resolve_block5_scratch_descs(u16_t pattern,
                                   tensor_desc_t& s2,
                                   tensor_desc_t& s3,
                                   tensor_desc_t& s4);
-bool backup_b2_src1_rows_before_write(const tensor_desc_t& src1,
-                                      int write_row,
-                                      bool src1_saved[MAX_FM_H]);
-bool read_b2_backup_src1_tile(u16_t h,
-                              u16_t w,
-                              u16_t c,
-                              u8_t lanes,
-                              act_vec_t& packed);
 void upsample_fused_begin();
 
 static param_blob_header_t s_param_header;
@@ -359,6 +351,7 @@ static bool csim_stop_before_logical_uop(unsigned uop_id) {
 #ifdef ESP_INT8_CSIM_MAX_UOP
   return uop_id > static_cast<unsigned>(ESP_INT8_CSIM_MAX_UOP);
 #else
+  (void)uop_id;
   return false;
 #endif
 }
@@ -368,7 +361,10 @@ static error_code_t core_mode_run(const axi_vec_t* gmem_frame_in,
                                   u32_t expected_uop_count,
                                   volatile u8_t& prof_stage_id,
                                   volatile u8_t& prof_pc,
-                                  volatile u8_t& prof_issue_kind) {
+                                  volatile u8_t& prof_issue_kind,
+                                  volatile u8_t& prof_conv_win_state,
+                                  volatile u8_t& prof_conv_sa_state,
+                                  volatile u8_t& prof_conv_post_state) {
 #pragma HLS INLINE off
   if (!s_param_ready) {
 #ifndef __SYNTHESIS__
@@ -399,7 +395,10 @@ static error_code_t core_mode_run(const axi_vec_t* gmem_frame_in,
   const error_code_t err = main_ctrl_run(gmem_frame_out,
                                          prof_stage_id,
                                          prof_pc,
-                                         prof_issue_kind);
+                                         prof_issue_kind,
+                                         prof_conv_win_state,
+                                         prof_conv_sa_state,
+                                         prof_conv_post_state);
   if (err != ERR_NONE) {
     npu_profile_set_stage(prof_stage_id, PROF_STAGE_ERROR);
     return err;
@@ -749,9 +748,9 @@ bool csim_dump_u40_prestore_row(const conv_exec_desc_t&,
 
 }  // namespace esp_int8
 
-static_assert(esp_int8::INPUT_FRAME_AXI_WORDS == 49152,
+static_assert(esp_int8::INPUT_FRAME_AXI_WORDS == 12288,
               "Update gmem_frame_in m_axi depth when INPUT_FRAME_AXI_WORDS changes.");
-static_assert(esp_int8::OUTPUT_FRAME_AXI_WORDS == 16384,
+static_assert(esp_int8::OUTPUT_FRAME_AXI_WORDS == 4096,
               "Update gmem_frame_out m_axi depth when OUTPUT_FRAME_AXI_WORDS changes.");
 
 void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
@@ -762,26 +761,35 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
                               volatile esp_int8::u8_t& prof_stage_id,
                               volatile ap_uint<1>& prof_active,
                               volatile esp_int8::u8_t& prof_pc,
-                              volatile esp_int8::u8_t& prof_issue_kind) {
+                              volatile esp_int8::u8_t& prof_issue_kind,
+                              volatile esp_int8::u8_t& prof_conv_win_state,
+                              volatile esp_int8::u8_t& prof_conv_sa_state,
+                              volatile esp_int8::u8_t& prof_conv_post_state) {
 #ifdef ESP_INT8_COSIM_LITE
-#pragma HLS INTERFACE ap_memory port=gmem_frame_in depth=49152
-#pragma HLS INTERFACE ap_memory port=gmem_frame_out depth=16384
+#pragma HLS INTERFACE ap_memory port=gmem_frame_in depth=12288
+#pragma HLS INTERFACE ap_memory port=gmem_frame_out depth=4096
 #pragma HLS INTERFACE ap_memory port=gmem_param depth=8192
 #pragma HLS INTERFACE ap_none port=mode
 #pragma HLS INTERFACE ap_none port=uop_count
-#pragma HLS INTERFACE ap_vld port=prof_stage_id
-#pragma HLS INTERFACE ap_none port=prof_active
-#pragma HLS INTERFACE ap_none port=prof_pc
-#pragma HLS INTERFACE ap_none port=prof_issue_kind
+#pragma HLS INTERFACE ap_vld port=prof_stage_id register
+#pragma HLS INTERFACE ap_none port=prof_active register
+#pragma HLS INTERFACE ap_none port=prof_pc register
+#pragma HLS INTERFACE ap_none port=prof_issue_kind register
+#pragma HLS INTERFACE ap_none port=prof_conv_win_state register
+#pragma HLS INTERFACE ap_none port=prof_conv_sa_state register
+#pragma HLS INTERFACE ap_none port=prof_conv_post_state register
 #pragma HLS INTERFACE ap_ctrl_hs port=return
 #else
-#pragma HLS INTERFACE m_axi port=gmem_frame_in offset=slave bundle=gmem0 depth=49152 max_read_burst_length=64 num_read_outstanding=4
-#pragma HLS INTERFACE m_axi port=gmem_frame_out offset=slave bundle=gmem1 depth=16384 max_write_burst_length=64 num_write_outstanding=4
+#pragma HLS INTERFACE m_axi port=gmem_frame_in offset=slave bundle=gmem0 depth=12288 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS INTERFACE m_axi port=gmem_frame_out offset=slave bundle=gmem1 depth=4096 max_write_burst_length=64 num_write_outstanding=4
 #pragma HLS INTERFACE m_axi port=gmem_param offset=slave bundle=gmem2 depth=8192 max_read_burst_length=64 num_read_outstanding=4
-#pragma HLS INTERFACE ap_vld port=prof_stage_id
-#pragma HLS INTERFACE ap_none port=prof_active
-#pragma HLS INTERFACE ap_none port=prof_pc
-#pragma HLS INTERFACE ap_none port=prof_issue_kind
+#pragma HLS INTERFACE ap_vld port=prof_stage_id register
+#pragma HLS INTERFACE ap_none port=prof_active register
+#pragma HLS INTERFACE ap_none port=prof_pc register
+#pragma HLS INTERFACE ap_none port=prof_issue_kind register
+#pragma HLS INTERFACE ap_none port=prof_conv_win_state register
+#pragma HLS INTERFACE ap_none port=prof_conv_sa_state register
+#pragma HLS INTERFACE ap_none port=prof_conv_post_state register
 #pragma HLS INTERFACE s_axilite port=gmem_frame_in bundle=control
 #pragma HLS INTERFACE s_axilite port=gmem_frame_out bundle=control
 #pragma HLS INTERFACE s_axilite port=gmem_param bundle=control
@@ -792,6 +800,9 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
 
   const std::uint32_t mode_runtime = esp_int8::runtime_mode(mode);
   const esp_int8::u32_t expected_uop_count = esp_int8::runtime_expected_uop_count(uop_count);
+  esp_int8::npu_profile_reset_conv_states(prof_conv_win_state,
+                                          prof_conv_sa_state,
+                                          prof_conv_post_state);
 
   switch (mode_runtime) {
     case esp_int8::MODE_INIT:
@@ -814,7 +825,10 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
                                     expected_uop_count,
                                     prof_stage_id,
                                     prof_pc,
-                                    prof_issue_kind);
+                                    prof_issue_kind,
+                                    prof_conv_win_state,
+                                    prof_conv_sa_state,
+                                    prof_conv_post_state);
         if (err == esp_int8::ERR_NONE) {
           esp_int8::npu_profile_set_stage(prof_stage_id, esp_int8::PROF_STAGE_IDLE);
         } else {

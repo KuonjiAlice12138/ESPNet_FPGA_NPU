@@ -30,6 +30,7 @@
 /ESP_INT8_hls/.rigel_lopper/
 /ESP_INT8_hls/compile_commands.json
 /ESP_INT8_hls/dfx_runtime.txt
+/ESP_INT8_hls/cmplx.*.fe.lowering.json
 /ESP_INT8_hls/*.exe
 /ESP_INT8_hls/*.bin
 /ESP_INT8_hls/*.dump

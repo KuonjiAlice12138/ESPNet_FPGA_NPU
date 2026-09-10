@@ -24,6 +24,8 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 import torch
 
+from geometry_contract import DEFAULT_GEOMETRY, DeploymentGeometry, geometry_from_manifest
+
 
 PARAM_BLOB_MAGIC = 0x544E4945
 PARAM_BLOB_VERSION_SCHED = 4
@@ -33,7 +35,9 @@ PARAM_HEADER_BYTES = PARAM_HEADER_WORDS * 4
 
 TM = 32
 TK = 32
-WBUF_BYTES = 120 * 1024
+# Keep the compiler-side limit identical to npu_config.hpp.  The 20-class
+# classifier needs 123456 bytes after packing, so 120 KiB is not sufficient.
+WBUF_BYTES = 124 * 1024
 MAX_K_TILE_COUNT = 40
 MAX_PACK_CMDS_PER_KT = 9
 MAX_STAGED_WINDOW_PACK_CMDS = 64
@@ -182,23 +186,114 @@ BANK_FMEM2 = 2
 BANK_BRAM_SCR0 = 0x80
 BANK_BRAM_SCR1 = 0x81
 
-FMBUF_BYTES = 0x598000
-FMEM0_BYTES = 0x418000
-FMBUF_POOL1_BASE = 0x3E0000
-FMBUF_POOL_TMP_BASE = 0x440000
-FMBUF_L20_BASE = 0x200000
+
+def _align_up(value: int, alignment: int) -> int:
+    if alignment <= 0 or alignment & (alignment - 1):
+        raise ValueError(f"alignment must be a positive power of two, got {alignment}")
+    return (int(value) + alignment - 1) & -alignment
+
+
+@dataclass(frozen=True)
+class MemoryLayout:
+    fmbuf_bytes: int
+    uram_bytes: int
+    bram_bytes: int
+    primary_base: int
+    block5_base: int
+    residual_base: int
+    c1_scratch_base: int
+    pool1_base: int
+    pool_tmp_base: int
+    l2_scratch_slot_bytes: int
+    l3_scratch_slot_bytes: int
+    l2_block5_bytes: int
+    l3_block5_bytes: int
+    pool1_bytes: int
+    pool2_bytes: int
+
+
+def build_memory_layout(geometry: DeploymentGeometry = DEFAULT_GEOMETRY) -> MemoryLayout:
+    """Build the fixed shared-FMBUF layout for one deployment geometry.
+
+    Main feature maps and row-group workspaces occupy the URAM prefix.  Pool
+    tensors occupy two BRAM-only regions after that prefix, so AvgPool never
+    drives the global URAM write fabric.
+    """
+    h1, w1 = geometry.input_height // 2, geometry.input_width // 2
+    h2, w2 = geometry.input_height // 4, geometry.input_width // 4
+    h3, w3 = geometry.logits_height, geometry.logits_width
+
+    primary_bytes = h2 * w2 * 131
+    residual_bytes = max(h1 * w1 * 19, h2 * w2 * 64, h3 * w3 * 128)
+    l2_block5_bytes = h2 * w2 * 64
+    l3_block5_bytes = h3 * w3 * 128
+    block5_base = h2 * w2 * 64
+    residual_base = _align_up(primary_bytes, 0x8000)
+    c1_scratch_base = _align_up(residual_base + residual_bytes, 0x8000)
+    l2_scratch_slot_bytes = h2 * w2 * 16
+    l3_scratch_slot_bytes = h3 * w3 * 25
+    uram_bytes = _align_up(c1_scratch_base + l2_scratch_slot_bytes, 0x8000)
+
+    pool1_bytes = h1 * w1 * 3
+    pool2_bytes = h2 * w2 * 3
+    pool1_base = uram_bytes
+    pool_tmp_base = pool1_base + pool1_bytes
+    fmbuf_bytes = pool_tmp_base + pool1_bytes
+
+    if block5_base + l2_block5_bytes > residual_base:
+        raise ValueError("L2 BLOCK5 workspace overlaps the residual tensor slot")
+    if residual_base + residual_bytes > c1_scratch_base:
+        raise ValueError("residual tensor slot overlaps C1 scratch")
+    if pool1_bytes < pool2_bytes:
+        raise ValueError("POOL2 cannot alias the smaller POOL1 region")
+    if fmbuf_bytes % 32:
+        raise ValueError("shared FMBUF high-water mark must be AXI-word aligned")
+
+    return MemoryLayout(
+        fmbuf_bytes=fmbuf_bytes,
+        uram_bytes=uram_bytes,
+        bram_bytes=fmbuf_bytes - uram_bytes,
+        primary_base=0,
+        block5_base=block5_base,
+        residual_base=residual_base,
+        c1_scratch_base=c1_scratch_base,
+        pool1_base=pool1_base,
+        pool_tmp_base=pool_tmp_base,
+        l2_scratch_slot_bytes=l2_scratch_slot_bytes,
+        l3_scratch_slot_bytes=l3_scratch_slot_bytes,
+        l2_block5_bytes=l2_block5_bytes,
+        l3_block5_bytes=l3_block5_bytes,
+        pool1_bytes=pool1_bytes,
+        pool2_bytes=pool2_bytes,
+    )
+
+
+DEFAULT_MEMORY_LAYOUT = build_memory_layout(DEFAULT_GEOMETRY)
+FMBUF_BYTES = DEFAULT_MEMORY_LAYOUT.fmbuf_bytes
+FMBUF_URAM_BYTES = DEFAULT_MEMORY_LAYOUT.uram_bytes
+FMBUF_BRAM_BYTES = DEFAULT_MEMORY_LAYOUT.bram_bytes
+FMBUF_PRIMARY_BASE = DEFAULT_MEMORY_LAYOUT.primary_base
+FMBUF_BLOCK5_BASE = DEFAULT_MEMORY_LAYOUT.block5_base
+FMBUF_B1_BASE = DEFAULT_MEMORY_LAYOUT.residual_base
+FMBUF_POOL1_BASE = DEFAULT_MEMORY_LAYOUT.pool1_base
+FMBUF_POOL_TMP_BASE = DEFAULT_MEMORY_LAYOUT.pool_tmp_base
+FMBUF_L20_BASE = DEFAULT_MEMORY_LAYOUT.residual_base
 FMBUF_L20_PHYS_C = 64
 FMBUF_L20_C_OFFSET = 0
-FMBUF_L30_BASE = 0x418000
-FMBUF_L2_SCRATCH_BASE = 0x418000
-FMBUF_L2_SCRATCH_SLOT_BYTES = 128 * 256 * 16
-FMBUF_L30_SCRATCH_C1_BASE = 0x518000
-FMBUF_L30_SCRATCH_LOW_BASE = 0x000000
-FMBUF_L30_SCRATCH_SLOT_BYTES = 64 * 128 * 25
-FMBUF_L3B0_SCRATCH_BASE = 0x200000
-FMBUF_L3B0_SCRATCH_SLOT_BYTES = 64 * 128 * 25
-BRAM_SCR0_BYTES = 256 * 512 * 3
-BRAM_SCR1_BYTES = 128 * 256 * 3
+FMBUF_L30_BASE = DEFAULT_MEMORY_LAYOUT.residual_base
+FMBUF_OUT_BASE = DEFAULT_MEMORY_LAYOUT.residual_base
+FMBUF_L2_SCRATCH_BASE = DEFAULT_MEMORY_LAYOUT.c1_scratch_base
+FMBUF_L2_SCRATCH_SLOT_BYTES = DEFAULT_MEMORY_LAYOUT.l2_scratch_slot_bytes
+FMBUF_L30_SCRATCH_C1_BASE = DEFAULT_MEMORY_LAYOUT.c1_scratch_base
+FMBUF_L30_SCRATCH_LOW_BASE = DEFAULT_MEMORY_LAYOUT.block5_base
+FMBUF_L30_SCRATCH_SLOT_BYTES = DEFAULT_MEMORY_LAYOUT.l3_scratch_slot_bytes
+FMBUF_L3B0_SCRATCH_BASE = DEFAULT_MEMORY_LAYOUT.c1_scratch_base
+FMBUF_L3B0_SCRATCH_SLOT_BYTES = DEFAULT_MEMORY_LAYOUT.l3_scratch_slot_bytes
+FMBUF_L2_BLOCK5_BASE = DEFAULT_MEMORY_LAYOUT.block5_base
+FMBUF_L30_BLOCK5_BASE = DEFAULT_MEMORY_LAYOUT.block5_base
+FMBUF_L3B0_BLOCK5_BASE = DEFAULT_MEMORY_LAYOUT.block5_base
+BRAM_SCR0_BYTES = DEFAULT_MEMORY_LAYOUT.pool1_bytes
+BRAM_SCR1_BYTES = DEFAULT_MEMORY_LAYOUT.pool2_bytes
 FMBUF_POOL2_ALIAS_BASE = FMBUF_POOL1_BASE
 FMBUF_POOL2_ALIAS_BYTES = BRAM_SCR1_BYTES
 
@@ -228,7 +323,7 @@ def block5_source_channels(pattern: int) -> Tuple[int, int, int, int, int]:
     raise ValueError(f"unsupported BLOCK5 source pattern: {pattern}")
 
 
-def build_block5_feasibility_audit() -> dict:
+def build_block5_feasibility_audit(geometry: DeploymentGeometry = DEFAULT_GEOMETRY) -> dict:
     """Document whether Step-4 whole-layer compact scratch is physically legal.
 
     The result is intentionally conservative. A false result means the exporter
@@ -236,7 +331,8 @@ def build_block5_feasibility_audit() -> dict:
     design has to use the row-level producer/consumer composer described by the
     Step 3/4 workplan instead of silently falling back to wide slice writes.
     """
-    l2_available = FMBUF_BYTES - FMBUF_L2_SCRATCH_BASE
+    layout = build_memory_layout(geometry)
+    l2_available = layout.l2_block5_bytes
     l2_channels = block5_source_channels(BLOCK5_PATTERN_L2_C16_4C12)
     l3_channels = block5_source_channels(BLOCK5_PATTERN_L3_C28_4C25)
 
@@ -258,15 +354,17 @@ def build_block5_feasibility_audit() -> dict:
             "requires_row_level_composer": whole > available,
         }
 
+    h2, w2 = geometry.input_height // 4, geometry.input_width // 4
+    h3, w3 = geometry.logits_height, geometry.logits_width
     return {
         "format": "P7_STEP34_BLOCK5_FEASIBILITY",
         "reason": "whole-layer compact branch tensors are allowed only when lifetime/memory bound is proven",
         "l2_high_scratch_bytes": l2_available,
         "stages": [
-            stage("L20/L2B0", 128, 256, l2_channels, l2_available),
+            stage("L20/L2B0", h2, w2, l2_channels, l2_available),
             # Level3 has enough aggregate bytes in the current FMEM0 scratch
             # map, but it should still follow the same BLOCK5 ABI as Level2.
-            stage("L30/L3B0", 64, 128, l3_channels, FMEM0_BYTES),
+            stage("L30/L3B0", h3, w3, l3_channels, layout.l3_block5_bytes),
         ],
     }
 
@@ -489,27 +587,47 @@ class PackedConvWeights:
     active_oc: int
 
 
-TENSORS: List[TensorDesc] = [
-    TensorDesc(0, "T_INPUT", BANK_FMEM0, 0x000000, 512, 1024, 3, 3, 0),
-    TensorDesc(1, "T_POOL1", BANK_FMEM0, FMBUF_POOL1_BASE, 256, 512, 3, 3, 0),
-    TensorDesc(2, "T_B1_CAT", BANK_FMEM1, 0x180000, 256, 512, 19, 19, 0),
-    TensorDesc(3, "T_B1_ACT", BANK_FMEM1, 0x180000, 256, 512, 19, 19, 0),
-    TensorDesc(4, "T_L20_CAT", BANK_FMEM0, FMBUF_L20_BASE, 128, 256, 64, FMBUF_L20_PHYS_C, FMBUF_L20_C_OFFSET),
-    TensorDesc(5, "T_L20_ACT", BANK_FMEM0, FMBUF_L20_BASE, 128, 256, 64, FMBUF_L20_PHYS_C, FMBUF_L20_C_OFFSET),
-    TensorDesc(6, "T_L2B0_CAT", BANK_FMEM0, 0x000000, 128, 256, 64, 64, 0),
-    TensorDesc(7, "T_L2B0_ACT", BANK_FMEM0, 0x000000, 128, 256, 64, 64, 0),
-    TensorDesc(8, "T_POOL2", BANK_BRAM_SCR1, 0x000000, 128, 256, 3, 3, 0),
-    TensorDesc(9, "T_B2_CAT", BANK_FMEM0, 0x000000, 128, 256, 131, 131, 0),
-    TensorDesc(10, "T_B2_ACT", BANK_FMEM0, 0x000000, 128, 256, 131, 131, 0),
-    TensorDesc(11, "T_L30_CAT", BANK_FMEM1, FMBUF_L30_BASE, 64, 128, 128, 128, 0),
-    TensorDesc(12, "T_L30_ACT", BANK_FMEM1, FMBUF_L30_BASE, 64, 128, 128, 128, 0),
-    TensorDesc(13, "T_L3B0_CAT", BANK_FMEM0, 0x000000, 64, 128, 128, 256, 128),
-    TensorDesc(14, "T_L3B0_ACT", BANK_FMEM0, 0x000000, 64, 128, 128, 256, 128),
-    TensorDesc(15, "T_B3_CAT", BANK_FMEM0, 0x000000, 64, 128, 256, 256, 0),
-    TensorDesc(16, "T_B3_ACT", BANK_FMEM0, 0x000000, 64, 128, 256, 256, 0),
-    TensorDesc(17, "T_OUT", BANK_FMEM0, 0x200000, 64, 128, 2, 2, 0),
-    TensorDesc(18, "T_POOL_TMP", BANK_BRAM_SCR0, 0x000000, 256, 512, 3, 3, 0),
-]
+def _check_class_count(classes: int) -> int:
+    classes = int(classes)
+    if classes not in (2, 20):
+        raise ValueError(f"hardware deployment supports class_count 2 or 20, got {classes}")
+    return classes
+
+
+def build_tensor_plan(
+    geometry: DeploymentGeometry = DEFAULT_GEOMETRY,
+    classes: int = 2,
+) -> List[TensorDesc]:
+    classes = _check_class_count(classes)
+    h0, w0 = geometry.input_height, geometry.input_width
+    h1, w1 = h0 // 2, w0 // 2
+    h2, w2 = h0 // 4, w0 // 4
+    ho, wo = geometry.logits_height, geometry.logits_width
+    layout = build_memory_layout(geometry)
+    return [
+        TensorDesc(0, "T_INPUT", BANK_FMEM0, layout.primary_base, h0, w0, 3, 3, 0),
+        TensorDesc(1, "T_POOL1", BANK_FMEM0, layout.pool1_base, h1, w1, 3, 3, 0),
+        TensorDesc(2, "T_B1_CAT", BANK_FMEM1, layout.residual_base, h1, w1, 19, 19, 0),
+        TensorDesc(3, "T_B1_ACT", BANK_FMEM1, layout.residual_base, h1, w1, 19, 19, 0),
+        TensorDesc(4, "T_L20_CAT", BANK_FMEM0, layout.residual_base, h2, w2, 64, FMBUF_L20_PHYS_C, FMBUF_L20_C_OFFSET),
+        TensorDesc(5, "T_L20_ACT", BANK_FMEM0, layout.residual_base, h2, w2, 64, FMBUF_L20_PHYS_C, FMBUF_L20_C_OFFSET),
+        TensorDesc(6, "T_L2B0_CAT", BANK_FMEM0, layout.primary_base, h2, w2, 64, 64, 0),
+        TensorDesc(7, "T_L2B0_ACT", BANK_FMEM0, layout.primary_base, h2, w2, 64, 64, 0),
+        TensorDesc(8, "T_POOL2", BANK_BRAM_SCR1, 0x000000, h2, w2, 3, 3, 0),
+        TensorDesc(9, "T_B2_CAT", BANK_FMEM0, layout.primary_base, h2, w2, 131, 131, 0),
+        TensorDesc(10, "T_B2_ACT", BANK_FMEM0, layout.primary_base, h2, w2, 131, 131, 0),
+        TensorDesc(11, "T_L30_CAT", BANK_FMEM1, layout.residual_base, ho, wo, 128, 128, 0),
+        TensorDesc(12, "T_L30_ACT", BANK_FMEM1, layout.residual_base, ho, wo, 128, 128, 0),
+        TensorDesc(13, "T_L3B0_CAT", BANK_FMEM0, layout.primary_base, ho, wo, 128, 256, 128),
+        TensorDesc(14, "T_L3B0_ACT", BANK_FMEM0, layout.primary_base, ho, wo, 128, 256, 128),
+        TensorDesc(15, "T_B3_CAT", BANK_FMEM0, layout.primary_base, ho, wo, 256, 256, 0),
+        TensorDesc(16, "T_B3_ACT", BANK_FMEM0, layout.primary_base, ho, wo, 256, 256, 0),
+        TensorDesc(17, "T_OUT", BANK_FMEM0, layout.residual_base, ho, wo, classes, classes, 0),
+        TensorDesc(18, "T_POOL_TMP", BANK_BRAM_SCR0, 0x000000, h1, w1, 3, 3, 0),
+    ]
+
+
+TENSORS: List[TensorDesc] = build_tensor_plan()
 
 
 CONVS: List[ConvSpec] = [
@@ -584,6 +702,85 @@ CONV_PLAN = CONVS
 AFFINE_PLAN = AFFINES
 ADD_PLAN = ADDS
 POOL_PLAN = POOLS
+
+
+def build_conv_plan(classes: int = 2) -> List[ConvSpec]:
+    classes = _check_class_count(classes)
+    plan = list(CONVS)
+    classifier = plan[-1]
+    plan[-1] = ConvSpec(
+        classifier.param_id,
+        classifier.name,
+        classifier.input_scale,
+        classifier.output_scale,
+        classes,
+    )
+    return plan
+
+
+def build_deployment_plans(
+    classes: int = 2,
+    *,
+    geometry: DeploymentGeometry = DEFAULT_GEOMETRY,
+) -> Tuple[List[TensorDesc], List[ConvSpec]]:
+    return build_tensor_plan(geometry, classes), build_conv_plan(classes)
+
+
+def activate_deployment_plans(
+    classes: int = 2,
+    *,
+    geometry: DeploymentGeometry = DEFAULT_GEOMETRY,
+) -> None:
+    """Select one immutable compiler plan before section builders run."""
+    global TENSORS, CONVS, TENSOR_PLAN, CONV_PLAN, TENSOR_DESC_BY_ID
+    TENSORS, CONVS = build_deployment_plans(classes, geometry=geometry)
+    TENSOR_PLAN = TENSORS
+    CONV_PLAN = CONVS
+    TENSOR_DESC_BY_ID = {desc.tensor_id: desc for desc in TENSORS}
+
+
+@dataclass(frozen=True)
+class ArtifactDeploymentContract:
+    profile_name: str
+    class_count: int
+    geometry: DeploymentGeometry
+    ignore_metric_class: int | None
+
+
+def load_deployment_contract(artifact_dir: Path) -> ArtifactDeploymentContract:
+    manifest = load_json(Path(artifact_dir) / "manifest.json")
+    deployment = manifest.get("deployment")
+    if not isinstance(deployment, dict):
+        raise ValueError("artifact manifest has no deployment section")
+    profile_name = str(deployment.get("profile_name", ""))
+    class_count = _check_class_count(int(deployment.get("class_count", 0)))
+    expected_profile = "binary2" if class_count == 2 else "cityscapes20"
+    if profile_name != expected_profile:
+        raise ValueError(
+            f"deployment profile/class mismatch: profile={profile_name!r} class_count={class_count}"
+        )
+
+    geometry = geometry_from_manifest(manifest)
+    classifier = manifest.get("classifier", {})
+    weight_shape = classifier.get("weight_shape")
+    if weight_shape is not None and list(weight_shape) != [class_count, 256, 1, 1]:
+        raise ValueError(
+            f"classifier weight shape mismatch: expected={[class_count, 256, 1, 1]} got={weight_shape}"
+        )
+
+    golden = Path(artifact_dir) / "golden_sample" / "classifier" / "output_int.npy"
+    if golden.exists():
+        shape = list(np.load(golden, mmap_mode="r").shape)
+        expected = [1, class_count, geometry.logits_height, geometry.logits_width]
+        if shape != expected:
+            raise ValueError(f"golden classifier shape mismatch: expected={expected} got={shape}")
+
+    return ArtifactDeploymentContract(
+        profile_name=profile_name,
+        class_count=class_count,
+        geometry=geometry,
+        ignore_metric_class=deployment.get("ignore_metric_class"),
+    )
 
 
 def safe_name(name: str) -> str:
@@ -2224,87 +2421,96 @@ def stage_last(uop: Uop) -> Uop:
     return Uop(**{**uop.__dict__, "flags": uop.flags | FLAG_LAST_UOP_OF_STAGE})
 
 
-def build_uops() -> List[Uop]:
+def build_uops(
+    classes: int = 2,
+    *,
+    geometry: DeploymentGeometry = DEFAULT_GEOMETRY,
+) -> List[Uop]:
+    classes = _check_class_count(classes)
+    h0, w0 = geometry.input_height, geometry.input_width
+    h1, w1 = h0 // 2, w0 // 2
+    h2, w2 = h0 // 4, w0 // 4
+    h3, w3 = geometry.logits_height, geometry.logits_width
     cflag = FLAG_CONCAT_MODE
     aflag = FLAG_ALIAS_ENABLE
     addflag = FLAG_REQUANT_BYPASS
     pool_same = FLAG_POOL_SAME_SCALE
 
     uops = [
-        Uop(UOP_LOAD_FM, dst=0, in_h=512, in_w=1024, in_c=3, out_c=3, valid_c=3),
-        Uop(UOP_POOL, src0=0, dst=1, param_id=0, in_h=512, in_w=1024, in_c=3, out_c=3, kernel=3, stride=2, padding=1, valid_c=3),
-        Uop(UOP_CONV, flags=FLAG_BIAS_EN | FLAG_RELU_EN | cflag, src0=0, dst=2, param_id=0, act_type=ACT_RELU, in_h=512, in_w=1024, in_c=3, out_c=16, kernel=3, stride=2, dilation=1, padding=1, valid_c=16),
-        Uop(UOP_STORE, flags=cflag, src0=1, dst=2, in_h=256, in_w=512, in_c=3, out_c=19, c_offset=16, valid_c=3),
-        stage_last(Uop(UOP_AFFINE, flags=aflag, src0=2, dst=3, param_id=0, act_type=ACT_RELU, in_h=256, in_w=512, in_c=19, out_c=19, valid_c=19)),
-        Uop(UOP_POOL, flags=pool_same, src0=0, dst=18, param_id=1, in_h=512, in_w=1024, in_c=3, out_c=3, kernel=3, stride=2, padding=1, valid_c=3),
-        Uop(UOP_POOL, src0=18, dst=8, param_id=2, in_h=256, in_w=512, in_c=3, out_c=3, kernel=3, stride=2, padding=1, valid_c=3),
-        Uop(UOP_CONV, src0=3, dst=LS_C1, param_id=1, in_h=256, in_w=512, in_c=19, out_c=12, kernel=3, stride=2, dilation=1, padding=1, valid_c=12),
-        Uop(UOP_CONV, flags=cflag, src0=LS_C1, dst=4, param_id=2, in_h=128, in_w=256, in_c=12, out_c=16, kernel=3, stride=1, dilation=1, padding=1, c_offset=0, valid_c=16),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_A, param_id=3, in_h=128, in_w=256, in_c=12, out_c=12, kernel=3, stride=1, dilation=2, padding=2, valid_c=12),
-        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=4, in_h=128, in_w=256, in_c=12, out_c=64, c_offset=16, valid_c=12),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=4, in_h=128, in_w=256, in_c=12, out_c=12, kernel=3, stride=1, dilation=4, padding=4, valid_c=12),
-        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=0, in_h=128, in_w=256, in_c=12, out_c=12, valid_c=12),
-        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=4, in_h=128, in_w=256, in_c=12, out_c=64, c_offset=28, valid_c=12),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=5, in_h=128, in_w=256, in_c=12, out_c=12, kernel=3, stride=1, dilation=8, padding=8, valid_c=12),
-        Uop(UOP_ADD, flags=addflag, src0=LS_B, src1=LS_TMP, dst=LS_A, param_id=1, in_h=128, in_w=256, in_c=12, out_c=12, valid_c=12),
-        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=4, in_h=128, in_w=256, in_c=12, out_c=64, c_offset=40, valid_c=12),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=6, in_h=128, in_w=256, in_c=12, out_c=12, kernel=3, stride=1, dilation=16, padding=16, valid_c=12),
-        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=2, in_h=128, in_w=256, in_c=12, out_c=12, valid_c=12),
-        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=4, in_h=128, in_w=256, in_c=12, out_c=64, c_offset=52, valid_c=12),
-        stage_last(Uop(UOP_AFFINE, flags=aflag, src0=4, dst=5, param_id=1, act_type=ACT_RELU, in_h=128, in_w=256, in_c=64, out_c=64, valid_c=64)),
-        Uop(UOP_CONV, src0=5, dst=LS_C1, param_id=7, in_h=128, in_w=256, in_c=64, out_c=12, kernel=1, stride=1, dilation=1, padding=0, valid_c=12),
-        Uop(UOP_CONV, flags=cflag, src0=LS_C1, dst=6, param_id=8, in_h=128, in_w=256, in_c=12, out_c=16, kernel=3, stride=1, dilation=1, padding=1, c_offset=0, valid_c=16),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_A, param_id=9, in_h=128, in_w=256, in_c=12, out_c=12, kernel=3, stride=1, dilation=2, padding=2, valid_c=12),
-        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=6, in_h=128, in_w=256, in_c=12, out_c=64, c_offset=16, valid_c=12),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=10, in_h=128, in_w=256, in_c=12, out_c=12, kernel=3, stride=1, dilation=4, padding=4, valid_c=12),
-        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=3, in_h=128, in_w=256, in_c=12, out_c=12, valid_c=12),
-        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=6, in_h=128, in_w=256, in_c=12, out_c=64, c_offset=28, valid_c=12),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=11, in_h=128, in_w=256, in_c=12, out_c=12, kernel=3, stride=1, dilation=8, padding=8, valid_c=12),
-        Uop(UOP_ADD, flags=addflag, src0=LS_B, src1=LS_TMP, dst=LS_A, param_id=4, in_h=128, in_w=256, in_c=12, out_c=12, valid_c=12),
-        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=6, in_h=128, in_w=256, in_c=12, out_c=64, c_offset=40, valid_c=12),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=12, in_h=128, in_w=256, in_c=12, out_c=12, kernel=3, stride=1, dilation=16, padding=16, valid_c=12),
-        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=5, in_h=128, in_w=256, in_c=12, out_c=12, valid_c=12),
-        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=6, in_h=128, in_w=256, in_c=12, out_c=64, c_offset=52, valid_c=12),
-        Uop(UOP_ADD, flags=addflag, src0=6, src1=5, dst=6, param_id=6, in_h=128, in_w=256, in_c=64, out_c=64, valid_c=64),
-        stage_last(Uop(UOP_AFFINE, flags=aflag, src0=6, dst=7, param_id=2, act_type=ACT_RELU, in_h=128, in_w=256, in_c=64, out_c=64, valid_c=64)),
-        Uop(UOP_STORE, flags=cflag, src0=7, dst=9, in_h=128, in_w=256, in_c=64, out_c=131, c_offset=0, valid_c=64),
-        Uop(UOP_STORE, flags=cflag, src0=5, dst=9, in_h=128, in_w=256, in_c=64, out_c=131, c_offset=64, valid_c=64),
-        Uop(UOP_STORE, flags=cflag, src0=8, dst=9, in_h=128, in_w=256, in_c=3, out_c=131, c_offset=128, valid_c=3),
-        stage_last(Uop(UOP_AFFINE, flags=aflag, src0=9, dst=10, param_id=3, act_type=ACT_RELU, in_h=128, in_w=256, in_c=131, out_c=131, valid_c=131)),
-        Uop(UOP_CONV, src0=10, dst=LS_C1, param_id=13, in_h=128, in_w=256, in_c=131, out_c=25, kernel=3, stride=2, dilation=1, padding=1, valid_c=25),
-        Uop(UOP_CONV, flags=cflag, src0=LS_C1, dst=11, param_id=14, in_h=64, in_w=128, in_c=25, out_c=28, kernel=3, stride=1, dilation=1, padding=1, c_offset=0, valid_c=28),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_A, param_id=15, in_h=64, in_w=128, in_c=25, out_c=25, kernel=3, stride=1, dilation=2, padding=2, valid_c=25),
-        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=11, in_h=64, in_w=128, in_c=25, out_c=128, c_offset=28, valid_c=25),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=16, in_h=64, in_w=128, in_c=25, out_c=25, kernel=3, stride=1, dilation=4, padding=4, valid_c=25),
-        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=7, in_h=64, in_w=128, in_c=25, out_c=25, valid_c=25),
-        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=11, in_h=64, in_w=128, in_c=25, out_c=128, c_offset=53, valid_c=25),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=17, in_h=64, in_w=128, in_c=25, out_c=25, kernel=3, stride=1, dilation=8, padding=8, valid_c=25),
-        Uop(UOP_ADD, flags=addflag, src0=LS_B, src1=LS_TMP, dst=LS_A, param_id=8, in_h=64, in_w=128, in_c=25, out_c=25, valid_c=25),
-        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=11, in_h=64, in_w=128, in_c=25, out_c=128, c_offset=78, valid_c=25),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=18, in_h=64, in_w=128, in_c=25, out_c=25, kernel=3, stride=1, dilation=16, padding=16, valid_c=25),
-        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=9, in_h=64, in_w=128, in_c=25, out_c=25, valid_c=25),
-        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=11, in_h=64, in_w=128, in_c=25, out_c=128, c_offset=103, valid_c=25),
-        stage_last(Uop(UOP_AFFINE, flags=aflag, src0=11, dst=12, param_id=4, act_type=ACT_RELU, in_h=64, in_w=128, in_c=128, out_c=128, valid_c=128)),
-        Uop(UOP_CONV, src0=12, dst=LS_C1, param_id=19, in_h=64, in_w=128, in_c=128, out_c=25, kernel=1, stride=1, dilation=1, padding=0, valid_c=25),
-        Uop(UOP_CONV, flags=cflag, src0=LS_C1, dst=13, param_id=20, in_h=64, in_w=128, in_c=25, out_c=28, kernel=3, stride=1, dilation=1, padding=1, c_offset=0, valid_c=28),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_A, param_id=21, in_h=64, in_w=128, in_c=25, out_c=25, kernel=3, stride=1, dilation=2, padding=2, valid_c=25),
-        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=13, in_h=64, in_w=128, in_c=25, out_c=128, c_offset=28, valid_c=25),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=22, in_h=64, in_w=128, in_c=25, out_c=25, kernel=3, stride=1, dilation=4, padding=4, valid_c=25),
-        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=10, in_h=64, in_w=128, in_c=25, out_c=25, valid_c=25),
-        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=13, in_h=64, in_w=128, in_c=25, out_c=128, c_offset=53, valid_c=25),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=23, in_h=64, in_w=128, in_c=25, out_c=25, kernel=3, stride=1, dilation=8, padding=8, valid_c=25),
-        Uop(UOP_ADD, flags=addflag, src0=LS_B, src1=LS_TMP, dst=LS_A, param_id=11, in_h=64, in_w=128, in_c=25, out_c=25, valid_c=25),
-        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=13, in_h=64, in_w=128, in_c=25, out_c=128, c_offset=78, valid_c=25),
-        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=24, in_h=64, in_w=128, in_c=25, out_c=25, kernel=3, stride=1, dilation=16, padding=16, valid_c=25),
-        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=12, in_h=64, in_w=128, in_c=25, out_c=25, valid_c=25),
-        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=13, in_h=64, in_w=128, in_c=25, out_c=128, c_offset=103, valid_c=25),
-        Uop(UOP_ADD, flags=addflag, src0=13, src1=12, dst=13, param_id=13, in_h=64, in_w=128, in_c=128, out_c=128, valid_c=128),
-        stage_last(Uop(UOP_AFFINE, flags=aflag, src0=13, dst=14, param_id=5, act_type=ACT_RELU, in_h=64, in_w=128, in_c=128, out_c=128, valid_c=128)),
-        Uop(UOP_STORE, flags=cflag, src0=12, dst=15, in_h=64, in_w=128, in_c=128, out_c=256, c_offset=0, valid_c=128),
-        Uop(UOP_STORE, flags=cflag, src0=14, dst=15, in_h=64, in_w=128, in_c=128, out_c=256, c_offset=128, valid_c=128),
-        Uop(UOP_AFFINE, flags=aflag, src0=15, dst=16, param_id=6, act_type=ACT_RELU, in_h=64, in_w=128, in_c=256, out_c=256, valid_c=256),
-        Uop(UOP_CONV, src0=16, dst=17, param_id=25, in_h=64, in_w=128, in_c=256, out_c=2, kernel=1, stride=1, dilation=1, padding=0, valid_c=2),
-        Uop(UOP_STORE, src0=17, in_h=64, in_w=128, in_c=2, out_c=2, valid_c=2),
+        Uop(UOP_LOAD_FM, dst=0, in_h=h0, in_w=w0, in_c=3, out_c=3, valid_c=3),
+        Uop(UOP_POOL, src0=0, dst=1, param_id=0, in_h=h0, in_w=w0, in_c=3, out_c=3, kernel=3, stride=2, padding=1, valid_c=3),
+        Uop(UOP_CONV, flags=FLAG_BIAS_EN | FLAG_RELU_EN | cflag, src0=0, dst=2, param_id=0, act_type=ACT_RELU, in_h=h0, in_w=w0, in_c=3, out_c=16, kernel=3, stride=2, dilation=1, padding=1, valid_c=16),
+        Uop(UOP_STORE, flags=cflag, src0=1, dst=2, in_h=h1, in_w=w1, in_c=3, out_c=19, c_offset=16, valid_c=3),
+        stage_last(Uop(UOP_AFFINE, flags=aflag, src0=2, dst=3, param_id=0, act_type=ACT_RELU, in_h=h1, in_w=w1, in_c=19, out_c=19, valid_c=19)),
+        Uop(UOP_POOL, flags=pool_same, src0=0, dst=18, param_id=1, in_h=h0, in_w=w0, in_c=3, out_c=3, kernel=3, stride=2, padding=1, valid_c=3),
+        Uop(UOP_POOL, src0=18, dst=8, param_id=2, in_h=h1, in_w=w1, in_c=3, out_c=3, kernel=3, stride=2, padding=1, valid_c=3),
+        Uop(UOP_CONV, src0=3, dst=LS_C1, param_id=1, in_h=h1, in_w=w1, in_c=19, out_c=12, kernel=3, stride=2, dilation=1, padding=1, valid_c=12),
+        Uop(UOP_CONV, flags=cflag, src0=LS_C1, dst=4, param_id=2, in_h=h2, in_w=w2, in_c=12, out_c=16, kernel=3, stride=1, dilation=1, padding=1, c_offset=0, valid_c=16),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_A, param_id=3, in_h=h2, in_w=w2, in_c=12, out_c=12, kernel=3, stride=1, dilation=2, padding=2, valid_c=12),
+        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=4, in_h=h2, in_w=w2, in_c=12, out_c=64, c_offset=16, valid_c=12),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=4, in_h=h2, in_w=w2, in_c=12, out_c=12, kernel=3, stride=1, dilation=4, padding=4, valid_c=12),
+        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=0, in_h=h2, in_w=w2, in_c=12, out_c=12, valid_c=12),
+        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=4, in_h=h2, in_w=w2, in_c=12, out_c=64, c_offset=28, valid_c=12),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=5, in_h=h2, in_w=w2, in_c=12, out_c=12, kernel=3, stride=1, dilation=8, padding=8, valid_c=12),
+        Uop(UOP_ADD, flags=addflag, src0=LS_B, src1=LS_TMP, dst=LS_A, param_id=1, in_h=h2, in_w=w2, in_c=12, out_c=12, valid_c=12),
+        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=4, in_h=h2, in_w=w2, in_c=12, out_c=64, c_offset=40, valid_c=12),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=6, in_h=h2, in_w=w2, in_c=12, out_c=12, kernel=3, stride=1, dilation=16, padding=16, valid_c=12),
+        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=2, in_h=h2, in_w=w2, in_c=12, out_c=12, valid_c=12),
+        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=4, in_h=h2, in_w=w2, in_c=12, out_c=64, c_offset=52, valid_c=12),
+        stage_last(Uop(UOP_AFFINE, flags=aflag, src0=4, dst=5, param_id=1, act_type=ACT_RELU, in_h=h2, in_w=w2, in_c=64, out_c=64, valid_c=64)),
+        Uop(UOP_CONV, src0=5, dst=LS_C1, param_id=7, in_h=h2, in_w=w2, in_c=64, out_c=12, kernel=1, stride=1, dilation=1, padding=0, valid_c=12),
+        Uop(UOP_CONV, flags=cflag, src0=LS_C1, dst=6, param_id=8, in_h=h2, in_w=w2, in_c=12, out_c=16, kernel=3, stride=1, dilation=1, padding=1, c_offset=0, valid_c=16),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_A, param_id=9, in_h=h2, in_w=w2, in_c=12, out_c=12, kernel=3, stride=1, dilation=2, padding=2, valid_c=12),
+        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=6, in_h=h2, in_w=w2, in_c=12, out_c=64, c_offset=16, valid_c=12),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=10, in_h=h2, in_w=w2, in_c=12, out_c=12, kernel=3, stride=1, dilation=4, padding=4, valid_c=12),
+        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=3, in_h=h2, in_w=w2, in_c=12, out_c=12, valid_c=12),
+        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=6, in_h=h2, in_w=w2, in_c=12, out_c=64, c_offset=28, valid_c=12),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=11, in_h=h2, in_w=w2, in_c=12, out_c=12, kernel=3, stride=1, dilation=8, padding=8, valid_c=12),
+        Uop(UOP_ADD, flags=addflag, src0=LS_B, src1=LS_TMP, dst=LS_A, param_id=4, in_h=h2, in_w=w2, in_c=12, out_c=12, valid_c=12),
+        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=6, in_h=h2, in_w=w2, in_c=12, out_c=64, c_offset=40, valid_c=12),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=12, in_h=h2, in_w=w2, in_c=12, out_c=12, kernel=3, stride=1, dilation=16, padding=16, valid_c=12),
+        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=5, in_h=h2, in_w=w2, in_c=12, out_c=12, valid_c=12),
+        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=6, in_h=h2, in_w=w2, in_c=12, out_c=64, c_offset=52, valid_c=12),
+        Uop(UOP_ADD, flags=addflag, src0=6, src1=5, dst=6, param_id=6, in_h=h2, in_w=w2, in_c=64, out_c=64, valid_c=64),
+        stage_last(Uop(UOP_AFFINE, flags=aflag, src0=6, dst=7, param_id=2, act_type=ACT_RELU, in_h=h2, in_w=w2, in_c=64, out_c=64, valid_c=64)),
+        Uop(UOP_STORE, flags=cflag, src0=7, dst=9, in_h=h2, in_w=w2, in_c=64, out_c=131, c_offset=0, valid_c=64),
+        Uop(UOP_STORE, flags=cflag, src0=5, dst=9, in_h=h2, in_w=w2, in_c=64, out_c=131, c_offset=64, valid_c=64),
+        Uop(UOP_STORE, flags=cflag, src0=8, dst=9, in_h=h2, in_w=w2, in_c=3, out_c=131, c_offset=128, valid_c=3),
+        stage_last(Uop(UOP_AFFINE, flags=aflag, src0=9, dst=10, param_id=3, act_type=ACT_RELU, in_h=h2, in_w=w2, in_c=131, out_c=131, valid_c=131)),
+        Uop(UOP_CONV, src0=10, dst=LS_C1, param_id=13, in_h=h2, in_w=w2, in_c=131, out_c=25, kernel=3, stride=2, dilation=1, padding=1, valid_c=25),
+        Uop(UOP_CONV, flags=cflag, src0=LS_C1, dst=11, param_id=14, in_h=h3, in_w=w3, in_c=25, out_c=28, kernel=3, stride=1, dilation=1, padding=1, c_offset=0, valid_c=28),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_A, param_id=15, in_h=h3, in_w=w3, in_c=25, out_c=25, kernel=3, stride=1, dilation=2, padding=2, valid_c=25),
+        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=11, in_h=h3, in_w=w3, in_c=25, out_c=128, c_offset=28, valid_c=25),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=16, in_h=h3, in_w=w3, in_c=25, out_c=25, kernel=3, stride=1, dilation=4, padding=4, valid_c=25),
+        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=7, in_h=h3, in_w=w3, in_c=25, out_c=25, valid_c=25),
+        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=11, in_h=h3, in_w=w3, in_c=25, out_c=128, c_offset=53, valid_c=25),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=17, in_h=h3, in_w=w3, in_c=25, out_c=25, kernel=3, stride=1, dilation=8, padding=8, valid_c=25),
+        Uop(UOP_ADD, flags=addflag, src0=LS_B, src1=LS_TMP, dst=LS_A, param_id=8, in_h=h3, in_w=w3, in_c=25, out_c=25, valid_c=25),
+        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=11, in_h=h3, in_w=w3, in_c=25, out_c=128, c_offset=78, valid_c=25),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=18, in_h=h3, in_w=w3, in_c=25, out_c=25, kernel=3, stride=1, dilation=16, padding=16, valid_c=25),
+        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=9, in_h=h3, in_w=w3, in_c=25, out_c=25, valid_c=25),
+        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=11, in_h=h3, in_w=w3, in_c=25, out_c=128, c_offset=103, valid_c=25),
+        stage_last(Uop(UOP_AFFINE, flags=aflag, src0=11, dst=12, param_id=4, act_type=ACT_RELU, in_h=h3, in_w=w3, in_c=128, out_c=128, valid_c=128)),
+        Uop(UOP_CONV, src0=12, dst=LS_C1, param_id=19, in_h=h3, in_w=w3, in_c=128, out_c=25, kernel=1, stride=1, dilation=1, padding=0, valid_c=25),
+        Uop(UOP_CONV, flags=cflag, src0=LS_C1, dst=13, param_id=20, in_h=h3, in_w=w3, in_c=25, out_c=28, kernel=3, stride=1, dilation=1, padding=1, c_offset=0, valid_c=28),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_A, param_id=21, in_h=h3, in_w=w3, in_c=25, out_c=25, kernel=3, stride=1, dilation=2, padding=2, valid_c=25),
+        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=13, in_h=h3, in_w=w3, in_c=25, out_c=128, c_offset=28, valid_c=25),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=22, in_h=h3, in_w=w3, in_c=25, out_c=25, kernel=3, stride=1, dilation=4, padding=4, valid_c=25),
+        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=10, in_h=h3, in_w=w3, in_c=25, out_c=25, valid_c=25),
+        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=13, in_h=h3, in_w=w3, in_c=25, out_c=128, c_offset=53, valid_c=25),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=23, in_h=h3, in_w=w3, in_c=25, out_c=25, kernel=3, stride=1, dilation=8, padding=8, valid_c=25),
+        Uop(UOP_ADD, flags=addflag, src0=LS_B, src1=LS_TMP, dst=LS_A, param_id=11, in_h=h3, in_w=w3, in_c=25, out_c=25, valid_c=25),
+        Uop(UOP_STORE, flags=cflag, src0=LS_A, dst=13, in_h=h3, in_w=w3, in_c=25, out_c=128, c_offset=78, valid_c=25),
+        Uop(UOP_CONV, src0=LS_C1, dst=LS_TMP, param_id=24, in_h=h3, in_w=w3, in_c=25, out_c=25, kernel=3, stride=1, dilation=16, padding=16, valid_c=25),
+        Uop(UOP_ADD, flags=addflag, src0=LS_A, src1=LS_TMP, dst=LS_B, param_id=12, in_h=h3, in_w=w3, in_c=25, out_c=25, valid_c=25),
+        Uop(UOP_STORE, flags=cflag, src0=LS_B, dst=13, in_h=h3, in_w=w3, in_c=25, out_c=128, c_offset=103, valid_c=25),
+        Uop(UOP_ADD, flags=addflag, src0=13, src1=12, dst=13, param_id=13, in_h=h3, in_w=w3, in_c=128, out_c=128, valid_c=128),
+        stage_last(Uop(UOP_AFFINE, flags=aflag, src0=13, dst=14, param_id=5, act_type=ACT_RELU, in_h=h3, in_w=w3, in_c=128, out_c=128, valid_c=128)),
+        Uop(UOP_STORE, flags=cflag, src0=12, dst=15, in_h=h3, in_w=w3, in_c=128, out_c=256, c_offset=0, valid_c=128),
+        Uop(UOP_STORE, flags=cflag, src0=14, dst=15, in_h=h3, in_w=w3, in_c=128, out_c=256, c_offset=128, valid_c=128),
+        Uop(UOP_AFFINE, flags=aflag, src0=15, dst=16, param_id=6, act_type=ACT_RELU, in_h=h3, in_w=w3, in_c=256, out_c=256, valid_c=256),
+        Uop(UOP_CONV, src0=16, dst=17, param_id=25, in_h=h3, in_w=w3, in_c=256, out_c=classes, kernel=1, stride=1, dilation=1, padding=0, valid_c=classes),
+        Uop(UOP_STORE, src0=17, in_h=h3, in_w=w3, in_c=classes, out_c=classes, valid_c=classes),
         stage_last(Uop(UOP_END)),
     ]
 
@@ -2867,18 +3073,31 @@ def build_exec_plan_sections(
 
         if uop.opcode == UOP_CONV:
             out_w = conv_out_dim(uop.in_w, uop.stride)
+            terminal_output_store = (
+                idx + 1 < len(uops)
+                and _uop_is_store_of(uops[idx + 1], uop.dst)
+                and uops[idx + 1].dst == TID_INVALID
+            )
 
             row_consumer = RowConsumerDesc(
                 mode=ROW_CONSUMER_NONE,
                 store_dst_tensor=uop.dst,
                 store_c_offset=uop.c_offset,
                 valid_c=uop.valid_c,
-                reserved0=store_layout_for(
-                    dst_tensor=uop.dst,
-                    producer=uop,
-                    c_offset=uop.c_offset,
-                    valid_c=uop.valid_c,
-                    out_w=out_w,
+                # The terminal classifier store has no tensor destination and
+                # is consumed by the upsample output path.  Other default
+                # CONV descriptors retain their scratch/tensor layout until
+                # the adjacent consumer pattern is recognized below.
+                reserved0=(
+                    STORE_LAYOUT_NONE
+                    if terminal_output_store
+                    else store_layout_for(
+                        dst_tensor=uop.dst,
+                        producer=uop,
+                        c_offset=uop.c_offset,
+                        valid_c=uop.valid_c,
+                        out_w=out_w,
+                    )
                 ),
             )
             if (
@@ -3316,14 +3535,23 @@ def build_exec_plan_sections(
     return conv_exec_descs, row_consumers, fixed_exec_descs, exec_plan, block5_sched_descs, coverage
 
 
-def build_hw_frame_files(artifact_dir: Path, out_dir: Path) -> Dict[str, object]:
+def build_hw_frame_files(
+    artifact_dir: Path,
+    out_dir: Path,
+    *,
+    geometry: DeploymentGeometry,
+    classes: int,
+) -> Dict[str, object]:
+    classes = _check_class_count(classes)
     golden_dir = artifact_dir / "golden_sample"
     input_nchw = require_int8_array(golden_dir / "quant" / "input_int.npy")
     output_nchw = require_int8_array(golden_dir / "classifier" / "output_int.npy")
 
-    if input_nchw.shape != (1, 3, 512, 1024):
+    expected_input = (1, 3, geometry.input_height, geometry.input_width)
+    expected_output = (1, classes, geometry.logits_height, geometry.logits_width)
+    if input_nchw.shape != expected_input:
         raise ValueError(f"Unexpected input shape: {input_nchw.shape}")
-    if output_nchw.shape != (1, 2, 64, 128):
+    if output_nchw.shape != expected_output:
         raise ValueError(f"Unexpected output shape: {output_nchw.shape}")
 
     input_nhwc = np.ascontiguousarray(np.transpose(input_nchw, (0, 2, 3, 1)))
@@ -3354,6 +3582,95 @@ def build_hw_frame_files(artifact_dir: Path, out_dir: Path) -> Dict[str, object]
     }
 
 
+def _compare_i8_arrays(actual: np.ndarray, expected: np.ndarray) -> Dict[str, object]:
+    actual_i8 = np.asarray(actual, dtype=np.int8)
+    expected_i8 = np.asarray(expected, dtype=np.int8)
+    if actual_i8.shape != expected_i8.shape:
+        raise ValueError(
+            f"golden shape mismatch: actual={actual_i8.shape} expected={expected_i8.shape}"
+        )
+    diff = actual_i8.astype(np.int16) - expected_i8.astype(np.int16)
+    mismatches = int(np.count_nonzero(diff))
+    return {
+        "shape": list(actual_i8.shape),
+        "bytes": int(actual_i8.nbytes),
+        "mismatches": mismatches,
+        "mismatch_rate": float(mismatches / actual_i8.size) if actual_i8.size else 0.0,
+        "max_abs_diff": int(np.max(np.abs(diff))) if diff.size else 0,
+        "mean_abs_diff": float(np.mean(np.abs(diff))) if diff.size else 0.0,
+    }
+
+
+def write_hardware_golden_files(out_dir: Path, replay_output_nhwc: np.ndarray) -> Dict[str, object]:
+    """Publish PARAM-replay output as the hardware golden.
+
+    The PyTorch hook output remains useful as a model-accuracy reference, but
+    it uses floating-point affine arithmetic.  The HLS contract uses the
+    integer multiplier/bias/shift values already frozen into PARAM.BIN, so the
+    board/CSim golden must come from replaying that final blob.
+    """
+    out_dir = Path(out_dir)
+    model_npy = out_dir / "golden_output_q_nhwc.npy"
+    if not model_npy.exists():
+        raise FileNotFoundError(f"model hook golden is missing: {model_npy}")
+
+    model_output = np.ascontiguousarray(np.load(model_npy).astype(np.int8, copy=False))
+    replay_output = np.ascontiguousarray(
+        np.asarray(replay_output_nhwc, dtype=np.int8)
+    )
+    if (
+        model_output.ndim == replay_output.ndim + 1
+        and model_output.shape[0] == 1
+        and model_output.shape[1:] == replay_output.shape
+    ):
+        replay_output = np.ascontiguousarray(replay_output[np.newaxis, ...])
+    comparison = _compare_i8_arrays(replay_output, model_output)
+
+    np.save(out_dir / "model_golden_output_q_nhwc.npy", model_output)
+    model_output.tofile(out_dir / "model_golden_output_q.bin")
+
+    np.save(out_dir / "golden_output_q_nhwc.npy", replay_output)
+    replay_output.tofile(out_dir / "golden_output_q.bin")
+    replay_output.tofile(out_dir / "expected_output_q.bin")
+    replay_output.tofile(out_dir / "replay_output_q.bin")
+
+    return {
+        "golden_semantics": "param_v4_integer_replay",
+        "model_golden_semantics": "pytorch_fake_quant_hooks",
+        "model_vs_hardware": comparison,
+        "golden_output_q_bin_bytes": int(replay_output.nbytes),
+    }
+
+
+def build_param_replay_golden(
+    out_dir: Path,
+    *,
+    geometry: DeploymentGeometry,
+    classes: int,
+) -> Dict[str, object]:
+    # Import lazily because hw_param_replay shares the PARAM ABI definitions
+    # from this module.
+    from hw_param_replay import ParamBlob, replay_prefix
+
+    blob = ParamBlob(out_dir / "PARAM.BIN")
+    stop_uop = max(
+        (int(entry.logical_uop_id) for entry in blob.exec_plan if entry.kind != EXEC_END),
+        default=0,
+    )
+    replay = replay_prefix(blob, out_dir / "input_q.bin", stop_uop)
+    output_tid = next(desc.tensor_id for desc in TENSOR_PLAN if desc.name == "T_OUT")
+    output = replay.read_tensor(output_tid)
+    expected_shape = (geometry.logits_height, geometry.logits_width, classes)
+    if output.shape != expected_shape:
+        raise ValueError(
+            f"PARAM replay output shape mismatch: expected={expected_shape} got={output.shape}"
+        )
+    report = write_hardware_golden_files(out_dir, output)
+    report["replay_stop_logical_uop"] = stop_uop
+    report["replay_executed_logical_uops"] = replay.executed
+    return report
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -3367,7 +3684,12 @@ def tensor_storage_bytes(desc: TensorDesc) -> int:
     return int(desc.h) * int(desc.w) * int(phys_c)
 
 
-def build_memory_lifetime_audit(uops: Sequence[Uop]) -> dict:
+def build_memory_lifetime_audit(
+    uops: Sequence[Uop],
+    *,
+    geometry: DeploymentGeometry = DEFAULT_GEOMETRY,
+) -> dict:
+    layout = build_memory_layout(geometry)
     first_write: Dict[int, int] = {}
     last_write: Dict[int, int] = {}
     first_read: Dict[int, int] = {}
@@ -3384,14 +3706,29 @@ def build_memory_lifetime_audit(uops: Sequence[Uop]) -> dict:
             first_write.setdefault(tensor_id, idx)
             last_write[tensor_id] = idx
 
+    def tensor_physical_base(desc: TensorDesc) -> int:
+        if desc.bank_id == BANK_BRAM_SCR0:
+            return layout.pool_tmp_base + int(desc.base_offset)
+        if desc.bank_id == BANK_BRAM_SCR1:
+            return layout.pool1_base + int(desc.base_offset)
+        return int(desc.base_offset)
+
     def tensor_lifetime(tensor_id: int) -> dict:
         desc = TENSOR_DESC_BY_ID[tensor_id]
+        byte_count = tensor_storage_bytes(desc)
+        physical_base = tensor_physical_base(desc)
+        starts = [x for x in (first_write.get(tensor_id), first_read.get(tensor_id)) if x is not None]
+        ends = [x for x in (last_write.get(tensor_id), last_read.get(tensor_id)) if x is not None]
         return {
             "tensor_id": tensor_id,
             "name": desc.name,
             "bank": int(desc.bank_id),
             "base_offset": int(desc.base_offset),
-            "bytes": tensor_storage_bytes(desc),
+            "bytes": byte_count,
+            "physical_base": physical_base,
+            "physical_end": physical_base + byte_count,
+            "lifetime_begin": min(starts) if starts else None,
+            "lifetime_end": max(ends) if ends else None,
             "first_write": first_write.get(tensor_id),
             "last_write": last_write.get(tensor_id),
             "first_read": first_read.get(tensor_id),
@@ -3401,9 +3738,9 @@ def build_memory_lifetime_audit(uops: Sequence[Uop]) -> dict:
     pool1 = tensor_lifetime(1)
     pool2 = tensor_lifetime(8)
     pool2_alias_fits = (
-        FMBUF_POOL2_ALIAS_BASE == FMBUF_POOL1_BASE
-        and FMBUF_POOL2_ALIAS_BYTES <= pool1["bytes"]
-        and FMBUF_POOL2_ALIAS_BASE + FMBUF_POOL2_ALIAS_BYTES <= FMBUF_BYTES
+        layout.pool1_base == pool1["physical_base"]
+        and layout.pool2_bytes <= pool1["bytes"]
+        and layout.pool1_base + layout.pool2_bytes <= layout.fmbuf_bytes
     )
     pool2_alias_lifetime_safe = (
         pool1["last_read"] is not None
@@ -3417,8 +3754,159 @@ def build_memory_lifetime_audit(uops: Sequence[Uop]) -> dict:
             f"pool1={pool1} pool2={pool2} fits={pool2_alias_fits}"
         )
 
+    tensor_lifetimes = {
+        str(tensor_id): tensor_lifetime(tensor_id)
+        for tensor_id in sorted(TENSOR_DESC_BY_ID)
+    }
+
+    transient_regions = [
+        {
+            "name": "L2_BRANCH_SCRATCH",
+            "base_offset": layout.block5_base,
+            "bytes": layout.l2_block5_bytes,
+            "uses": [[8, 20], [22, 35]],
+        },
+        {
+            "name": "L3_BRANCH_SCRATCH",
+            "base_offset": layout.block5_base,
+            "bytes": layout.l3_block5_bytes,
+            "uses": [[41, 53], [55, 68]],
+        },
+        {
+            "name": "BLOCK5_ROW_GROUP",
+            "base_offset": layout.block5_base,
+            "bytes": max(layout.l2_block5_bytes, layout.l3_block5_bytes),
+            "reason": "one reused compact branch workspace; L2/L3 uses are serialized",
+        },
+        {
+            "name": "C1_SCRATCH",
+            "base_offset": layout.c1_scratch_base,
+            "bytes": layout.l2_scratch_slot_bytes,
+            "uses": [[7, 20], [21, 35], [40, 53], [54, 68]],
+        },
+        {
+            "name": "B2_SRC1_BACKUP",
+            "base_offset": 0,
+            "bytes": 0,
+            "retired": True,
+            "reason": "H256 B2 output ends before the L20 source begins",
+        },
+        {
+            "name": "POOL1_OR_POOL2",
+            "base_offset": layout.pool1_base,
+            "bytes": layout.pool1_bytes,
+            "uses": [[1, 3], [6, 38]],
+        },
+        {
+            "name": "POOL_TMP",
+            "base_offset": layout.pool_tmp_base,
+            "bytes": layout.pool1_bytes,
+            "uses": [[5, 6]],
+        },
+    ]
+
+    allocations: List[dict] = []
+    for tensor_id_s, lifetime in tensor_lifetimes.items():
+        if lifetime["lifetime_begin"] is None or lifetime["lifetime_end"] is None:
+            continue
+        allocations.append(
+            {
+                "name": lifetime["name"],
+                "tensor_id": int(tensor_id_s),
+                "base": lifetime["physical_base"],
+                "end": lifetime["physical_end"],
+                "begin_uop": lifetime["lifetime_begin"],
+                "end_uop": lifetime["lifetime_end"],
+                "kind": "tensor",
+            }
+        )
+
+    for name, base, byte_count, uses in (
+        ("L2_BLOCK5_WORKSPACE", layout.block5_base, layout.l2_block5_bytes, ((8, 20), (22, 35))),
+        ("L3_BLOCK5_WORKSPACE", layout.block5_base, layout.l3_block5_bytes, ((41, 53), (55, 68))),
+        ("L2_C1_SCRATCH", layout.c1_scratch_base, layout.l2_scratch_slot_bytes, ((7, 20), (21, 35))),
+        ("L30_C1_SCRATCH", layout.c1_scratch_base, layout.l3_scratch_slot_bytes, ((40, 53),)),
+        ("L3B0_C1_SCRATCH", FMBUF_L3B0_SCRATCH_BASE, layout.l3_scratch_slot_bytes, ((54, 68),)),
+    ):
+        for use_index, (begin_uop, end_uop) in enumerate(uses):
+            allocations.append(
+                {
+                    "name": f"{name}_{use_index}",
+                    "base": base,
+                    "end": base + byte_count,
+                    "begin_uop": begin_uop,
+                    "end_uop": end_uop,
+                    "kind": "transient",
+                }
+            )
+
+    approved_in_place_pairs = {
+        frozenset(pair)
+        for pair in ((2, 3), (4, 5), (6, 7), (7, 9), (9, 10),
+                     (11, 12), (13, 14), (14, 15), (15, 16))
+    }
+    unsafe_overlaps: List[dict] = []
+    approved_overlaps: List[dict] = []
+    for index, lhs in enumerate(allocations):
+        for rhs in allocations[index + 1 :]:
+            physical_overlap = lhs["base"] < rhs["end"] and rhs["base"] < lhs["end"]
+            lifetime_overlap = (
+                lhs["begin_uop"] <= rhs["end_uop"]
+                and rhs["begin_uop"] <= lhs["end_uop"]
+            )
+            if not physical_overlap or not lifetime_overlap:
+                continue
+            tensor_pair = frozenset((lhs.get("tensor_id"), rhs.get("tensor_id")))
+            approved = (
+                lhs["kind"] == "tensor"
+                and rhs["kind"] == "tensor"
+                and tensor_pair in approved_in_place_pairs
+            )
+            record = {
+                "lhs": lhs["name"],
+                "rhs": rhs["name"],
+                "physical_overlap": [max(lhs["base"], rhs["base"]), min(lhs["end"], rhs["end"])],
+                "lifetime_overlap": [
+                    max(lhs["begin_uop"], rhs["begin_uop"]),
+                    min(lhs["end_uop"], rhs["end_uop"]),
+                ],
+            }
+            if approved:
+                record["reason"] = "scheduled in-place read/write handoff"
+                approved_overlaps.append(record)
+            else:
+                unsafe_overlaps.append(record)
+
+    all_regions_in_bounds = all(
+        0 <= item["base"] <= item["end"] <= layout.fmbuf_bytes
+        for item in allocations
+    )
+    b2_output_end = int(TENSOR_DESC_BY_ID[9].base_offset) + tensor_storage_bytes(TENSOR_DESC_BY_ID[9])
+    b2_backup_retired = b2_output_end <= int(TENSOR_DESC_BY_ID[5].base_offset)
+    l3b0_c1_end = FMBUF_L3B0_SCRATCH_BASE + layout.l3_scratch_slot_bytes
+    l3_block5_end = layout.block5_base + layout.l3_block5_bytes
+    l3b0_c1_disjoint_from_block5 = (
+        l3b0_c1_end <= layout.block5_base
+        or l3_block5_end <= FMBUF_L3B0_SCRATCH_BASE
+    )
+    if unsafe_overlaps:
+        raise ValueError(f"unsafe shared-FMBUF overlap: {unsafe_overlaps}")
+    if not all_regions_in_bounds:
+        raise ValueError("shared-FMBUF allocation exceeds compact physical storage")
+    if not b2_backup_retired:
+        raise ValueError("compact layout still requires the retired B2 source backup")
+    if not l3b0_c1_disjoint_from_block5:
+        raise ValueError("L3B0 C1 source overlaps its live BLOCK5 workspace")
+
     return {
-        "format": "ESP_INT8_MEMORY_LIFETIME_AUDIT_V1",
+        "format": "ESP_INT8_MEMORY_LIFETIME_AUDIT_V2",
+        "physical_layout": {
+            "uram_bytes": layout.uram_bytes,
+            "bram_bytes": layout.bram_bytes,
+            "high_water_mark": layout.fmbuf_bytes,
+            "estimated_uram_blocks_256b": layout.uram_bytes // 0x8000,
+            "pool_bram_base": layout.pool1_base,
+        },
         "aliases": [
             {
                 "name": "POOL2_OVER_POOL1_FMBUF",
@@ -3426,27 +3914,33 @@ def build_memory_lifetime_audit(uops: Sequence[Uop]) -> dict:
                 "virtual_bank_id": BANK_BRAM_SCR1,
                 "target_bank": "BANK_FMEM0",
                 "target_bank_id": BANK_FMEM0,
-                "base_offset": FMBUF_POOL2_ALIAS_BASE,
-                "bytes": FMBUF_POOL2_ALIAS_BYTES,
+                "base_offset": layout.pool1_base,
+                "bytes": layout.pool2_bytes,
                 "overlays_tensor": "T_POOL1",
                 "producer_tensor": "T_POOL2",
                 "reason": "T_POOL1 is last read before T_POOL2 is first written; pool temp is not aliased.",
             }
         ],
-        "tensor_lifetimes": {
-            str(tensor_id): tensor_lifetime(tensor_id)
-            for tensor_id in sorted(TENSOR_DESC_BY_ID)
-        },
+        "tensor_lifetimes": tensor_lifetimes,
+        "transient_regions": transient_regions,
+        "approved_in_place_overlaps": approved_overlaps,
+        "unsafe_overlaps": unsafe_overlaps,
         "hard_checks": {
             "pool2_alias_fits_pool1_region": pool2_alias_fits,
             "pool2_alias_lifetime_safe": pool2_alias_lifetime_safe,
             "pool2_alias_safe": pool2_alias_safe,
+            "all_regions_in_bounds": all_regions_in_bounds,
+            "all_overlaps_lifetime_safe": not unsafe_overlaps,
+            "b2_backup_retired": b2_backup_retired,
+            "l3b0_c1_disjoint_from_block5": l3b0_c1_disjoint_from_block5,
         },
     }
 
 
 def build_param_audit(
     *,
+    geometry: DeploymentGeometry,
+    classes: int,
     qparams: Dict[str, Tuple[float, int, str]],
     scale_names: Sequence[str],
     section_offsets: Dict[str, int],
@@ -3481,7 +3975,7 @@ def build_param_audit(
         raise ValueError(f"S5 hot path selected narrow fixed RMW layout: {store_layouts}")
     if store_layouts.get(STORE_LAYOUT_NAMES[STORE_LAYOUT_COLD_RMW_FALLBACK], 0):
         raise ValueError(f"S5 hot path selected cold RMW fallback: {store_layouts}")
-    block5_feasibility = build_block5_feasibility_audit()
+    block5_feasibility = build_block5_feasibility_audit(geometry)
 
     scale_report = [
         {
@@ -3496,6 +3990,8 @@ def build_param_audit(
     return {
         "format": "ESP_INT8_PARAM_AUDIT_V4",
         "param_version": PARAM_BLOB_VERSION_SCHED,
+        "geometry": geometry.to_manifest(),
+        "class_count": _check_class_count(classes),
         "section_offsets": section_offsets,
         "section_sizes": section_sizes,
         "scale_table": scale_report,
@@ -3553,6 +4049,18 @@ def build_param_audit(
                 memory_audit.get("hard_checks", {}).get("pool2_alias_lifetime_safe", False)
             ),
             "pool2_alias_safe": bool(memory_audit.get("hard_checks", {}).get("pool2_alias_safe", False)),
+            "memory_regions_in_bounds": bool(
+                memory_audit.get("hard_checks", {}).get("all_regions_in_bounds", False)
+            ),
+            "memory_overlaps_lifetime_safe": bool(
+                memory_audit.get("hard_checks", {}).get("all_overlaps_lifetime_safe", False)
+            ),
+            "b2_backup_retired": bool(
+                memory_audit.get("hard_checks", {}).get("b2_backup_retired", False)
+            ),
+            "l3b0_c1_disjoint_from_block5": bool(
+                memory_audit.get("hard_checks", {}).get("l3b0_c1_disjoint_from_block5", False)
+            ),
             "store_layouts_scheduled": bool(store_layouts),
             "no_store_cold_rmw_fallback": store_layouts.get(STORE_LAYOUT_NAMES[STORE_LAYOUT_COLD_RMW_FALLBACK], 0) == 0,
             "block5_schedule_section_present": len(block5_sched_descs) > 0,
@@ -3566,6 +4074,15 @@ def build_blob_v4(args: argparse.Namespace) -> dict:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     warnings: List[str] = []
+
+    contract = load_deployment_contract(artifact_dir)
+    requested_geometry = DeploymentGeometry(args.height, args.width, args.target_scale)
+    if requested_geometry != contract.geometry:
+        raise ValueError(
+            "CLI geometry disagrees with model artifact: "
+            f"requested={requested_geometry.to_manifest()} artifact={contract.geometry.to_manifest()}"
+        )
+    activate_deployment_plans(contract.class_count, geometry=contract.geometry)
 
     qparams = collect_activation_qparams(artifact_dir)
     scale_names, scale_ids = build_scale_table(qparams)
@@ -3583,8 +4100,8 @@ def build_blob_v4(args: argparse.Namespace) -> dict:
     add_q_blob, add_q_local_offsets, add_report = build_add_qparams(qparams, scale_ids, warnings)
     pool_q_blob, pool_q_local_offsets, pool_report = build_pool_qparams(qparams, scale_ids)
 
-    uops = build_uops()
-    memory_audit = build_memory_lifetime_audit(uops)
+    uops = build_uops(contract.class_count, geometry=contract.geometry)
+    memory_audit = build_memory_lifetime_audit(uops, geometry=contract.geometry)
     window_scheds, window_cmds, schedule_ids_by_param, window_audit = build_window_schedule_sections(uops)
     conv_exec_descs, row_consumers, fixed_exec_descs, exec_plan, block5_sched_descs, fusion_coverage = build_exec_plan_sections(
         uops,
@@ -3719,6 +4236,8 @@ def build_blob_v4(args: argparse.Namespace) -> dict:
     pad_to(blob)
 
     audit = build_param_audit(
+        geometry=contract.geometry,
+        classes=contract.class_count,
         qparams=qparams,
         scale_names=scale_names,
         section_offsets=offsets,
@@ -3741,7 +4260,42 @@ def build_blob_v4(args: argparse.Namespace) -> dict:
     (out_dir / "window_pack_cmd.bin").write_bytes(window_cmd_data)
     (out_dir / "block5_sched_desc.bin").write_bytes(block5_sched_data)
 
-    frame_report = build_hw_frame_files(artifact_dir, out_dir)
+    frame_report = build_hw_frame_files(
+        artifact_dir,
+        out_dir,
+        geometry=contract.geometry,
+        classes=contract.class_count,
+    )
+    frame_report.update(
+        build_param_replay_golden(
+            out_dir,
+            geometry=contract.geometry,
+            classes=contract.class_count,
+        )
+    )
+    frame_hashes = {
+        "input": {
+            "file": "INPUTQ.BIN",
+            "sha256": sha256_file(out_dir / "INPUTQ.BIN"),
+        },
+        "golden_output": {
+            "file": "golden_output_q.bin",
+            "sha256": sha256_file(out_dir / "golden_output_q.bin"),
+        },
+        "model_golden_output": {
+            "file": "model_golden_output_q.bin",
+            "sha256": sha256_file(out_dir / "model_golden_output_q.bin"),
+        },
+        "replay_output": {
+            "file": "replay_output_q.bin",
+            "sha256": sha256_file(out_dir / "replay_output_q.bin"),
+        },
+        "param": {
+            "file": "PARAM.BIN",
+            "sha256": sha256_file(out_dir / "PARAM.BIN"),
+        },
+    }
+    frame_report["sha256"] = frame_hashes
 
     scale_report = audit["scale_table"]
     (out_dir / "scale_table.json").write_text(
@@ -3780,15 +4334,29 @@ def build_blob_v4(args: argparse.Namespace) -> dict:
         "param_blob_bytes": len(blob),
         "param_blob_sha256": audit["param_blob"]["sha256"],
         "param_version": PARAM_BLOB_VERSION_SCHED,
+        "artifact_hashes": frame_hashes,
         "hardware_contract": {
-            "memory_layout": "p7_ppu_bram_pool2_alias_wbuf120k_20260707",
+            "memory_layout": "p7_h256_compact_fmbuf_v1_20260909",
             "schedule": "P7_PARAM_V4_EXEC_PLAN",
             "weight_layout": "SA-ready packed weight words: oc-local TM lane, kt K-tile",
             "window_schedule": "PARAM v4 staged 3x3/1x1 descriptors; pack commands are audit/replay-only",
             "fixed_ops": "PARAM v4 fixed_exec_desc section; no HLS legacy-uop reconstruction",
-            "board_input": "NHWC signed int8, 512x1024x3",
-            "board_output": "full-res uint8 mask for P7 fullres hardware, or low-res logits debug files",
+            "board_input": (
+                f"NHWC signed int8, {contract.geometry.input_height}x"
+                f"{contract.geometry.input_width}x3"
+            ),
+            "board_output": (
+                f"full-res uint8 mask, {contract.geometry.input_height}x"
+                f"{contract.geometry.input_width}; low-res logits {contract.geometry.logits_height}x"
+                f"{contract.geometry.logits_width}x{contract.class_count}"
+            ),
         },
+        "deployment": {
+            "profile_name": contract.profile_name,
+            "class_count": contract.class_count,
+            "ignore_metric_class": contract.ignore_metric_class,
+        },
+        "geometry": contract.geometry.to_manifest(),
         "uop_count": len(uops),
         "exec_entry_count": len(exec_plan),
         "tensor_desc_count": len(TENSOR_PLAN),
@@ -3850,6 +4418,10 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
         "window_pack_cmd_count": header[29],
         "row_consumer_desc_count": header[31],
     }
+    if counts["exec_entry_count"] != 16:
+        raise ValueError(
+            f"unexpected exec entry count: {counts['exec_entry_count']}; expected 16"
+        )
     if counts["tensor_desc_count"] != len(TENSOR_PLAN):
         raise ValueError(f"unexpected tensor count: {counts['tensor_desc_count']}")
     if counts["legacy_uop_count"] != 75:
@@ -3883,6 +4455,47 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
     for (name_a, off_a), (name_b, off_b) in zip(sorted_offsets, sorted_offsets[1:]):
         if off_a > off_b:
             raise ValueError(f"section order is not monotonic: {name_a}->{name_b}")
+
+    # Rebuild the expected descriptor plan from the selected artifact
+    # contract. Comparing packed bytes catches stale H512/W1024 geometry or
+    # a partially updated UOP table before the blob reaches PARAM.BIN.
+    expected_geometry = (
+        DeploymentGeometry.from_manifest(audit["geometry"])
+        if audit is not None and audit.get("geometry") is not None
+        else DeploymentGeometry(TENSOR_PLAN[0].h, TENSOR_PLAN[0].w, 8)
+    )
+    expected_classes = (
+        int(audit["class_count"])
+        if audit is not None and audit.get("class_count") is not None
+        else int(TENSOR_PLAN[17].c)
+    )
+    expected_tensors, _expected_convs = build_deployment_plans(
+        expected_classes, geometry=expected_geometry
+    )
+    expected_uops = build_uops(expected_classes, geometry=expected_geometry)
+    expected_tensor_data = b"".join(pack_tensor_desc(desc) for desc in expected_tensors)
+    actual_tensor_data = data[
+        offsets["tensor_desc"] : offsets["tensor_desc"] + len(expected_tensor_data)
+    ]
+    if actual_tensor_data != expected_tensor_data:
+        raise ValueError("tensor descriptor table does not match the selected geometry/class plan")
+    expected_uop_data = b"".join(pack_uop(uop) for uop in expected_uops)
+    uop_end = offsets["legacy_uop_debug"] + len(expected_uop_data)
+    if uop_end > len(data):
+        raise ValueError("legacy UOP debug section is truncated")
+    if data[offsets["legacy_uop_debug"] : uop_end] != expected_uop_data:
+        raise ValueError("UOP table does not match the selected geometry/class plan")
+    expected_schedules, _expected_cmds, _schedule_ids, _schedule_audit = build_window_schedule_sections(
+        expected_uops
+    )
+    expected_schedule_data = b"".join(
+        pack_window_sched_desc(desc) for desc in expected_schedules
+    )
+    actual_schedule_data = data[
+        offsets["window_sched_desc"] : offsets["window_sched_desc"] + len(expected_schedule_data)
+    ]
+    if actual_schedule_data != expected_schedule_data:
+        raise ValueError("window schedule table does not match the selected UOP geometry plan")
 
     tensor_descs: List[TensorDesc] = []
     tensor_off = offsets["tensor_desc"]
@@ -3939,6 +4552,36 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
     last = struct.unpack("<4B", data[exec_off + (exec_count - 1) * 4 : exec_off + exec_count * 4])
     if last[0] != EXEC_END:
         raise ValueError(f"exec_plan last entry is not EXEC_END: {last}")
+    expected_exec_signature = [
+        (EXEC_POOL, 1),
+        (EXEC_CONV, 2),
+        (EXEC_POOL, 5),
+        (EXEC_POOL, 6),
+        (EXEC_CONV, 7),
+        (EXEC_BLOCK_AFFINE, 20),
+        (EXEC_CONV, 21),
+        (EXEC_BLOCK_ADD_AFFINE, 35),
+        (EXEC_BLOCK_AFFINE, 39),
+        (EXEC_CONV, 40),
+        (EXEC_BLOCK_AFFINE, 53),
+        (EXEC_CONV, 54),
+        (EXEC_BLOCK_ADD_AFFINE, 68),
+        (EXEC_BLOCK_AFFINE, 71),
+        (EXEC_CONV, 72),
+        (EXEC_END, len(expected_uops) - 1),
+    ]
+    actual_exec_signature = [
+        (
+            data[exec_off + i * 4],
+            data[exec_off + i * 4 + 2],
+        )
+        for i in range(exec_count)
+    ]
+    if actual_exec_signature != expected_exec_signature:
+        raise ValueError(
+            "exec_plan does not match the P7 v4 schedule signature: "
+            f"actual={actual_exec_signature} expected={expected_exec_signature}"
+        )
     executed_conv_desc_ids: set[int] = set()
     for i in range(exec_count):
         kind, desc_id, _logical, _flags = struct.unpack("<4B", data[exec_off + i * 4 : exec_off + (i + 1) * 4])
@@ -4125,6 +4768,14 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
             raise ValueError("audit reports packed weight WBUF overflow")
         if not audit.get("hard_checks", {}).get("pool2_alias_safe", False):
             raise ValueError("audit reports unsafe pool2 BRAM alias")
+        for check_name in (
+            "memory_regions_in_bounds",
+            "memory_overlaps_lifetime_safe",
+            "b2_backup_retired",
+            "l3b0_c1_disjoint_from_block5",
+        ):
+            if not audit.get("hard_checks", {}).get(check_name, False):
+                raise ValueError(f"audit reports failed compact-memory check: {check_name}")
 
 
 def main() -> None:
@@ -4146,6 +4797,9 @@ def main() -> None:
         default=4,
         help="Only PARAM v4/P7 staged-WinGen schedule blobs are supported.",
     )
+    parser.add_argument("--height", type=int, default=DEFAULT_GEOMETRY.input_height)
+    parser.add_argument("--width", type=int, default=DEFAULT_GEOMETRY.input_width)
+    parser.add_argument("--target-scale", type=int, default=DEFAULT_GEOMETRY.target_scale)
     parser.add_argument(
         "--strict-zp",
         action="store_true",

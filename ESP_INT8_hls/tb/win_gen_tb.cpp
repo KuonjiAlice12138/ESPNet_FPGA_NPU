@@ -92,7 +92,8 @@ void scheduled_window_generator_row(const tensor_desc_t& src_desc,
                                      const window_sched_desc_t& sched,
                                      hls::stream<act_vec_t>& act_stream0,
                                      hls::stream<act_vec_t>& act_stream1,
-                                     u16_t out_row);
+                                     u16_t out_row,
+                                     volatile u8_t& prof_conv_win_state);
 
 }  // namespace esp_int8
 
@@ -397,11 +398,17 @@ static void check_case(const char* tag,
 
     hls::stream<esp_int8::act_vec_t> stream0;
     hls::stream<esp_int8::act_vec_t> stream1;
+    volatile esp_int8::u8_t prof_conv_win_state = 0;
     const int out_h = (in_h + stride - 1) / stride;
     for (int oh = 0; oh < out_h; ++oh) {
         const int issue_count = paired ? (sched.out_w.to_uint() + 1) / 2 : sched.out_w.to_uint();
         esp_int8::scheduled_window_generator_row(
-            desc, sched, stream0, stream1, static_cast<esp_int8::u16_t>(oh));
+            desc,
+            sched,
+            stream0,
+            stream1,
+            static_cast<esp_int8::u16_t>(oh),
+            prof_conv_win_state);
         for (int issue = 0; issue < issue_count; ++issue) {
             const int pixel0 = paired ? issue * 2 : issue;
             for (int kt = 0; kt < sched.k_tiles.to_uint(); ++kt) {

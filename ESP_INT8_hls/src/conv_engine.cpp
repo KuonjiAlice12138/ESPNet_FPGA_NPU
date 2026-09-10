@@ -48,13 +48,15 @@ void scheduled_window_generator_row(const tensor_desc_t& src_desc,
                                      const window_sched_desc_t& sched,
                                      hls::stream<act_vec_t>& act_stream0,
                                      hls::stream<act_vec_t>& act_stream1,
-                                     u16_t out_row);
+                                     u16_t out_row,
+                                     volatile u8_t& prof_conv_win_state);
 void systolic_array_core_row(hls::stream<act_vec_t>& act_stream0,
                              hls::stream<act_vec_t>& act_stream1,
                              const wgt_vec_t weight_buf[TM][MAX_K_TILE_COUNT],
                              hls::stream<psum_half_vec_t>& psum_stream,
                              hls::stream<conv_cfg_t>& cfg_stream,
-                             hls::stream<u8_t>& sched_flags_stream);
+                             hls::stream<u8_t>& sched_flags_stream,
+                             volatile u8_t& prof_conv_sa_state);
 bool ppu_preadd_row(const tensor_desc_t& other,
                     u16_t out_row,
                     const conv_cfg_t& cfg,
@@ -83,7 +85,6 @@ bool ppu_consume_block5_final_row(const block5_sched_desc_t& sched,
                                   const tensor_desc_t& final_dst,
                                   bool has_residual,
                                   const add_q_t& residual_add_qparam,
-                                  const conv_cfg_t& cfg,
                                   u8_t act_type,
                                   u16_t local_row,
                                   u16_t abs_row,
@@ -223,7 +224,8 @@ static void post_process_conv_row_to_buffer(
     const conv_cfg_t& cfg,
     const window_sched_desc_t& sched,
     u8_t act_type,
-    const conv_q_t& qparam) {
+    const conv_q_t& qparam,
+    volatile u8_t& prof_conv_post_state) {
 #pragma HLS INLINE off
 #pragma HLS ARRAY_PARTITION variable=qparam.bias complete dim=1
 #pragma HLS ARRAY_PARTITION variable=qparam.mult complete dim=1
@@ -246,6 +248,8 @@ static void post_process_conv_row_to_buffer(
     if (issue_i >= issue_count) {
       break;
     }
+    npu_profile_set_conv_post_state(prof_conv_post_state,
+                                    PROF_CONV_POST_REQUANT_OR_WAIT_PSUM);
     const psum_half_vec_t psum_word0 = psum_stream.read();
     psum_half_vec_t psum_word1 = 0;
     if (paired || out_c_i > TM / 2) {
@@ -288,12 +292,16 @@ static void post_process_conv_row_to_buffer(
       }
     }
     const int pixel0 = paired ? issue_i * 2 : issue_i;
+    npu_profile_set_conv_post_state(prof_conv_post_state,
+                                    PROF_CONV_POST_ROWBUF_WRITE);
     row_buf[pixel0] = packed0;
     const bool tail_issue = odd_tail && issue_i == issue_count - 1;
     if (paired && !tail_issue) {
       row_buf[pixel0 + 1] = packed1;
     }
   }
+  npu_profile_set_conv_post_state(prof_conv_post_state,
+                                  PROF_CONV_POST_IDLE_OR_DONE);
 }
 
 static void generate_conv_window_row(
@@ -304,11 +312,17 @@ static void generate_conv_window_row(
     hls::stream<u8_t>& sa_sched_flags_stream,
     const conv_cfg_t& cfg,
     const window_sched_desc_t& sched,
-    u16_t out_row) {
+    u16_t out_row,
+    volatile u8_t& prof_conv_win_state) {
 #pragma HLS INLINE off
   sa_cfg_stream.write(cfg);
   sa_sched_flags_stream.write(sched.flags);
-  scheduled_window_generator_row(src, sched, act_stream0, act_stream1, out_row);
+  scheduled_window_generator_row(src,
+                                 sched,
+                                 act_stream0,
+                                 act_stream1,
+                                 out_row,
+                                 prof_conv_win_state);
 }
 
 static void shared_conv_row_engine(
@@ -319,7 +333,10 @@ static void shared_conv_row_engine(
     const conv_q_t& qparam,
     u16_t out_row,
     act_vec_t row_buf[MAX_FM_W],
-    const wgt_vec_t weight_buf[TM][MAX_K_TILE_COUNT]) {
+    const wgt_vec_t weight_buf[TM][MAX_K_TILE_COUNT],
+    volatile u8_t& prof_conv_win_state,
+    volatile u8_t& prof_conv_sa_state,
+    volatile u8_t& prof_conv_post_state) {
 #pragma HLS INLINE off
   hls::stream<act_vec_t> act_stream0;
   hls::stream<act_vec_t> act_stream1;
@@ -342,14 +359,22 @@ static void shared_conv_row_engine(
                            sa_sched_flags_stream,
                            cfg,
                            sched,
-                           out_row);
+                           out_row,
+                           prof_conv_win_state);
   systolic_array_core_row(act_stream0,
                           act_stream1,
                           weight_buf,
                           psum_stream,
                           sa_cfg_stream,
-                          sa_sched_flags_stream);
-  post_process_conv_row_to_buffer(psum_stream, row_buf, cfg, sched, act_type, qparam);
+                          sa_sched_flags_stream,
+                          prof_conv_sa_state);
+  post_process_conv_row_to_buffer(psum_stream,
+                                  row_buf,
+                                  cfg,
+                                  sched,
+                                  act_type,
+                                  qparam,
+                                  prof_conv_post_state);
 }
 
 static void replay_conv_row_to_stream(const act_vec_t row_buf[MAX_FM_W],
@@ -414,7 +439,10 @@ static void load_conv_weight_buffer(const conv_exec_desc_t& conv_desc,
 
 static bool run_conv_rows_task(const conv_rows_task_t& task,
                                axi_vec_t* gmem_frame_out,
-                               volatile u8_t& prof_stage_id) {
+                               volatile u8_t& prof_stage_id,
+                               volatile u8_t& prof_conv_win_state,
+                               volatile u8_t& prof_conv_sa_state,
+                               volatile u8_t& prof_conv_post_state) {
 #pragma HLS INLINE off
 #pragma HLS BIND_STORAGE variable=s_shared_conv_row_buf type=ram_2p impl=bram
 #pragma HLS ARRAY_PARTITION variable=s_shared_weight_buf cyclic factor=16 dim=1
@@ -450,7 +478,10 @@ static bool run_conv_rows_task(const conv_rows_task_t& task,
                            task.qparam,
                            conv_row,
                            s_shared_conv_row_buf,
-                           s_shared_weight_buf);
+                           s_shared_weight_buf,
+                           prof_conv_win_state,
+                           prof_conv_sa_state,
+                           prof_conv_post_state);
     if (!csim_dump_u40_prestore_row(task.conv_desc, conv_row, task.cfg, s_shared_conv_row_buf)) {
       write_ok = false;
     }
@@ -506,7 +537,6 @@ static bool run_conv_rows_task(const conv_rows_task_t& task,
                                             task.block5_final_dst,
                                             task.block5_has_residual,
                                             task.block5_residual_add_qparam,
-                                            task.cfg,
                                             task.block5_act_type,
                                             consumer_row,
                                             conv_row,
@@ -777,18 +807,29 @@ static bool build_conv_task_from_issue(const conv_issue_t& issue,
 static bool run_conv_issue_once(const conv_issue_t& issue,
                                 axi_vec_t* gmem_frame_out,
                                 conv_issue_result_t& result,
-                                volatile u8_t& prof_stage_id) {
+                                volatile u8_t& prof_stage_id,
+                                volatile u8_t& prof_conv_win_state,
+                                volatile u8_t& prof_conv_sa_state,
+                                volatile u8_t& prof_conv_post_state) {
 #pragma HLS INLINE off
   conv_rows_task_t task;
   if (!build_conv_task_from_issue(issue, task, result)) {
     return false;
   }
-  return run_conv_rows_task(task, gmem_frame_out, prof_stage_id);
+  return run_conv_rows_task(task,
+                            gmem_frame_out,
+                            prof_stage_id,
+                            prof_conv_win_state,
+                            prof_conv_sa_state,
+                            prof_conv_post_state);
 }
 
 error_code_t conv_engine_exec(const npu_issue_t& issue,
                               axi_vec_t* gmem_frame_out,
-                              volatile u8_t& prof_stage_id) {
+                              volatile u8_t& prof_stage_id,
+                              volatile u8_t& prof_conv_win_state,
+                              volatile u8_t& prof_conv_sa_state,
+                              volatile u8_t& prof_conv_post_state) {
 #pragma HLS INLINE off
   conv_issue_t conv_issue = conv_issue_t();
   conv_issue_result_t result;
@@ -815,7 +856,13 @@ error_code_t conv_engine_exec(const npu_issue_t& issue,
     return ERR_UNSUPPORTED_OPCODE;
   }
 
-  if (!run_conv_issue_once(conv_issue, gmem_frame_out, result, prof_stage_id)) {
+  if (!run_conv_issue_once(conv_issue,
+                           gmem_frame_out,
+                           result,
+                           prof_stage_id,
+                           prof_conv_win_state,
+                           prof_conv_sa_state,
+                           prof_conv_post_state)) {
     return ERR_BANK_OVERFLOW;
   }
 

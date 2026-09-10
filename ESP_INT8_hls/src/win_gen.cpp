@@ -1,4 +1,5 @@
 #include "../include/npu_config.hpp"
+#include "../include/npu_ctrl.hpp"
 #include "../include/npu_schedule.hpp"
 #include "../include/npu_types.hpp"
 
@@ -2091,25 +2092,24 @@ static void scheduled_1x1_window_row(const tensor_desc_t& src_desc,
 void scheduled_window_generator_row(const tensor_desc_t& src_desc,
                                      const window_sched_desc_t& sched,
                                      hls::stream<act_vec_t>& act_stream0,
-    hls::stream<act_vec_t>& act_stream1,
-                                     u16_t out_row) {
+                                     hls::stream<act_vec_t>& act_stream1,
+                                     u16_t out_row,
+                                     volatile u8_t& prof_conv_win_state) {
 #pragma HLS INLINE off
+    npu_profile_set_conv_win_state(prof_conv_win_state, PROF_CONV_WIN_ACTIVE);
     const unsigned mode = sched.mode.to_uint();
     const unsigned loader_class = sched.loader_class.to_uint();
     if (loader_class == static_cast<unsigned>(WIN_LOADER_3X3_NARROW) ||
         loader_class == static_cast<unsigned>(WIN_LOADER_3X3_WIDE)) {
         scheduled_3x3_window_row_pipeline(
             src_desc, sched, act_stream0, act_stream1, out_row);
-        return;
-    }
-    if (mode == static_cast<unsigned>(WIN_MODE_1X1_ALIGNED)) {
+    } else if (mode == static_cast<unsigned>(WIN_MODE_1X1_ALIGNED)) {
         scheduled_1x1_window_row(src_desc, sched, act_stream0, act_stream1, out_row, true);
-        return;
-    }
-    if (mode == static_cast<unsigned>(WIN_MODE_1X1_PACKED)) {
+    } else if (mode == static_cast<unsigned>(WIN_MODE_1X1_PACKED)) {
         scheduled_1x1_window_row(src_desc, sched, act_stream0, act_stream1, out_row, false);
-        return;
     }
+    npu_profile_set_conv_win_state(prof_conv_win_state,
+                                   PROF_CONV_WIN_IDLE_OR_DONE);
 }
 
 }  // namespace esp_int8

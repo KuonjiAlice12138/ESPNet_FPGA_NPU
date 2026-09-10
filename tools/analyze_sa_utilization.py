@@ -41,6 +41,13 @@ OPCODE_NAME = {
 
 DEFAULT_ARTIFACT_DIR = Path("D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702")
 
+# Current P7 SA emits 16 INT32 psums per stream word.  Conv postprocess
+# requantizes 8 lanes/cycle, so one 32-lane issue occupies four post cycles.
+# Keep these architectural constants next to the model instead of silently
+# carrying forward the pre-P7 scalar-psum assumptions.
+PSUM_LANES_PER_WORD = 16
+POSTPROCESS_LANES_PER_CYCLE = 8
+
 # Latest board profile captured on 2026-05-13 after packed-read hardware update.
 # These are cumulative prefix runs from the app, not one full MODE_RUN.
 DEFAULT_PREFIX_CYCLES: Dict[int, int] = {
@@ -92,20 +99,37 @@ class ConvStats:
     dst: int
     in_shape: str
     out_shape: str
+    out_h: int
+    out_w: int
     kernel: int
     stride: int
     dilation: int
     out_pixels: int
     k_total: int
+    precision: str
+    activation_bits: int
+    weight_bits: int
+    effective_k_lanes: int
+    baseline_int8_k_tiles: int
     k_tiles: int
+    weight_k_tiles: int
+    k_tile_savings: int
     oc_tiles: int
     useful_macs: int
     pe_slot_macs: int
     arithmetic_fill: float
     sa_mac_occupancy_bound: float
     combined_sa_slot_bound: float
+    pixel_parallel: bool
+    issue_count_per_row: int
+    psum_words_per_issue: int
+    postprocess_cycles_per_issue: int
+    sa_cycles_per_issue: int
+    weight_load_cycles: int
     row_weight_load_cycles: int
     sa_compute_cycles_lower_bound: int
+    row_dataflow_cycles_lower_bound: int
+    int8_baseline_row_dataflow_cycles_lower_bound: int
     act_read_segments_per_pixel: int
     act_words_per_pixel: int
     read_segments_per_act_word: float
@@ -201,39 +225,84 @@ def parse_uops(path: Path) -> List[Uop]:
     return uops
 
 
-def act_read_segments_per_pixel(uop: Uop, tk: int) -> int:
+def act_read_segments_per_pixel(uop: Uop, logical_k_lanes: int) -> int:
     kernel = 1 if uop.kernel == 1 else 3
     if kernel == 1:
-        return ceil_div(uop.in_c, tk)
+        return ceil_div(uop.in_c, logical_k_lanes)
     # Current fast 3x3 path reads contiguous channel segments per spatial point.
-    return kernel * kernel * ceil_div(uop.in_c, tk)
+    return kernel * kernel * ceil_div(uop.in_c, logical_k_lanes)
 
 
-def conv_stats(uop: Uop, tm: int, tk: int) -> ConvStats:
+def conv_stats(
+    uop: Uop,
+    tm: int,
+    tk: int,
+    activation_bits: int = 8,
+    weight_bits: int = 8,
+    pixel_parallel: bool = False,
+) -> ConvStats:
+    if activation_bits not in (4, 8) or weight_bits not in (4, 8):
+        raise ValueError(f"unsupported precision W{weight_bits}A{activation_bits}")
+    if activation_bits == 4 and weight_bits != 4:
+        raise ValueError("A4 requires W4 in the unified mixed-precision SA")
     kernel = 1 if uop.kernel == 1 else 3
     stride = uop.stride or 1
     out_h = conv_out_dim(uop.in_h, stride)
     out_w = conv_out_dim(uop.in_w, stride)
     out_pixels = out_h * out_w
     k_total = uop.in_c * kernel * kernel
-    k_tiles = ceil_div(k_total, tk)
+    baseline_int8_k_tiles = ceil_div(k_total, tk)
+    effective_k_lanes = tk * 2 if activation_bits == 4 else tk
+    weight_k_lanes = tk * 2 if weight_bits == 4 else tk
+    k_tiles = ceil_div(k_total, effective_k_lanes)
+    weight_k_tiles = ceil_div(k_total, weight_k_lanes)
     oc_tiles = ceil_div(uop.out_c, tm)
+    if pixel_parallel and uop.out_c > tm // 2:
+        raise ValueError(
+            f"U{uop.index}: pixel-parallel schedule requires out_c <= {tm // 2}, "
+            f"got {uop.out_c}"
+        )
     useful_macs = out_pixels * uop.out_c * k_total
-    pe_slot_macs = out_pixels * oc_tiles * tm * k_tiles * tk
+    pe_slot_macs = out_pixels * oc_tiles * tm * k_tiles * effective_k_lanes
     arithmetic_fill = useful_macs / pe_slot_macs if pe_slot_macs else 0.0
 
-    # systolic_array_core_row has a kt loop plus a serial TM psum emit loop per pixel,
-    # and reloads k_tiles*TM weight vectors for each row. This is a lower bound because
-    # window generation, stream stalls, post-process, and memory writeback are omitted.
-    row_weight_load_cycles = out_h * oc_tiles * k_tiles * tm
-    pixel_mac_cycles = out_pixels * oc_tiles * k_tiles
-    pixel_psum_cycles = out_pixels * oc_tiles * tm
-    sa_compute_cycles_lower_bound = row_weight_load_cycles + pixel_mac_cycles + pixel_psum_cycles
+    # The current P7 engine preloads weights once per CONV task, emits 16 psums
+    # per stream word, and processes two pixels in one issue when scheduled.
+    # WinGen, SA and postprocess are in one row-level DATAFLOW region, so its
+    # steady-state lower bound is the slowest per-issue stage rather than the
+    # sum of all three stages.  This intentionally excludes PPU/store work.
+    issue_count_per_row = ceil_div(out_w, 2) if pixel_parallel else out_w
+    psum_words_per_issue = (
+        2 if pixel_parallel else ceil_div(min(uop.out_c, tm), PSUM_LANES_PER_WORD)
+    )
+    postprocess_cycles_per_issue = ceil_div(tm, POSTPROCESS_LANES_PER_CYCLE)
+    sa_cycles_per_issue = k_tiles + psum_words_per_issue
+    baseline_sa_cycles_per_issue = baseline_int8_k_tiles + psum_words_per_issue
+    weight_load_cycles = oc_tiles * weight_k_tiles * tm
+    baseline_weight_load_cycles = oc_tiles * baseline_int8_k_tiles * tm
+    # Retain the historical field for CSV consumers, but it now correctly
+    # represents the one-time task preload rather than a per-row reload.
+    row_weight_load_cycles = weight_load_cycles
+    pixel_mac_cycles = out_h * issue_count_per_row * oc_tiles * k_tiles
+    sa_issue_cycles = out_h * issue_count_per_row * oc_tiles * sa_cycles_per_issue
+    sa_compute_cycles_lower_bound = weight_load_cycles + sa_issue_cycles
+    row_dataflow_cycles_lower_bound = weight_load_cycles + (
+        out_h
+        * issue_count_per_row
+        * oc_tiles
+        * max(sa_cycles_per_issue, postprocess_cycles_per_issue)
+    )
+    int8_baseline_row_dataflow_cycles_lower_bound = baseline_weight_load_cycles + (
+        out_h
+        * issue_count_per_row
+        * oc_tiles
+        * max(baseline_sa_cycles_per_issue, postprocess_cycles_per_issue)
+    )
     sa_mac_occupancy_bound = (
         pixel_mac_cycles / sa_compute_cycles_lower_bound if sa_compute_cycles_lower_bound else 0.0
     )
     combined_sa_slot_bound = arithmetic_fill * sa_mac_occupancy_bound
-    read_segments = act_read_segments_per_pixel(uop, tk)
+    read_segments = act_read_segments_per_pixel(uop, effective_k_lanes)
 
     return ConvStats(
         uop=uop.index,
@@ -242,24 +311,117 @@ def conv_stats(uop: Uop, tm: int, tk: int) -> ConvStats:
         dst=uop.dst,
         in_shape=f"{uop.in_h}x{uop.in_w}x{uop.in_c}",
         out_shape=f"{out_h}x{out_w}x{uop.out_c}",
+        out_h=out_h,
+        out_w=out_w,
         kernel=kernel,
         stride=stride,
         dilation=uop.dilation or 1,
         out_pixels=out_pixels,
         k_total=k_total,
+        precision=f"W{weight_bits}A{activation_bits}",
+        activation_bits=activation_bits,
+        weight_bits=weight_bits,
+        effective_k_lanes=effective_k_lanes,
+        baseline_int8_k_tiles=baseline_int8_k_tiles,
         k_tiles=k_tiles,
+        weight_k_tiles=weight_k_tiles,
+        k_tile_savings=baseline_int8_k_tiles - k_tiles,
         oc_tiles=oc_tiles,
         useful_macs=useful_macs,
         pe_slot_macs=pe_slot_macs,
         arithmetic_fill=arithmetic_fill,
         sa_mac_occupancy_bound=sa_mac_occupancy_bound,
         combined_sa_slot_bound=combined_sa_slot_bound,
+        pixel_parallel=pixel_parallel,
+        issue_count_per_row=issue_count_per_row,
+        psum_words_per_issue=psum_words_per_issue,
+        postprocess_cycles_per_issue=postprocess_cycles_per_issue,
+        sa_cycles_per_issue=sa_cycles_per_issue,
+        weight_load_cycles=weight_load_cycles,
         row_weight_load_cycles=row_weight_load_cycles,
         sa_compute_cycles_lower_bound=sa_compute_cycles_lower_bound,
+        row_dataflow_cycles_lower_bound=row_dataflow_cycles_lower_bound,
+        int8_baseline_row_dataflow_cycles_lower_bound=(
+            int8_baseline_row_dataflow_cycles_lower_bound
+        ),
         act_read_segments_per_pixel=read_segments,
         act_words_per_pixel=k_tiles,
         read_segments_per_act_word=read_segments / k_tiles if k_tiles else 0.0,
     )
+
+
+def load_precision_contract(artifact_dir: Path) -> Dict[int, Tuple[int, int]]:
+    """Return PARAM-id -> execution (input bits, weight bits).
+
+    ``activation_bits`` in the exported contract describes the quantizer that
+    produces this CONV's output.  The SA input width is instead encoded by
+    ``src_format`` and can differ at a compiled precision boundary.  Likewise,
+    the physical weight stream is defined by ``weight_format``.  Utilization
+    must follow those physical formats because they control WinGen/SA K tiles.
+    """
+    for name in ("single_manifest.json", "export_manifest.json"):
+        path = artifact_dir / name
+        if not path.exists():
+            continue
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        entries = raw.get("precision_contract")
+        if not isinstance(entries, list):
+            continue
+        contract: Dict[int, Tuple[int, int]] = {}
+        for item in entries:
+            if not isinstance(item, dict):
+                raise ValueError(f"{path}: precision_contract entry must be an object")
+            param_id = int(item["param_id"])
+            src_format = int(item.get("src_format", 0))
+            weight_format = int(item.get("weight_format", 0))
+            if src_format not in (0, 1) or weight_format not in (0, 1):
+                raise ValueError(
+                    f"{path}: param {param_id} has unsupported physical formats "
+                    f"src={src_format}, weight={weight_format}"
+                )
+            activation_bits = 4 if src_format == 1 else 8
+            weight_bits = 4 if weight_format == 1 else 8
+            if activation_bits not in (4, 8) or weight_bits not in (4, 8):
+                raise ValueError(
+                    f"{path}: param {param_id} has unsupported W{weight_bits}A{activation_bits}"
+                )
+            if activation_bits == 4 and weight_bits != 4:
+                raise ValueError(f"{path}: param {param_id} requests unsupported A4W8")
+            contract[param_id] = (activation_bits, weight_bits)
+        return contract
+    return {}
+
+
+def load_window_schedule_contract(artifact_dir: Path) -> Dict[int, Tuple[bool, int]]:
+    """Return PARAM-id -> (pixel_parallel, compiled_k_tiles)."""
+    param_path = artifact_dir / "PARAM.BIN"
+    if not param_path.is_file():
+        return {}
+    try:
+        from tools.hw_param_replay import (
+            ParamBlob,
+            WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2,
+        )
+    except ModuleNotFoundError:
+        from hw_param_replay import (  # type: ignore[no-redef]
+            ParamBlob,
+            WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2,
+        )
+
+    blob = ParamBlob(param_path)
+    contract: Dict[int, Tuple[bool, int]] = {}
+    for desc in blob.conv_exec_by_index:
+        sched = blob.window_sched.get(desc.window_sched_id)
+        if sched is None:
+            raise ValueError(
+                f"{param_path}: conv param {desc.param_id} references missing "
+                f"window schedule {desc.window_sched_id}"
+            )
+        contract[desc.param_id] = (
+            bool(sched.flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2),
+            int(sched.k_tiles),
+        )
+    return contract
 
 
 def prefix_stats(conv_rows: List[ConvStats], prefix_cycles: Dict[int, int], tm: int, tk: int) -> List[PrefixStats]:
@@ -348,9 +510,11 @@ def stage_stats(conv_rows: List[ConvStats], prefix_cycles: Dict[int, int], tm: i
     return rows
 
 
-def parse_profile_json(path: Optional[Path]) -> Dict[int, int]:
+def parse_profile_json(
+    path: Optional[Path], *, use_legacy_default: bool = False
+) -> Dict[int, int]:
     if path is None:
-        return dict(DEFAULT_PREFIX_CYCLES)
+        return dict(DEFAULT_PREFIX_CYCLES) if use_legacy_default else {}
     raw = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(raw, dict):
         return {int(k): int(v) for k, v in raw.items()}
@@ -379,6 +543,18 @@ def print_summary(
     useful_total = sum(row.useful_macs for row in conv_rows)
     slot_total = sum(row.pe_slot_macs for row in conv_rows)
     lower_cycles_total = sum(row.sa_compute_cycles_lower_bound for row in conv_rows)
+    dataflow_cycles_total = sum(row.row_dataflow_cycles_lower_bound for row in conv_rows)
+    baseline_dataflow_cycles_total = sum(
+        row.int8_baseline_row_dataflow_cycles_lower_bound for row in conv_rows
+    )
+    baseline_tiles_total = sum(
+        row.baseline_int8_k_tiles * row.issue_count_per_row * row.out_h
+        for row in conv_rows
+    )
+    actual_tiles_total = sum(
+        row.k_tiles * row.issue_count_per_row * row.out_h
+        for row in conv_rows
+    )
 
     print("=== SA Utilization Summary ===")
     print(f"conv uops: {len(conv_rows)}")
@@ -386,6 +562,19 @@ def print_summary(
     print(f"PE slot MACs from tiling: {slot_total:,}")
     print(f"weighted arithmetic fill: {useful_total / slot_total:.4%}")
     print(f"SA row-core lower-bound cycles: {lower_cycles_total:,} ({lower_cycles_total / 100_000:.2f} ms @100MHz)")
+    if baseline_dataflow_cycles_total:
+        saved = baseline_dataflow_cycles_total - dataflow_cycles_total
+        print(
+            f"Conv row-DATAFLOW lower bound: {dataflow_cycles_total:,} vs INT8 "
+            f"{baseline_dataflow_cycles_total:,} (saved {saved:,}, "
+            f"{saved / baseline_dataflow_cycles_total:.2%})"
+        )
+    if baseline_tiles_total:
+        saved = baseline_tiles_total - actual_tiles_total
+        print(
+            f"activation K-tile issues: {actual_tiles_total:,} vs INT8 {baseline_tiles_total:,} "
+            f"(saved {saved:,}, {saved / baseline_tiles_total:.2%})"
+        )
     if prefixes:
         last = prefixes[-1]
         print(
@@ -397,7 +586,8 @@ def print_summary(
     for row in sorted(conv_rows, key=lambda r: r.arithmetic_fill)[:8]:
         print(
             f"U{row.uop:02d} p{row.param_id:02d} {row.in_shape}->{row.out_shape} "
-            f"k{row.kernel} K={row.k_total} kt={row.k_tiles} fill={row.arithmetic_fill:.2%} "
+            f"{row.precision} k{row.kernel} K={row.k_total} "
+            f"kt={row.k_tiles}/{row.baseline_int8_k_tiles} fill={row.arithmetic_fill:.2%} "
             f"SA_bound={row.combined_sa_slot_bound:.2%} reads/act={row.read_segments_per_act_word:.2f}"
         )
 
@@ -405,7 +595,8 @@ def print_summary(
     for row in sorted(conv_rows, key=lambda r: r.useful_macs, reverse=True)[:8]:
         print(
             f"U{row.uop:02d} p{row.param_id:02d} useful={row.useful_macs/1e6:.1f}M "
-            f"{row.in_shape}->{row.out_shape} k{row.kernel} fill={row.arithmetic_fill:.2%} "
+            f"{row.in_shape}->{row.out_shape} {row.precision} k{row.kernel} "
+            f"fill={row.arithmetic_fill:.2%} "
             f"reads/pixel={row.act_read_segments_per_pixel}"
         )
 
@@ -441,6 +632,11 @@ def main() -> None:
     parser.add_argument("--artifact-dir", type=Path, default=DEFAULT_ARTIFACT_DIR)
     parser.add_argument("--uop-table", type=Path, default=None)
     parser.add_argument("--profile-json", type=Path, default=None)
+    parser.add_argument(
+        "--legacy-default-profile",
+        action="store_true",
+        help="Use the historical 2026-05-13 prefix table when --profile-json is absent.",
+    )
     parser.add_argument("--tm", type=int, default=32)
     parser.add_argument("--tk", type=int, default=32)
     parser.add_argument("--out-prefix", type=Path, default=None)
@@ -449,8 +645,31 @@ def main() -> None:
     uop_path = args.uop_table or (args.artifact_dir / "uop_table.bin")
     out_prefix = args.out_prefix or (args.artifact_dir / "sa_utilization")
     uops = parse_uops(uop_path)
-    conv_rows = [conv_stats(uop, args.tm, args.tk) for uop in uops if uop.opcode == UOP_CONV]
-    profile = parse_profile_json(args.profile_json)
+    precision = load_precision_contract(args.artifact_dir)
+    schedules = load_window_schedule_contract(args.artifact_dir)
+    conv_rows = []
+    for uop in uops:
+        if uop.opcode != UOP_CONV:
+            continue
+        activation_bits, weight_bits = precision.get(uop.param_id, (8, 8))
+        pixel_parallel, compiled_k_tiles = schedules.get(uop.param_id, (False, 0))
+        row = conv_stats(
+            uop,
+            args.tm,
+            args.tk,
+            activation_bits=activation_bits,
+            weight_bits=weight_bits,
+            pixel_parallel=pixel_parallel,
+        )
+        if compiled_k_tiles and compiled_k_tiles != row.k_tiles:
+            raise ValueError(
+                f"U{uop.index}/param {uop.param_id}: PARAM schedule k_tiles="
+                f"{compiled_k_tiles} disagrees with physical precision model {row.k_tiles}"
+            )
+        conv_rows.append(row)
+    profile = parse_profile_json(
+        args.profile_json, use_legacy_default=args.legacy_default_profile
+    )
     prefixes = prefix_stats(conv_rows, profile, args.tm, args.tk)
     intervals = interval_stats(conv_rows, profile, args.tm, args.tk)
     stages = stage_stats(conv_rows, profile, args.tm, args.tk)
@@ -459,6 +678,10 @@ def main() -> None:
         "uop_table": str(uop_path),
         "tm": args.tm,
         "tk": args.tk,
+        "precision_contract_source": (
+            "single_manifest.json/export_manifest.json" if precision else "implicit W8A8"
+        ),
+        "schedule_contract_source": "PARAM.BIN" if schedules else "implicit serial pixels",
         "prefix_cycles": profile,
         "conv": [asdict(row) for row in conv_rows],
         "prefix": [asdict(row) for row in prefixes],
@@ -472,6 +695,30 @@ def main() -> None:
                 sum(row.useful_macs for row in conv_rows) / sum(row.pe_slot_macs for row in conv_rows)
             ),
             "sa_compute_cycles_lower_bound": sum(row.sa_compute_cycles_lower_bound for row in conv_rows),
+            "row_dataflow_cycles_lower_bound": sum(
+                row.row_dataflow_cycles_lower_bound for row in conv_rows
+            ),
+            "int8_baseline_row_dataflow_cycles_lower_bound": sum(
+                row.int8_baseline_row_dataflow_cycles_lower_bound for row in conv_rows
+            ),
+            "estimated_conv_datapath_reduction_vs_int8": (
+                1.0
+                - sum(row.row_dataflow_cycles_lower_bound for row in conv_rows)
+                / sum(
+                    row.int8_baseline_row_dataflow_cycles_lower_bound
+                    for row in conv_rows
+                )
+            ),
+            "activation_k_tile_issues": sum(
+                row.k_tiles * row.issue_count_per_row * row.out_h
+                for row in conv_rows
+            ),
+            "int8_baseline_k_tile_issues": sum(
+                row.baseline_int8_k_tiles
+                * row.issue_count_per_row
+                * row.out_h
+                for row in conv_rows
+            ),
         },
     }
 

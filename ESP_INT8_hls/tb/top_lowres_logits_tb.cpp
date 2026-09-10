@@ -56,9 +56,9 @@ static void pack_bytes(const std::vector<std::uint8_t>& bytes,
 }
 
 int main() {
-  const char* param_path = "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/PARAM.BIN";
-  const char* input_path = "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/input_q.bin";
-  const char* golden_path = "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/golden_output_q.bin";
+  const char* param_path = "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_v4/PARAM.BIN";
+  const char* input_path = "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_v4/input_q.bin";
+  const char* golden_path = "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_v4/golden_output_q.bin";
 
   std::vector<std::uint8_t> param_bytes;
   std::vector<std::uint8_t> input_bytes;

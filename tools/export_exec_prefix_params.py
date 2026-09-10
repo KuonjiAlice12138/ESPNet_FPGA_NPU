@@ -178,12 +178,12 @@ def main() -> None:
     parser.add_argument(
         "--param",
         type=Path,
-        default=root / "hw_artifacts" / "sched_v4_p7_0702" / "PARAM.BIN",
+        default=root / "hw_artifacts" / "binary2_int8_0809" / "PARAM.BIN",
     )
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=root / "hw_artifacts" / "sched_v4_p7_0702" / "exec_prefix",
+        default=root / "hw_artifacts" / "binary2_int8_0809" / "exec_prefix",
     )
     args = parser.parse_args()
 

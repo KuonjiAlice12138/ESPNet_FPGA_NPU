@@ -5,13 +5,6 @@
 namespace esp_int8 {
 
 bool param_dma_get_tensor_desc(u8_t tensor_id, tensor_desc_t& desc);
-bool on_chip_memory_read_fmbuf_abs_word(u8_t bank_id,
-                                        u32_t byte_offset,
-                                        axi_vec_t& packed);
-bool on_chip_memory_write_fmbuf_abs_word(u8_t bank_id,
-                                         u32_t byte_offset,
-                                         axi_vec_t packed);
-
 static tensor_desc_t s_scratch_desc[4];
 static bool s_scratch_valid[4] = {false, false, false, false};
 static tensor_desc_t s_global_alias_desc[MAX_TENSOR_DESC_COUNT];
@@ -275,81 +268,6 @@ bool resolve_block5_scratch_descs(u16_t pattern,
   cursor += row_pixels * static_cast<u32_t>(c3);
   s4 = make_block5_scratch_desc(cursor, rows, out_w, c4);
   return true;
-}
-
-static bool copy_src1_row_to_b2_backup(const tensor_desc_t& src1, u16_t row) {
-#pragma HLS INLINE off
-  const unsigned row_u = row.to_uint();
-  const unsigned slot = row_u & static_cast<unsigned>(B2_SRC1_BACKUP_ROWS - 1);
-  const u32_t src_base = src1.base_offset +
-                         static_cast<u32_t>(row_u * static_cast<unsigned>(B2_SRC1_BACKUP_ROW_BYTES));
-  const u32_t dst_base = static_cast<u32_t>(B2_SRC1_BACKUP_BASE) +
-                         static_cast<u32_t>(slot * static_cast<unsigned>(B2_SRC1_BACKUP_ROW_BYTES));
-
-  for (int word_idx = 0; word_idx < B2_SRC1_BACKUP_ROW_WORDS; ++word_idx) {
-#pragma HLS PIPELINE off
-    const u32_t offset = static_cast<u32_t>(word_idx * AXI_WORD_BYTES);
-    axi_vec_t word = 0;
-    if (!on_chip_memory_read_fmbuf_abs_word(src1.bank_id, src_base + offset, word)) {
-      return false;
-    }
-    if (!on_chip_memory_write_fmbuf_abs_word(static_cast<u8_t>(static_cast<unsigned>(BANK_FMEM0)),
-                                             dst_base + offset,
-                                             word)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool backup_b2_src1_rows_before_write(const tensor_desc_t& src1,
-                                      int write_row,
-                                      bool src1_saved[MAX_FM_H]) {
-#pragma HLS INLINE off
-  const unsigned out_row_begin =
-      static_cast<unsigned>(write_row) * static_cast<unsigned>(ROW_CONTIG_MAX_BYTES);
-  const unsigned out_row_end =
-      out_row_begin + static_cast<unsigned>(ROW_CONTIG_MAX_BYTES);
-  const unsigned src_base = src1.base_offset.to_uint();
-
-  for (int row = 0; row < MAX_FM_H; ++row) {
-#pragma HLS PIPELINE off
-    if (row >= write_row) {
-      break;
-    }
-    const unsigned src_row_begin =
-        src_base + static_cast<unsigned>(row) * static_cast<unsigned>(B2_SRC1_BACKUP_ROW_BYTES);
-    const unsigned src_row_end = src_row_begin + static_cast<unsigned>(B2_SRC1_BACKUP_ROW_BYTES);
-    const bool overlaps = (out_row_begin < src_row_end) && (src_row_begin < out_row_end);
-    if (overlaps && !src1_saved[row]) {
-      if (!copy_src1_row_to_b2_backup(src1, static_cast<u16_t>(row))) {
-        return false;
-      }
-      src1_saved[row] = true;
-    }
-  }
-  return true;
-}
-
-bool read_b2_backup_src1_tile(u16_t h,
-                              u16_t w,
-                              u16_t c,
-                              u8_t lanes,
-                              act_vec_t& packed) {
-#pragma HLS INLINE
-  packed = 0;
-  if (lanes.to_uint() != static_cast<unsigned>(AXI_WORD_BYTES) ||
-      c.to_uint() + static_cast<unsigned>(AXI_WORD_BYTES) > 64U) {
-    return false;
-  }
-  const unsigned slot = h.to_uint() & static_cast<unsigned>(B2_SRC1_BACKUP_ROWS - 1);
-  const u32_t byte_offset =
-      static_cast<u32_t>(B2_SRC1_BACKUP_BASE) +
-      static_cast<u32_t>(slot * static_cast<unsigned>(B2_SRC1_BACKUP_ROW_BYTES)) +
-      static_cast<u32_t>(w.to_uint() * 64U + c.to_uint());
-  return on_chip_memory_read_fmbuf_abs_word(static_cast<u8_t>(static_cast<unsigned>(BANK_FMEM0)),
-                                            byte_offset,
-                                            packed);
 }
 
 static unsigned conv_scratch_region_fields(u8_t param_id, u8_t src0_tensor, u16_t out_h) {

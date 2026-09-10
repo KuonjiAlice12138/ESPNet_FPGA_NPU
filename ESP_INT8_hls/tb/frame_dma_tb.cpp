@@ -18,7 +18,7 @@ static std::uint8_t pattern(std::uint32_t byte_idx) {
 }
 
 static bool load_input_file(std::vector<std::uint8_t>& bytes) {
-    const char* path = "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702/input_q.bin";
+    const char* path = "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_v4/input_q.bin";
     std::ifstream in(path, std::ios::binary);
     if (!in) {
         return false;

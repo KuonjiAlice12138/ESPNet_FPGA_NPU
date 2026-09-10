@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """Evaluate full-resolution mask outputs produced by the INT8 NPU.
 
-This script matches the PERF125-UPFULL output contract:
-
-- each board output file is a 512x1024 uint8 mask
-- class ids are already argmax results: 0=target, 1=background
-- metrics are computed against the original 512x1024 validation labels
+The expected mask geometry comes from the artifact/parameter manifest. Legacy
+H512/W1024 defaults remain only for compatibility with old board dumps.
 """
 
 from __future__ import annotations
@@ -17,7 +14,7 @@ import pickle
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import torch
@@ -28,10 +25,28 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from eval_hw_constrained_qat import add_espnet, remap_target  # noqa: E402
+from geometry_contract import (  # noqa: E402
+    DEFAULT_GEOMETRY,
+    LEGACY_GEOMETRY,
+    DeploymentGeometry,
+    geometry_from_manifest,
+)
 
 
-MASK_SHAPE = (512, 1024)
-MASK_BYTES = MASK_SHAPE[0] * MASK_SHAPE[1]
+MASK_SHAPE = (LEGACY_GEOMETRY.input_height, LEGACY_GEOMETRY.input_width)
+MASK_BYTES = LEGACY_GEOMETRY.output_mask_bytes
+
+
+def load_eval_geometry(
+    sd_manifest: Mapping[str, Any] | None,
+    param_audit: Mapping[str, Any] | None,
+    fallback: DeploymentGeometry = LEGACY_GEOMETRY,
+) -> DeploymentGeometry:
+    """Resolve output geometry from the exported dataset/audit contract."""
+    for manifest in (sd_manifest, param_audit):
+        if isinstance(manifest, Mapping) and manifest.get("geometry") is not None:
+            return geometry_from_manifest(manifest)
+    return fallback
 
 
 def metric_dict(metric: Any) -> dict[str, Any]:
@@ -44,7 +59,11 @@ def metric_dict(metric: Any) -> dict[str, Any]:
     }
 
 
-def build_fullres_val_dataset(espnet_dir: Path, cached_data_file: Path):
+def build_fullres_val_dataset(
+    espnet_dir: Path,
+    cached_data_file: Path,
+    geometry: DeploymentGeometry = LEGACY_GEOMETRY,
+):
     add_espnet(espnet_dir)
     import DataSet as myDataLoader
     import Transforms as myTransforms
@@ -54,7 +73,7 @@ def build_fullres_val_dataset(espnet_dir: Path, cached_data_file: Path):
 
     val_tf = myTransforms.Compose([
         myTransforms.Normalize(mean=data["mean"], std=data["std"]),
-        myTransforms.Scale(1024, 512),
+        myTransforms.Scale(geometry.input_width, geometry.input_height),
         myTransforms.ToTensor(1),
     ])
     return myDataLoader.MyDataset(data["valIm"], data["valAnnot"], transform=val_tf)
@@ -119,11 +138,15 @@ def parse_timing_log(path: Path | None) -> dict[str, Any]:
     return {"samples": samples, "total_ticks": total_ticks, "avg_ms": avg_ms}
 
 
-def load_mask(path: Path) -> np.ndarray:
+def load_mask(
+    path: Path,
+    geometry: DeploymentGeometry = LEGACY_GEOMETRY,
+) -> np.ndarray:
     data = np.fromfile(path, dtype=np.uint8)
-    if data.size != MASK_BYTES:
-        raise ValueError(f"{path} has {data.size} bytes, expected {MASK_BYTES}")
-    return data.reshape(MASK_SHAPE)
+    expected_bytes = geometry.output_mask_bytes
+    if data.size != expected_bytes:
+        raise ValueError(f"{path} has {data.size} bytes, expected {expected_bytes}")
+    return data.reshape((geometry.input_height, geometry.input_width))
 
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
@@ -131,7 +154,20 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     from IOUEval_total import iouEval
 
     output_dir = Path(args.output_dir)
-    dataset = build_fullres_val_dataset(Path(args.espnet_dir), Path(args.cached_data_file))
+    sd_manifest = None
+    if args.sd_manifest:
+        sd_manifest = json.loads(Path(args.sd_manifest).read_text(encoding="utf-8"))
+    param_audit = None
+    if args.param_audit:
+        param_audit = json.loads(Path(args.param_audit).read_text(encoding="utf-8"))
+    fallback_geometry = DeploymentGeometry(args.height, args.width, args.target_scale)
+    geometry = load_eval_geometry(sd_manifest, param_audit, fallback=fallback_geometry)
+    expected_bytes = geometry.output_mask_bytes
+    dataset = build_fullres_val_dataset(
+        Path(args.espnet_dir),
+        Path(args.cached_data_file),
+        geometry,
+    )
     metric = iouEval(args.classes)
     missing: list[str] = []
     wrong_size: list[dict[str, Any]] = []
@@ -140,7 +176,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     limit = args.limit if args.limit > 0 else len(dataset)
     limit = min(limit, len(dataset) - args.start_index)
     validate_eval_contract(args.output_pattern, args.allow_reference_mask_eval)
-    output_set = validate_output_set(output_dir, args.output_pattern, args.start_index, limit)
+    output_set = validate_output_set(
+        output_dir,
+        args.output_pattern,
+        args.start_index,
+        limit,
+        expected_bytes=expected_bytes,
+    )
     missing = output_set["missing"]
     wrong_size = output_set["wrong_size"]
     if (missing or wrong_size) and not args.allow_missing:
@@ -154,14 +196,16 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             if args.allow_missing:
                 continue
             raise FileNotFoundError(out_path)
-        if out_path.stat().st_size != MASK_BYTES:
+        if out_path.stat().st_size != expected_bytes:
             if args.allow_missing:
                 continue
-            raise ValueError(f"{out_path} has {out_path.stat().st_size} bytes, expected {MASK_BYTES}")
+            raise ValueError(
+                f"{out_path} has {out_path.stat().st_size} bytes, expected {expected_bytes}"
+            )
 
         _inputs, target, _name = dataset[index]
         target = remap_target(target.unsqueeze(0)).squeeze(0)
-        pred = torch.from_numpy(load_mask(out_path)).long()
+        pred = torch.from_numpy(load_mask(out_path, geometry)).long()
         metric.addBatch(pred, target)
         processed += 1
 
@@ -173,13 +217,6 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 f"processed={processed} PA={metrics['pixel_accuracy']:.8f} "
                 f"mIoU={metrics['mIoU']:.8f}"
             )
-
-    sd_manifest = None
-    if args.sd_manifest:
-        sd_manifest = json.loads(Path(args.sd_manifest).read_text(encoding="utf-8"))
-    param_audit = None
-    if args.param_audit:
-        param_audit = json.loads(Path(args.param_audit).read_text(encoding="utf-8"))
 
     return {
         "output_dir": str(output_dir),
@@ -198,6 +235,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "param_audit_format": (
             param_audit.get("format") if isinstance(param_audit, dict) else None
         ),
+        "geometry": geometry.to_manifest(),
+        "mask_bytes": expected_bytes,
         "timing": parse_timing_log(Path(args.timing_log) if args.timing_log else None),
         "metrics": metric_dict(metric),
     }
@@ -211,6 +250,9 @@ def main() -> None:
     parser.add_argument("--output-pattern", default="O%04d.BIN")
     parser.add_argument("--out-json", default=r"D:\ESP_INT8\hw_artifacts\hw_constrained_qat_3ep_val\board_val_fullres_mask_metrics.json")
     parser.add_argument("--classes", type=int, default=2)
+    parser.add_argument("--height", type=int, default=DEFAULT_GEOMETRY.input_height)
+    parser.add_argument("--width", type=int, default=DEFAULT_GEOMETRY.input_width)
+    parser.add_argument("--target-scale", type=int, default=DEFAULT_GEOMETRY.target_scale)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--progress-every", type=int, default=25)

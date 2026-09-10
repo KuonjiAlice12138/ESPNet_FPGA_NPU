@@ -26,17 +26,8 @@ bool conv_store_row_contiguous_plan_ok(const tensor_desc_t& dst,
                                        u16_t valid_c);
 bool resolve_tensor_read(u8_t tensor_id, tensor_desc_t& desc);
 bool resolve_tensor_write(u8_t tensor_id, u16_t h, u16_t w, u16_t c, tensor_desc_t& desc);
-bool backup_b2_src1_rows_before_write(const tensor_desc_t& src1,
-                                      int write_row,
-                                      bool src1_saved[MAX_FM_H]);
-bool read_b2_backup_src1_tile(u16_t h,
-                              u16_t w,
-                              u16_t c,
-                              u8_t lanes,
-                              act_vec_t& packed);
 
 static axi_vec_t s_shared_row_contig_words[ROW_CONTIG_MAX_WORDS];
-static bool s_shared_b2_src1_saved[MAX_FM_H];
 
 constexpr int VEC_AFF_HALF_LANES = TM / 2;
 constexpr int VEC_AFF_HALF_COUNT = TM / VEC_AFF_HALF_LANES;
@@ -222,26 +213,6 @@ static bool vec_full_aligned_tile_write_plan_ok(const tensor_desc_t& desc, u16_t
   return true;
 }
 
-static bool vec_row_contig_b2_needs_src1_backup(const fixed_exec_desc_t& desc,
-                                                const tensor_desc_t& src0,
-                                                const tensor_desc_t& src1,
-                                                const tensor_desc_t& src2,
-                                                bool has_src2,
-                                                const tensor_desc_t& dst) {
-#pragma HLS INLINE
-  return has_src2 &&
-         desc.in_h.to_uint() == 128U &&
-         desc.in_w.to_uint() == static_cast<unsigned>(ROW_CONTIG_MAX_W) &&
-         desc.valid_c.to_uint() == static_cast<unsigned>(ROW_CONTIG_MAX_C) &&
-         src0.base_offset.to_uint() == 0U &&
-         vec_tensor_phys_c(src0).to_uint() == 64U &&
-         src1.base_offset.to_uint() == static_cast<unsigned>(FMBUF_L20_BASE) &&
-         vec_tensor_phys_c(src1).to_uint() == 64U &&
-         src2.bank_id.to_uint() == static_cast<unsigned>(BANK_BRAM_SCR1) &&
-         dst.base_offset.to_uint() == 0U &&
-         vec_tensor_phys_c(dst).to_uint() == static_cast<unsigned>(ROW_CONTIG_MAX_C);
-}
-
 static bool read_block_affine_source_tile(const tensor_desc_t& src0,
                                           const tensor_desc_t& src1,
                                           const tensor_desc_t& src2,
@@ -280,31 +251,6 @@ static bool read_block_affine_source_tile(const tensor_desc_t& src0,
                                            packed);
   }
   return false;
-}
-
-static bool read_fixed_affine_source_tile(const tensor_desc_t& src0,
-                                          const tensor_desc_t& src1,
-                                          const tensor_desc_t& src2,
-                                          bool has_src2,
-                                          bool use_b2_backup,
-                                          const bool src1_saved[MAX_FM_H],
-                                          u16_t h,
-                                          u16_t w,
-                                          u16_t c,
-                                          u8_t lanes,
-                                          act_vec_t& packed) {
-#pragma HLS INLINE
-  const unsigned c_abs = c.to_uint();
-  const unsigned c0 = src0.c.to_uint();
-  const unsigned c1 = src1.c.to_uint();
-  if (use_b2_backup && c_abs >= c0 && c_abs < c0 + c1 && src1_saved[h.to_uint()]) {
-    return read_b2_backup_src1_tile(h,
-                                    w,
-                                    static_cast<u16_t>(c_abs - c0),
-                                    lanes,
-                                    packed);
-  }
-  return read_block_affine_source_tile(src0, src1, src2, has_src2, h, w, c, lanes, packed);
 }
 
 static error_code_t resolve_fixed_affine_tensors(const fixed_exec_desc_t& desc,
@@ -487,15 +433,12 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
                                             const tensor_desc_t& src0,
                                             const tensor_desc_t& src1,
                                             const tensor_desc_t& src2,
-                                            bool has_src2,
-                                            const tensor_desc_t& dst,
-                                            bool row_contiguous,
-                                            bool use_b2_backup) {
+                                             bool has_src2,
+                                             const tensor_desc_t& dst,
+                                             bool row_contiguous) {
 #pragma HLS INLINE off
 #pragma HLS BIND_STORAGE variable=s_shared_row_contig_words type=ram_2p impl=bram
-#pragma HLS BIND_STORAGE variable=s_shared_b2_src1_saved type=ram_2p impl=bram
 #pragma HLS RESET variable=s_shared_row_contig_words off
-#pragma HLS RESET variable=s_shared_b2_src1_saved off
   if (row_contiguous) {
     if (!conv_store_row_contiguous_plan_ok(dst, desc.in_w, desc.valid_c)) {
       return ERR_BANK_OVERFLOW;
@@ -503,11 +446,6 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
   } else if (!vec_full_aligned_tile_write_plan_ok(dst, desc.valid_c)) {
     return ERR_BANK_OVERFLOW;
   }
-  if (use_b2_backup &&
-      !vec_row_contig_b2_needs_src1_backup(desc, src0, src1, src2, has_src2, dst)) {
-    return ERR_BANK_OVERFLOW;
-  }
-
   const int h_count = static_cast<int>(desc.in_h.to_uint());
   const int w_count = static_cast<int>(desc.in_w.to_uint());
   const unsigned valid_c_u = desc.valid_c.to_uint();
@@ -519,13 +457,6 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
       (desc.flags.to_uint() & static_cast<unsigned>(FIXED_FLAG_CBLOCK_MAJOR)) != 0U;
   if (row_contiguous == cblock_major) {
     return ERR_UOP_DECODE;
-  }
-
-  if (use_b2_backup) {
-    for (int row = 0; row < MAX_FM_H; ++row) {
-#pragma HLS PIPELINE off
-      s_shared_b2_src1_saved[row] = false;
-    }
   }
 
   i32_t qmul[TM][VEC_AFF_RESIDENT_BLOCKS];
@@ -576,12 +507,10 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
         const u8_t lanes = row_contiguous ? vec_tensor_lanes(remaining) : static_cast<u8_t>(TM);
         act_vec_t in_packed = 0;
         act_vec_t out_packed = 0;
-        if (!read_fixed_affine_source_tile(src0,
+        if (!read_block_affine_source_tile(src0,
                                            src1,
                                            src2,
                                            has_src2,
-                                           use_b2_backup,
-                                           s_shared_b2_src1_saved,
                                            h,
                                            w,
                                            c,
@@ -660,10 +589,6 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
           packed_word_idx != static_cast<unsigned>(row_word_count)) {
         return ERR_BANK_OVERFLOW;
       }
-      if (use_b2_backup &&
-          !backup_b2_src1_rows_before_write(src1, row_h_i, s_shared_b2_src1_saved)) {
-        return ERR_BANK_OVERFLOW;
-      }
       const u32_t dst_row_base =
           dst.base_offset + static_cast<u32_t>(row_h_i) * static_cast<u32_t>(row_bytes_u);
       for (int word_idx = 0; word_idx < ROW_CONTIG_MAX_WORDS; ++word_idx) {
@@ -716,17 +641,13 @@ error_code_t vec_alu_run_fixed_issue(const npu_issue_t& issue,
   }
   const bool row_contiguous =
       (desc.flags.to_uint() & static_cast<unsigned>(FIXED_FLAG_ROW_CONTIGUOUS_STORE)) != 0U;
-  const bool use_b2_backup =
-      row_contiguous &&
-      vec_row_contig_b2_needs_src1_backup(desc, src0, src1, src2, has_src2, dst);
   return run_fixed_affine_common(desc,
                                  src0,
                                  src1,
                                  src2,
                                  has_src2,
                                  dst,
-                                 row_contiguous,
-                                 use_b2_backup);
+                                 row_contiguous);
 }
 
 error_code_t vec_alu_engine_exec(const npu_issue_t& issue,

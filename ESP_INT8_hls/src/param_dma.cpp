@@ -23,6 +23,27 @@ static bool s_ready = false;
 
 static const unsigned k_v3_affine_blocks[MAX_AFFINE_PARAM_DESC_COUNT] = {1, 2, 2, 5, 4, 4, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
+static bool validate_deployment_geometry() {
+#pragma HLS INLINE
+    const unsigned input_idx = static_cast<unsigned>(TID_INPUT);
+    const unsigned output_idx = static_cast<unsigned>(TID_OUT);
+    if (s_header.tensor_desc_count.to_uint() <= output_idx) {
+        return false;
+    }
+
+    const tensor_desc_t& input = s_tensor_desc[input_idx];
+    const tensor_desc_t& output = s_tensor_desc[output_idx];
+    const unsigned output_c = output.c.to_uint();
+    return input.elem_bytes.to_uint() == 1U &&
+           input.h.to_uint() == static_cast<unsigned>(INPUT_FRAME_H) &&
+           input.w.to_uint() == static_cast<unsigned>(INPUT_FRAME_W) &&
+           input.c.to_uint() == static_cast<unsigned>(INPUT_FRAME_C) &&
+           output.elem_bytes.to_uint() == 1U &&
+           output.h.to_uint() == static_cast<unsigned>(ENCODER_OUT_H) &&
+           output.w.to_uint() == static_cast<unsigned>(ENCODER_OUT_W) &&
+           (output_c == 2U || output_c == 20U);
+}
+
 static axi_vec_t* get_wbuf() {
 #pragma HLS INLINE
     static axi_vec_t s_wbuf[WBUF_AXI_WORDS];
@@ -599,6 +620,9 @@ void param_dma_init(const axi_vec_t* gmem_param) {
         if (i < static_cast<int>(s_header.tensor_desc_count.to_uint())) {
             s_tensor_desc[i] = load_tensor_desc(gmem_param, s_header.tensor_desc_offset + i * 16);
         }
+    }
+    if (!validate_deployment_geometry()) {
+        return;
     }
     for (int i = 0; i < MAX_CONV_EXEC_DESC_COUNT; ++i) {
 #pragma HLS PIPELINE off

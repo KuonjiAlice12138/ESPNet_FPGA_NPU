@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from geometry_contract import DeploymentGeometry
 from hw_int8_math import (
     clamp_i8,
     hls_round_shift_int,
@@ -38,8 +39,12 @@ PARAM_BLOB_MAGIC = 0x544E4945
 TK = 32
 TM = 32
 SECTION_ALIGN = 64
-FMBUF_BYTES = 0x598000
-FMBUF_URAM_BYTES = 0x380000
+FMBUF_BYTES = 0x1F0000
+FMBUF_URAM_BYTES = 0x1C0000
+FMBUF_POOL1_BASE = 0x1C0000
+FMBUF_POOL_TMP_BASE = 0x1D8000
+BANK_BRAM_SCR0 = 0x80
+BANK_BRAM_SCR1 = 0x81
 MAX_BLOCK5_SCHED_COUNT = 8
 WINDOW_LOADER_RUN_MAX = 3
 WINDOW_LOADER_RESERVED_WORDS = 10
@@ -452,6 +457,23 @@ class ParamBlob:
                 c=self._u16(bo + 12),
                 reserved1=self._u16(bo + 14),
             ))
+        if len(self.tensor_desc) < 18:
+            raise ValueError("PARAM v4 tensor descriptor table is incomplete")
+        input_desc = self.tensor_desc[0]
+        self.geometry = DeploymentGeometry(input_desc.h, input_desc.w, 8)
+        logits_desc = self.tensor_desc[17]
+        if (logits_desc.h, logits_desc.w) != (
+            self.geometry.logits_height,
+            self.geometry.logits_width,
+        ):
+            raise ValueError(
+                "PARAM logits geometry disagrees with input geometry: "
+                f"input={self.geometry.to_manifest()} "
+                f"logits={(logits_desc.h, logits_desc.w)}"
+            )
+        self.class_count = int(logits_desc.c)
+        if self.class_count not in (2, 20):
+            raise ValueError(f"unsupported PARAM class_count={self.class_count}")
         # Read exec plan entries
         self.exec_plan: List[ExecPlanEntry] = []
         ep_count = self.header.get("exec_plan_count", 0)
@@ -686,11 +708,19 @@ class FeatureMemory:
     def __init__(self):
         self.buf = np.zeros(FMBUF_BYTES, dtype=np.uint8)
 
+    @staticmethod
+    def physical_base(desc: TensorDesc) -> int:
+        if int(desc.bank_id) == BANK_BRAM_SCR0:
+            return FMBUF_POOL_TMP_BASE + int(desc.base_offset)
+        if int(desc.bank_id) == BANK_BRAM_SCR1:
+            return FMBUF_POOL1_BASE + int(desc.base_offset)
+        return int(desc.base_offset)
+
     def load_tile(self, desc: TensorDesc, h: int, w: int, c_begin: int, count: int) -> np.ndarray:
         if h < 0 or w < 0 or h >= desc.h or w >= desc.w or c_begin >= desc.c:
             return np.zeros(count, dtype=np.int8)
         valid = min(count, desc.c - c_begin, desc.phys_c)
-        off = desc.base_offset + desc.elem_offset(h, w, c_begin)
+        off = self.physical_base(desc) + desc.elem_offset(h, w, c_begin)
         result = np.zeros(count, dtype=np.int8)
         slice_buf = self.buf[off:off + valid].astype(np.int8)
         result[:valid] = slice_buf
@@ -700,14 +730,14 @@ class FeatureMemory:
         if h >= desc.h or w >= desc.w or c_begin >= desc.c:
             return
         valid = min(count, desc.c - c_begin)
-        off = desc.base_offset + desc.elem_offset(h, w, c_begin)
+        off = self.physical_base(desc) + desc.elem_offset(h, w, c_begin)
         self.buf[off:off + valid] = np.clip(data[:valid], INT8_MIN, INT8_MAX).astype(np.uint8)
 
     def dump_tensor(self, desc: TensorDesc) -> np.ndarray:
         result = np.zeros((desc.h, desc.w, desc.c), dtype=np.int8)
         for h in range(desc.h):
             for w in range(desc.w):
-                off = desc.base_offset + desc.elem_offset(h, w, 0)
+                off = self.physical_base(desc) + desc.elem_offset(h, w, 0)
                 result[h, w, :] = self.buf[off:off + desc.c].astype(np.int8)
         return result
 
@@ -751,7 +781,7 @@ def _write_array_to_fmem(fmem: FeatureMemory, desc: TensorDesc, arr: np.ndarray)
         raise ValueError(f"shape mismatch for fmem write: {arr.shape} vs {desc.h}x{desc.w}x{desc.c}")
     if desc.c_offset == 0 and desc.phys_c == desc.c:
         flat = np.ascontiguousarray(arr.reshape(-1)).astype(np.uint8)
-        start = int(desc.base_offset)
+        start = fmem.physical_base(desc)
         fmem.buf[start:start + flat.size] = flat
         return
     for h in range(desc.h):
@@ -1340,96 +1370,63 @@ def main():
     parser = argparse.ArgumentParser(description="Offline P7 PARAM replay")
     parser.add_argument("--param", type=Path, required=True)
     parser.add_argument("--input", type=Path, required=True)
-    parser.add_argument("--dump-dir", type=Path, required=True,
-                        help="Path to CSim dump directory for comparison")
+    parser.add_argument(
+        "--dump-dir",
+        type=Path,
+        default=None,
+        help="Optional legacy argument retained for command compatibility",
+    )
     parser.add_argument("--layer", type=str, default="all",
                         help="Layer to replay: all, U38, U39, U40")
+    parser.add_argument(
+        "--stop-logical-uop",
+        type=int,
+        default=None,
+        help="Stop after this PARAM logical UOP; overrides --layer",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional path for the replayed T_OUT tensor in HWC int8 order",
+    )
     args = parser.parse_args()
 
     blob = ParamBlob(args.param)
-    print(f"PARAM: exec_plan entries={len(blob.exec_plan)} conv_exec={len(blob.conv_exec)}")
+    input_desc = blob.tensor_desc[0]
+    input_data = np.fromfile(args.input, dtype=np.int8)
+    expected_input = int(input_desc.h) * int(input_desc.w) * int(input_desc.c)
+    if input_data.size != expected_input:
+        raise ValueError(f"{args.input} has {input_data.size} bytes, expected {expected_input}")
 
-    # Load input
-    input_data = np.frombuffer(args.input.read_bytes(), dtype=np.int8)
-    input_3c = input_data.reshape(512, 1024, 3)
+    if args.stop_logical_uop is not None:
+        stop = int(args.stop_logical_uop)
+    elif args.layer.lower() == "all":
+        stop = max(
+            (int(entry.logical_uop_id) for entry in blob.exec_plan if entry.kind != EXEC_END),
+            default=0,
+        )
+    elif args.layer.upper().startswith("U") and args.layer[1:].isdigit():
+        stop = int(args.layer[1:])
+    else:
+        raise ValueError(f"unsupported replay layer selector: {args.layer}")
 
-    # Initialize feature memory
-    fmem = FeatureMemory()
-    
-    # Root tensor descriptors (simplified — full replay would read from blob)
-    T_INPUT = 0
-    desc_input = TensorDesc(bank_id=0, base_offset=0, h=512, w=1024, c=3)
-    # Load input frame
-    for h in range(512):
-        for w in range(1024):
-            off = h * 1024 + w
-            fmem.buf[off * 3:(off + 1) * 3] = np.clip(input_3c[h, w, :], INT8_MIN, INT8_MAX).astype(np.uint8)
+    print(
+        f"PARAM: geometry={blob.geometry.to_manifest()} classes={blob.class_count} "
+        f"exec_plan={len(blob.exec_plan)} conv_exec={len(blob.conv_exec)} stop_uop={stop}"
+    )
+    replay = replay_prefix(blob, args.input, stop)
+    print(f"Replay complete: executed={len(replay.executed)} logical_uops={replay.executed}")
 
-    # Focus: replay U39 (b2_bn affine) and U40 (level3_0_c1 conv)
-    # For these, we need B2_CAT as input. Let's load it from CSim dump.
-    dump_dir = args.dump_dir
-
-    if args.layer in ("U39", "all"):
-        # Replay U39 affine (b2_bn)
-        # Input: B2_CAT at TID=9. Read from CSim dump if available.
-        b2cat_path = dump_dir / "csim_u38_b2_cat.bin"
-        if b2cat_path.exists():
-            b2cat = np.frombuffer(b2cat_path.read_bytes(), dtype=np.int8).reshape(128, 256, 131)
-            # Load into fmem as if written by U38 store
-            desc_b2cat = TensorDesc(bank_id=0, base_offset=0, h=128, w=256, c=131, reserved0=131)
-            for h in range(128):
-                for w in range(256):
-                    off = desc_b2cat.elem_offset(h, w, 0)
-                    fmem.buf[off:off + 131] = np.clip(b2cat[h, w, :], INT8_MIN, INT8_MAX).astype(np.uint8)
-            print(f"Loaded B2_CAT from {b2cat_path} → fmem")
-        else:
-            print(f"WARNING: {b2cat_path} not found, generating random B2_CAT")
-            desc_b2cat = TensorDesc(bank_id=0, base_offset=0, h=128, w=256, c=131, reserved0=131)
-            for h in range(128):
-                for w in range(256):
-                    off = desc_b2cat.elem_offset(h, w, 0)
-                    fmem.buf[off:off + 131] = np.random.randint(-10, 10, 131, dtype=np.int8).astype(np.uint8)
-
-        # U39: AFFINE (param_id=3, B2_CAT -> B2_ACT)
-        # Use HLS affine math directly
-        affine_qparam_path = dump_dir.parent / "csim_u71_b3_bn.bin"  # placeholder
-        # For U39, we need affine qparam for param_id=3
-        # Let's use the same pattern as conv_qparam
-        print("Replaying U39 affine...")
-        desc_b2act = TensorDesc(bank_id=0, base_offset=0, h=128, w=256, c=131, reserved0=131)
-        # Read U39 qparam from blob
-        # affine qparam is at different offsets, skip for now
-        print("U39: done (affine replay stub)")
-
-    if args.layer in ("U40", "all"):
-        desc_u40 = blob.conv_exec.get(13)
-        if desc_u40:
-            print(f"\nU40 conv_exec_desc: in={desc_u40.in_h}x{desc_u40.in_w}x{desc_u40.in_c} out_c={desc_u40.out_c} k_tiles={desc_u40.k_tiles}")
-            src_desc = TensorDesc(bank_id=0, base_offset=0, h=128, w=256, c=131, reserved0=131)
-            dst_desc = TensorDesc(bank_id=0, base_offset=0, h=64, w=128, c=25, reserved0=25)
-            consumer = blob.row_consumer.get(desc_u40.row_consumer_id, RowConsumerDesc())
-
-            print("Replaying U40 large-C conv (this may take a while)...")
-            replay_conv(fmem, blob, 13, src_desc, dst_desc, consumer)
-
-            # Compare with CSim dump
-            dump_path = dump_dir / "csim_u40_level3_0_c1.bin"
-            if dump_path.exists():
-                hls_dump = np.frombuffer(dump_path.read_bytes(), dtype=np.int8).reshape(64, 128, 25)
-                replay_dump = fmem.dump_tensor(dst_desc)
-                diff = (hls_dump.astype(np.int32) - replay_dump.astype(np.int32)) != 0
-                mismatches = diff.sum()
-                mae = float(np.abs(hls_dump.astype(np.int32) - replay_dump.astype(np.int32)).mean())
-                print(f"U40 replay vs HLS: mismatch={mismatches}/{diff.size} ({100*mismatches/diff.size:.1f}%) mae={mae:.2f}")
-                if mismatches > 0:
-                    # Show first few diffs
-                    idxs = np.where(diff)
-                    print("First 5 mismatches:")
-                    for i in range(min(5, len(idxs[0]))):
-                        h, w, c = idxs[0][i], idxs[1][i], idxs[2][i]
-                        print(f"  ({h},{w},c{c}): HLS={hls_dump[h,w,c]} replay={replay_dump[h,w,c]}")
-            else:
-                print(f"No CSim dump at {dump_path}")
+    if 17 in replay.tensors:
+        output = replay.tensors[17]
+        print(f"T_OUT: shape={output.shape} bytes={output.nbytes}")
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            np.ascontiguousarray(output, dtype=np.int8).tofile(args.output)
+            print(f"Saved T_OUT: {args.output}")
+    elif args.output is not None:
+        raise ValueError("requested --output, but replay stop point did not produce T_OUT")
 
 
 if __name__ == "__main__":

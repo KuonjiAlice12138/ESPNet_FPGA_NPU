@@ -1,8 +1,32 @@
 # ESPNet INT8 Data Export Workflow
 
-> Historical note: this document records the older P6/P7 pre-hwconv export flow.
-> For the current P7 PARAM v4 + scheduled cached-WinGen baseline, use
-> `tools/README.md` and `D:\ESP_INT8\hw_artifacts\sched_v4_p7ef_0629`.
+## Current Round1 entry point
+
+当前工作流固定为 `H=256, W=512`，logits 为 `32x64`，上采样倍率为 `8`。
+模型侧 artifact、硬件 PARAM、replay 和验证集导出必须使用同一份 manifest geometry，
+不得把本节历史命令中的 `512x1024/64x128` 数值复制到新发布路径。
+
+```powershell
+D:/ESPNet/.venv/Scripts/python.exe D:/ESP_INT8/tools/export_int8_hw_blob.py `
+  --artifact-dir D:/ESP_INT8/round1_binary2_model_artifact `
+  --out-dir D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_v4 `
+  --height 256 --width 512 --target-scale 8 `
+  --strict-zp --strict-schedule
+```
+
+Round1 产物目录为 `hw_artifacts/binary2_int8_h256w512_v4` 和
+`hw_artifacts/cityscapes20_int8_h256w512_v4`。20-class 目录目前是候选暂存，
+模型侧 INT8 精度 gate 未通过前不作为发布数据。
+
+每个目录保留两种明确区分的参考输出：
+
+- `model_golden_output_q.*`：PyTorch fake-quant hook 语义，用于分析模型与硬件定点 affine 的量化偏差；
+- `golden_output_q.*` / `replay_output_q.bin`：从最终 `PARAM.BIN` 执行整数 replay 得到，是 HLS bit-exact 验收的唯一 golden。
+
+导出完成后这两个 hardware golden 文件必须 SHA256 相同；HLS 顶层还需分别对 binary2/20-class 验证 U72 logits 和 H256W512 mask 均为 `0 mismatch`。
+
+> Historical note: the remainder of this document records the older P6/P7 pre-hwconv export flow.
+> It is retained for rollback/reference only; use `tools/README.md` for the current flow.
 
 本文档说明从“带硬件约束的 QAT”到生成 FPGA/NPU 可用 `hw_artifacts` 的完整数据处理流程。
 
@@ -34,6 +58,8 @@
 - `param_blob.bin`
 - `input_q.bin`
 - `golden_output_q.bin`
+- `model_golden_output_q.bin`
+- `replay_output_q.bin`
 - `uop_table.bin`
 - `tensor_desc_table.bin`
 - `scale_table.json`
@@ -99,7 +125,7 @@ D:\ESP_INT8\hw_artifacts\hw_constrained_qat_3ep_single
 - `export_manifest.json`
 - `int8_baseline_metrics.json`
 
-其中 `input_q.bin` 和 `golden_output_q.bin` 均为 NHWC INT8 layout。
+其中 `input_q.bin`、`model_golden_output_q.bin` 和 `golden_output_q.bin` 均为 NHWC INT8 layout；NPY 文件额外保留 batch 维。
 
 ## 3. 手动执行流程
 

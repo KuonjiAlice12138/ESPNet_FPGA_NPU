@@ -1,4 +1,5 @@
 #include "../include/npu_config.hpp"
+#include "../include/npu_ctrl.hpp"
 #include "../include/npu_schedule.hpp"
 #include "../include/npu_types.hpp"
 
@@ -83,9 +84,12 @@ void systolic_array_core_row(
     const wgt_vec_t weight_buf[TM][MAX_SA_K_TILES],
     hls::stream<psum_half_vec_t>& psum_stream,
     hls::stream<conv_cfg_t>& cfg_stream,
-    hls::stream<u8_t>& sched_flags_stream) {
+    hls::stream<u8_t>& sched_flags_stream,
+    volatile u8_t& prof_conv_sa_state) {
 #pragma HLS INLINE off
 #pragma HLS ARRAY_PARTITION variable=weight_buf cyclic factor=SA_ACTIVE_TM dim=1
+    npu_profile_set_conv_sa_state(prof_conv_sa_state,
+                                  PROF_CONV_SA_COMPUTE_OR_WAIT_ACT);
     const conv_cfg_t cfg = cfg_stream.read();
     const u8_t sched_flags = sched_flags_stream.read();
     const u16_t stride = (cfg.stride == 0)
@@ -109,6 +113,9 @@ void systolic_array_core_row(
         if (issue_i >= issue_count) {
             break;
         }
+
+        npu_profile_set_conv_sa_state(prof_conv_sa_state,
+                                      PROF_CONV_SA_COMPUTE_OR_WAIT_ACT);
 
         i32_t psum[TM];
 #pragma HLS ARRAY_PARTITION variable=psum cyclic factor=SA_ACTIVE_TM dim=1
@@ -143,6 +150,8 @@ void systolic_array_core_row(
         const int valid_group_count = paired
                                           ? SA_OUTPUT_GROUP_COUNT
                                           : ((valid_tm_i <= SA_OUTPUT_TM) ? 1 : SA_OUTPUT_GROUP_COUNT);
+        npu_profile_set_conv_sa_state(prof_conv_sa_state,
+                                      PROF_CONV_SA_PSUM_EMIT_OR_WAIT);
         for (int group = 0; group < SA_OUTPUT_GROUP_COUNT; ++group) {
 #pragma HLS PIPELINE II=1
             if (group >= valid_group_count) {
@@ -159,6 +168,8 @@ void systolic_array_core_row(
             psum_stream.write(group_word);
         }
     }
+    npu_profile_set_conv_sa_state(prof_conv_sa_state,
+                                  PROF_CONV_SA_IDLE_OR_DONE);
 }
 
 }  // namespace esp_int8

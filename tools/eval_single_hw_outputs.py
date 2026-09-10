@@ -6,19 +6,63 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import pickle
-import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from geometry_contract import LEGACY_GEOMETRY, DeploymentGeometry, geometry_from_manifest
 
-LOWRES_SHAPE = (1, 64, 128, 2)
+
 LOWRES_TARGET_SHAPE = (1, 64, 128)
 FULLRES_SHAPE = (512, 1024)
 UPSAMPLE_SCALE = 8
+
+
+@dataclass(frozen=True)
+class DeploymentContract:
+    profile_name: str
+    class_count: int
+    ignore_metric_class: int | None
+    geometry: DeploymentGeometry = LEGACY_GEOMETRY
+
+    @property
+    def lowres_shape(self) -> tuple[int, int]:
+        return self.geometry.logits_height, self.geometry.logits_width
+
+    @property
+    def fullres_shape(self) -> tuple[int, int]:
+        return self.geometry.input_height, self.geometry.input_width
+
+    @property
+    def ignore_target(self) -> int:
+        return 255 if self.ignore_metric_class is None else self.ignore_metric_class
+
+
+def load_deployment_contract(artifact_dir: Path) -> DeploymentContract:
+    candidates = (
+        artifact_dir / "manifest.json",
+        artifact_dir / "export_manifest.json",
+        artifact_dir / "single_manifest.json",
+        artifact_dir.parent / "manifest.json",
+    )
+    manifest_path = next((path for path in candidates if path.is_file()), None)
+    if manifest_path is None:
+        raise FileNotFoundError(f"deployment manifest not found under {artifact_dir}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    deployment = manifest.get("deployment", {})
+    class_count = int(deployment.get("class_count", 0))
+    if class_count < 2 or class_count > 32:
+        raise ValueError(f"invalid deployment class_count={class_count}")
+    ignore = deployment.get("ignore_metric_class")
+    return DeploymentContract(
+        profile_name=str(deployment.get("profile_name", "")),
+        class_count=class_count,
+        ignore_metric_class=None if ignore is None else int(ignore),
+        geometry=geometry_from_manifest(manifest),
+    )
 
 
 def sha256_file(path: Path) -> str:
@@ -29,23 +73,36 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def load_i8_logits(path: Path) -> np.ndarray:
+def load_i8_logits(
+    path: Path,
+    class_count: int,
+    geometry: DeploymentGeometry = LEGACY_GEOMETRY,
+) -> np.ndarray:
     data = np.fromfile(path, dtype=np.int8)
-    expected = int(np.prod(LOWRES_SHAPE))
+    shape = (1, geometry.logits_height, geometry.logits_width, class_count)
+    expected = int(np.prod(shape))
     if data.size != expected:
         raise ValueError(f"{path} has {data.size} bytes, expected {expected}")
-    return data.reshape(LOWRES_SHAPE)
+    return data.reshape(shape)
 
 
-def load_lowres_target(path: Path) -> np.ndarray:
+def load_lowres_target(path: Path, contract: DeploymentContract) -> np.ndarray:
     target = np.load(path)
-    if tuple(target.shape) != LOWRES_TARGET_SHAPE:
-        raise ValueError(f"{path} shape={target.shape}, expected {LOWRES_TARGET_SHAPE}")
-    return remap_target_np(target[0])
+    expected = (1, *contract.lowres_shape)
+    if tuple(target.shape) != expected:
+        raise ValueError(f"{path} shape={target.shape}, expected {expected}")
+    return remap_target_np(target[0], contract)
 
 
-def remap_target_np(target: np.ndarray) -> np.ndarray:
+def remap_target_np(target: np.ndarray, contract: DeploymentContract) -> np.ndarray:
     mapped = target.astype(np.int64, copy=True)
+    if contract.profile_name == "cityscapes20":
+        invalid = ((mapped < 0) | (mapped >= contract.class_count)) & (mapped != 255)
+        if np.any(invalid):
+            raise ValueError(f"invalid cityscapes20 labels: {np.unique(mapped[invalid]).tolist()}")
+        mapped[mapped == 255] = contract.ignore_target
+        return mapped
+
     valid = mapped != 255
     if set(np.unique(mapped).tolist()).issubset({0, 1, 255}):
         return mapped
@@ -54,8 +111,13 @@ def remap_target_np(target: np.ndarray) -> np.ndarray:
     return mapped
 
 
-def segmentation_metrics(pred: np.ndarray, target: np.ndarray) -> dict[str, Any]:
-    valid = target != 255
+def segmentation_metrics(
+    pred: np.ndarray,
+    target: np.ndarray,
+    class_count: int = 2,
+    ignore_target: int = 255,
+) -> dict[str, Any]:
+    valid = target != ignore_target
     pred_v = pred[valid]
     target_v = target[valid]
     if target_v.size == 0:
@@ -64,7 +126,8 @@ def segmentation_metrics(pred: np.ndarray, target: np.ndarray) -> dict[str, Any]
     per_class_acc: list[float] = []
     per_class_iou: list[float] = []
     confusion: list[dict[str, int]] = []
-    for cls in (0, 1):
+    metric_classes = [cls for cls in range(class_count) if cls != ignore_target]
+    for cls in metric_classes:
         tp = int(((pred_v == cls) & (target_v == cls)).sum())
         fp = int(((pred_v == cls) & (target_v != cls)).sum())
         fn = int(((pred_v != cls) & (target_v == cls)).sum())
@@ -114,8 +177,11 @@ def logit_diff_metrics(hls: np.ndarray, golden: np.ndarray) -> dict[str, Any]:
     }
 
 
-def bilinear_axis_map(out_idx: int, in_size: int) -> tuple[int, int, int, int]:
-    scale = UPSAMPLE_SCALE
+def bilinear_axis_map(
+    out_idx: int,
+    in_size: int,
+    scale: int = UPSAMPLE_SCALE,
+) -> tuple[int, int, int, int]:
     clip_high_start = in_size * scale - (scale // 2)
     if out_idx < scale // 2:
         return 0, 0, 16, 0
@@ -128,18 +194,29 @@ def bilinear_axis_map(out_idx: int, in_size: int) -> tuple[int, int, int, int]:
     return idx0, idx1, 16 - w1, w1
 
 
-def fullres_mask_from_logits(logits: np.ndarray) -> np.ndarray:
-    logits2 = logits.reshape(64, 128, 2).astype(np.int16)
-    diff = logits2[:, :, 0] - logits2[:, :, 1]
-    mask = np.zeros(FULLRES_SHAPE, dtype=np.uint8)
-    for y in range(FULLRES_SHAPE[0]):
-        y0, y1, wy0, wy1 = bilinear_axis_map(y, 64)
-        for x in range(FULLRES_SHAPE[1]):
-            x0, x1, wx0, wx1 = bilinear_axis_map(x, 128)
-            top = int(diff[y0, x0]) * wx0 + int(diff[y0, x1]) * wx1
-            bottom = int(diff[y1, x0]) * wx0 + int(diff[y1, x1]) * wx1
-            interp = top * wy0 + bottom * wy1
-            mask[y, x] = 0 if interp >= 0 else 1
+def fullres_mask_from_logits(
+    logits: np.ndarray,
+    class_count: int = 2,
+    geometry: DeploymentGeometry = LEGACY_GEOMETRY,
+) -> np.ndarray:
+    logits2 = logits.reshape(geometry.logits_height, geometry.logits_width, class_count).astype(np.int32)
+    fullres_shape = (geometry.input_height, geometry.input_width)
+    mask = np.zeros(fullres_shape, dtype=np.uint8)
+    x_maps = [
+        bilinear_axis_map(x, geometry.logits_width, geometry.target_scale)
+        for x in range(fullres_shape[1])
+    ]
+    x0 = np.asarray([item[0] for item in x_maps], dtype=np.intp)
+    x1 = np.asarray([item[1] for item in x_maps], dtype=np.intp)
+    wx0 = np.asarray([item[2] for item in x_maps], dtype=np.int32)[:, None]
+    wx1 = np.asarray([item[3] for item in x_maps], dtype=np.int32)[:, None]
+    for y in range(fullres_shape[0]):
+        y0, y1, wy0, wy1 = bilinear_axis_map(
+            y, geometry.logits_height, geometry.target_scale
+        )
+        top = logits2[y0, x0, :] * wx0 + logits2[y0, x1, :] * wx1
+        bottom = logits2[y1, x0, :] * wx0 + logits2[y1, x1, :] * wx1
+        mask[y, :] = np.argmax(top * wy0 + bottom * wy1, axis=1).astype(np.uint8)
     return mask
 
 
@@ -153,34 +230,66 @@ def find_sample_index(artifact_dir: Path, cached_data_file: Path) -> tuple[int, 
     with cached_data_file.open("rb") as f:
         data = pickle.load(f)
     for idx, image in enumerate(data["valIm"]):
-        if normalize_sample_name(image) == sample_name:
+        normalized = normalize_sample_name(image)
+        if (
+            normalized == sample_name
+            or normalized.endswith(sample_name)
+            or sample_name.endswith(normalized)
+        ):
             return idx, image
     raise ValueError(f"sample {sample_name} not found in {cached_data_file}")
 
 
-def load_fullres_target(
+def resolve_cached_path(
+    value: str,
+    cached_data_file: Path,
     espnet_dir: Path,
+) -> Path:
+    path = Path(value.replace("\\", "/"))
+    if path.is_absolute():
+        return path
+
+    candidates = (
+        espnet_dir / path,
+        cached_data_file.parent / path,
+        path,
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def load_fullres_target(
     cached_data_file: Path,
     sample_index: int,
+    contract: DeploymentContract,
+    espnet_dir: Path,
 ) -> np.ndarray:
-    sys.path.insert(0, str(espnet_dir))
-    os.chdir(espnet_dir)
-    import DataSet as myDataLoader  # type: ignore
-    import Transforms as myTransforms  # type: ignore
+    import cv2
 
     with cached_data_file.open("rb") as f:
         data = pickle.load(f)
-    val_tf = myTransforms.Compose([
-        myTransforms.Normalize(mean=data["mean"], std=data["std"]),
-        myTransforms.Scale(1024, 512),
-        myTransforms.ToTensor(1),
-    ])
-    dataset = myDataLoader.MyDataset(data["valIm"], data["valAnnot"], transform=val_tf)
-    _image, target, _name = dataset[sample_index]
-    return remap_target_np(target.numpy())
+    target_path = resolve_cached_path(
+        data["valAnnot"][sample_index], cached_data_file, espnet_dir
+    )
+    target = cv2.imread(str(target_path), cv2.IMREAD_UNCHANGED)
+    if target is None:
+        raise FileNotFoundError(target_path)
+    if tuple(target.shape[:2]) != contract.fullres_shape:
+        target = cv2.resize(
+            target,
+            (contract.fullres_shape[1], contract.fullres_shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    return remap_target_np(target, contract)
 
 
-def check_single_vs_val_smoke(artifact_dir: Path, val_smoke_dir: Path) -> dict[str, Any]:
+def check_single_vs_val_smoke(
+    artifact_dir: Path,
+    val_smoke_dir: Path,
+    contract: DeploymentContract,
+) -> dict[str, Any]:
     checks: dict[str, Any] = {"val_smoke_dir": str(val_smoke_dir), "available": val_smoke_dir.exists()}
     if not val_smoke_dir.exists():
         return checks
@@ -199,7 +308,7 @@ def check_single_vs_val_smoke(artifact_dir: Path, val_smoke_dir: Path) -> dict[s
     t0 = val_smoke_dir / "T0000.BIN"
     target_npy = artifact_dir / "target.npy"
     if t0.exists() and target_npy.exists():
-        low_target = load_lowres_target(target_npy).astype(np.uint8)
+        low_target = load_lowres_target(target_npy, contract).astype(np.uint8)
         t_bin = np.fromfile(t0, dtype=np.uint8)
         checks["target_remap_vs_T0000"] = {
             "target_npy": str(target_npy),
@@ -213,38 +322,64 @@ def check_single_vs_val_smoke(artifact_dir: Path, val_smoke_dir: Path) -> dict[s
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     artifact_dir = Path(args.artifact_dir)
     cached_data_file = Path(args.cached_data_file)
+    espnet_dir = Path(args.espnet_dir)
+    contract = load_deployment_contract(artifact_dir)
     sample_index, sample_name = find_sample_index(artifact_dir, cached_data_file)
 
-    golden_logits = load_i8_logits(artifact_dir / "golden_output_q.bin")
-    low_target = load_lowres_target(artifact_dir / "target.npy")
-    full_target = load_fullres_target(Path(args.espnet_dir), cached_data_file, sample_index)
+    golden_logits = load_i8_logits(
+        artifact_dir / "golden_output_q.bin",
+        contract.class_count,
+        contract.geometry,
+    )
+    low_target = load_lowres_target(artifact_dir / "target.npy", contract)
+    full_target = load_fullres_target(
+        cached_data_file, sample_index, contract, espnet_dir
+    )
 
     golden_low_mask = np.argmax(golden_logits[0], axis=-1).astype(np.uint8)
-    golden_full_mask = fullres_mask_from_logits(golden_logits)
+    golden_full_mask = fullres_mask_from_logits(
+        golden_logits, contract.class_count, contract.geometry
+    )
+    valid_low = low_target != contract.ignore_target
+    valid_full = full_target != contract.ignore_target
 
     result: dict[str, Any] = {
         "artifact_dir": str(artifact_dir),
         "sample_index": sample_index,
         "sample_name": sample_name,
+        "deployment": {
+            "profile_name": contract.profile_name,
+            "class_count": contract.class_count,
+            "ignore_metric_class": contract.ignore_metric_class,
+        },
+        "geometry": contract.geometry.to_manifest(),
         "input_q_sha256": sha256_file(artifact_dir / "input_q.bin"),
         "golden_output_q_sha256": sha256_file(artifact_dir / "golden_output_q.bin"),
         "artifact_consistency": check_single_vs_val_smoke(
-            artifact_dir, Path(args.val_smoke_dir)
+            artifact_dir, Path(args.val_smoke_dir), contract
         ),
-        "golden_lowres_metrics": segmentation_metrics(golden_low_mask, low_target),
-        "golden_fullres_metrics": segmentation_metrics(golden_full_mask, full_target),
+        "golden_lowres_metrics": segmentation_metrics(
+            golden_low_mask, low_target, contract.class_count, contract.ignore_target
+        ),
+        "golden_fullres_metrics": segmentation_metrics(
+            golden_full_mask, full_target, contract.class_count, contract.ignore_target
+        ),
     }
 
     if args.lowres_logits:
         hls_logits_path = Path(args.lowres_logits)
-        hls_logits = load_i8_logits(hls_logits_path)
+        hls_logits = load_i8_logits(
+            hls_logits_path, contract.class_count, contract.geometry
+        )
         hls_low_mask = np.argmax(hls_logits[0], axis=-1).astype(np.uint8)
         result["hls_lowres_logits"] = {
             "path": str(hls_logits_path),
             "sha256": sha256_file(hls_logits_path),
             "logit_diff": logit_diff_metrics(hls_logits, golden_logits),
-            "mask_diff_vs_golden": diff_metrics(hls_low_mask, golden_low_mask, low_target != 255),
-            "metrics": segmentation_metrics(hls_low_mask, low_target),
+            "mask_diff_vs_golden": diff_metrics(hls_low_mask, golden_low_mask, valid_low),
+            "metrics": segmentation_metrics(
+                hls_low_mask, low_target, contract.class_count, contract.ignore_target
+            ),
         }
         result["hls_lowres_logits"]["metric_delta_vs_golden"] = {
             "pixel_accuracy": result["hls_lowres_logits"]["metrics"]["pixel_accuracy"]
@@ -256,15 +391,20 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     if args.fullres_mask:
         hls_mask_path = Path(args.fullres_mask)
         data = np.fromfile(hls_mask_path, dtype=np.uint8)
-        if data.size != int(np.prod(FULLRES_SHAPE)):
-            raise ValueError(f"{hls_mask_path} has {data.size} bytes, expected {np.prod(FULLRES_SHAPE)}")
-        hls_full_mask = data.reshape(FULLRES_SHAPE)
+        if data.size != int(np.prod(contract.fullres_shape)):
+            raise ValueError(
+                f"{hls_mask_path} has {data.size} bytes, "
+                f"expected {np.prod(contract.fullres_shape)}"
+            )
+        hls_full_mask = data.reshape(contract.fullres_shape)
         result["hls_fullres_mask"] = {
             "path": str(hls_mask_path),
             "sha256": sha256_file(hls_mask_path),
-            "invalid_labels": int(((hls_full_mask != 0) & (hls_full_mask != 1)).sum()),
-            "mask_diff_vs_golden": diff_metrics(hls_full_mask, golden_full_mask, full_target != 255),
-            "metrics": segmentation_metrics(hls_full_mask, full_target),
+            "invalid_labels": int((hls_full_mask >= contract.class_count).sum()),
+            "mask_diff_vs_golden": diff_metrics(hls_full_mask, golden_full_mask, valid_full),
+            "metrics": segmentation_metrics(
+                hls_full_mask, full_target, contract.class_count, contract.ignore_target
+            ),
         }
         result["hls_fullres_mask"]["metric_delta_vs_golden"] = {
             "pixel_accuracy": result["hls_fullres_mask"]["metrics"]["pixel_accuracy"]

@@ -167,14 +167,11 @@ static void count_labels(const std::vector<std::uint8_t>& bytes,
 }
 
 int main() {
-  // Full-resolution output is accepted by mask-level metrics rather than
-  // bit-exact logits. The current HLS integer path has a stable ~0.68% mask
-  // delta versus software bilinear-logit golden, with <0.5pp mIoU drop.
-  static constexpr int MAX_ALLOWED_MASK_MISMATCHES = 4096;
+  static constexpr int MAX_ALLOWED_MASK_MISMATCHES = 0;
 #if ESP_INT8_CSIM_CLASS_COUNT == 20
-  const char* artifact_dir = "D:/ESP_INT8/hw_artifacts/cityscapes20_p7_qat_final";
+  const char* artifact_dir = "D:/ESP_INT8/hw_artifacts/cityscapes20_int8_h256w512_v4";
 #else
-  const char* artifact_dir = "D:/ESP_INT8/hw_artifacts/sched_v4_p7_0702";
+  const char* artifact_dir = "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_v4";
 #endif
   const std::string param_path = std::string(artifact_dir) + "/PARAM.BIN";
   const std::string input_path = std::string(artifact_dir) + "/input_q.bin";
@@ -247,17 +244,14 @@ int main() {
     return 1;
   }
 
-  std::vector<std::uint8_t> upsample_reference_mask = golden_mask;
-#if ESP_INT8_CSIM_CLASS_COUNT == 20
   std::vector<std::uint8_t> hls_lowres_logits;
   if (!read_binary("csim_u72_lowres_logits.bin", hls_lowres_logits) ||
       hls_lowres_logits.size() != golden_logits.size()) {
     std::printf("[FAIL] missing or malformed HLS lowres logits side dump\n");
     return 1;
   }
-  upsample_reference_mask =
+  const std::vector<std::uint8_t> upsample_reference_mask =
       make_fullres_mask_golden(hls_lowres_logits, ESP_INT8_CSIM_CLASS_COUNT);
-#endif
 
   int golden_zeros = 0;
   int golden_ones = 0;
@@ -280,8 +274,14 @@ int main() {
               output_aa);
 
   int mismatches = 0;
+  int lowres_mismatches = 0;
   int upsample_mismatches = 0;
   int invalid_labels = 0;
+  for (std::size_t i = 0; i < golden_logits.size(); ++i) {
+    if (hls_lowres_logits[i] != golden_logits[i]) {
+      ++lowres_mismatches;
+    }
+  }
   for (std::size_t i = 0; i < golden_mask.size(); ++i) {
     const std::uint8_t got = hls_output[i];
     const std::uint8_t expected = golden_mask[i];
@@ -307,34 +307,39 @@ int main() {
               mismatches,
               golden_mask.size(),
               invalid_labels);
-#if ESP_INT8_CSIM_CLASS_COUNT == 20
-  std::printf("top multiclass upsample stats: mismatches=%d/%zu\n",
+  std::printf("top replay logits stats: mismatches=%d/%zu\n",
+              lowres_mismatches,
+              golden_logits.size());
+  std::printf("top upsample stats: mismatches=%d/%zu\n",
               upsample_mismatches,
               hls_output.size());
-  if (upsample_mismatches != 0 || invalid_labels != 0) {
-    std::printf("[FAIL] multiclass upsample/reference mismatch=%d invalid=%d\n",
+  if (lowres_mismatches != 0 ||
+      upsample_mismatches != 0 ||
+      mismatches > MAX_ALLOWED_MASK_MISMATCHES ||
+      invalid_labels != 0) {
+    std::printf("[FAIL] replay logits=%d fullres=%d upsample=%d invalid=%d\n",
+                lowres_mismatches,
+                mismatches,
                 upsample_mismatches,
                 invalid_labels);
     return 1;
   }
-  std::printf("[PASS] multiclass upsample is bit-exact; software mask delta=%d/%zu\n",
-              mismatches,
-              golden_mask.size());
-#else
-  if (mismatches > MAX_ALLOWED_MASK_MISMATCHES || invalid_labels != 0) {
-    std::printf("[FAIL] fullres mask check: mismatches=%d/%zu threshold=%d invalid=%d\n",
-                mismatches,
-                golden_mask.size(),
-                MAX_ALLOWED_MASK_MISMATCHES,
-                invalid_labels);
+
+  std::vector<std::uint8_t> old_param_bytes;
+  if (!read_binary("D:/ESP_INT8/hw_artifacts/binary2_int8_0809/PARAM.BIN",
+                   old_param_bytes)) {
     return 1;
-  } else {
-    std::printf("[PASS] fullres mask mismatches=%d/%zu threshold=%d\n",
-                mismatches,
-                golden_mask.size(),
-                MAX_ALLOWED_MASK_MISMATCHES);
   }
-#endif
+  pack_bytes(old_param_bytes, param, 8192U);
+  call_espnet_encoder_int8_core(frame_in, frame_out, param,
+                                esp_int8::MODE_INIT,
+                                esp_int8::UOP_COUNT_ENCODER);
+  if (esp_int8::param_dma_ready()) {
+    std::printf("[FAIL] legacy H512W1024 PARAM passed H256W512 geometry gate\n");
+    return 1;
+  }
+
+  std::printf("[PASS] replay logits/mask are bit-exact and legacy geometry is rejected\n");
 
   std::printf("top_golden_sample_tb finished: mismatches=%d\n", mismatches);
   return 0;

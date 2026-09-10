@@ -45,11 +45,22 @@ static bool block5_schedule_valid(const fixed_exec_desc_t& desc,
 
 static error_code_t execute_issue(const npu_issue_t& issue,
                                   axi_vec_t* gmem_frame_out,
-                                  volatile u8_t& prof_stage_id) {
+                                  volatile u8_t& prof_stage_id,
+                                  volatile u8_t& prof_conv_win_state,
+                                  volatile u8_t& prof_conv_sa_state,
+                                  volatile u8_t& prof_conv_post_state) {
 #pragma HLS INLINE off
+  npu_profile_reset_conv_states(prof_conv_win_state,
+                                prof_conv_sa_state,
+                                prof_conv_post_state);
   switch (issue.engine.to_uint()) {
     case static_cast<unsigned>(NPU_ENGINE_CONV):
-      return conv_engine_exec(issue, gmem_frame_out, prof_stage_id);
+      return conv_engine_exec(issue,
+                              gmem_frame_out,
+                              prof_stage_id,
+                              prof_conv_win_state,
+                              prof_conv_sa_state,
+                              prof_conv_post_state);
     case static_cast<unsigned>(NPU_ENGINE_VEC):
       npu_profile_set_stage(prof_stage_id, PROF_STAGE_VEC_FIXED);
       return vec_alu_engine_exec(issue, gmem_frame_out, prof_stage_id);
@@ -336,7 +347,10 @@ static error_code_t complete_entry(ctrl_runtime_t& ctx) {
 error_code_t main_ctrl_run(axi_vec_t* gmem_frame_out,
                            volatile u8_t& prof_stage_id,
                            volatile u8_t& prof_pc,
-                           volatile u8_t& prof_issue_kind) {
+                           volatile u8_t& prof_issue_kind,
+                           volatile u8_t& prof_conv_win_state,
+                           volatile u8_t& prof_conv_sa_state,
+                           volatile u8_t& prof_conv_post_state) {
 #pragma HLS INLINE off
   ctrl_runtime_t ctx;
   init_ctrl_runtime(ctx);
@@ -382,7 +396,12 @@ error_code_t main_ctrl_run(axi_vec_t* gmem_frame_out,
       prof_pc = ctx.pc;
       prof_issue_kind = issue.kind;
       npu_profile_set_stage(prof_stage_id, PROF_STAGE_MAIN_CTRL);
-      err = execute_issue(issue, gmem_frame_out, prof_stage_id);
+      err = execute_issue(issue,
+                          gmem_frame_out,
+                          prof_stage_id,
+                          prof_conv_win_state,
+                          prof_conv_sa_state,
+                          prof_conv_post_state);
       if (err != ERR_NONE) {
         main_ctrl_set_csim_last_error(err);
         npu_profile_set_stage(prof_stage_id, PROF_STAGE_ERROR);

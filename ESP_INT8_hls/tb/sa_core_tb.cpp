@@ -12,7 +12,8 @@ void systolic_array_core_row(
     const wgt_vec_t weight_buf[TM][MAX_K_TILE_COUNT],
     hls::stream<psum_half_vec_t>& psum_stream,
     hls::stream<conv_cfg_t>& cfg_stream,
-    hls::stream<u8_t>& sched_flags_stream);
+    hls::stream<u8_t>& sched_flags_stream,
+    volatile u8_t& prof_conv_sa_state);
 }  // namespace esp_int8
 
 static int g_failures = 0;
@@ -73,6 +74,7 @@ static void run_case(const char* tag,
     hls::stream<esp_int8::psum_half_vec_t> psum_stream;
     hls::stream<esp_int8::conv_cfg_t> cfg_stream;
     hls::stream<esp_int8::u8_t> sched_flags_stream;
+    volatile esp_int8::u8_t prof_conv_sa_state = 0;
     esp_int8::wgt_vec_t weight_buf[esp_int8::TM][esp_int8::MAX_K_TILE_COUNT] = {};
 
     const int k_tiles = (k_total + esp_int8::TK - 1) / esp_int8::TK;
@@ -113,7 +115,8 @@ static void run_case(const char* tag,
         weight_buf,
         psum_stream,
         cfg_stream,
-        sched_flags_stream);
+        sched_flags_stream,
+        prof_conv_sa_state);
 
     int out_idx = 0;
     for (int pix = 0; pix < out_pixels; ++pix) {

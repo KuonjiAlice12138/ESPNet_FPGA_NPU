@@ -15,13 +15,21 @@ import torch
 from torch.nn.intrinsic.qat import freeze_bn_stats
 from torch.quantization import disable_observer
 
+from geometry_contract import DEFAULT_GEOMETRY, LEGACY_GEOMETRY, DeploymentGeometry
+
 
 def add_espnet(espnet_dir: Path) -> None:
     sys.path.insert(0, str(espnet_dir))
     os.chdir(espnet_dir)
 
 
-def build_val_loader(cached_data_file: Path, scale_in: int, batch_size: int, num_workers: int):
+def build_val_loader(
+    cached_data_file: Path,
+    scale_in: int,
+    batch_size: int,
+    num_workers: int,
+    geometry: DeploymentGeometry = LEGACY_GEOMETRY,
+):
     import DataSet as myDataLoader
     import Transforms as myTransforms
 
@@ -30,7 +38,7 @@ def build_val_loader(cached_data_file: Path, scale_in: int, batch_size: int, num
 
     val_tf = myTransforms.Compose([
         myTransforms.Normalize(mean=data["mean"], std=data["std"]),
-        myTransforms.Scale(1024, 512),
+        myTransforms.Scale(geometry.input_width, geometry.input_height),
         myTransforms.ToTensor(scale_in),
     ])
     val_dataset = myDataLoader.MyDataset(data["valIm"], data["valAnnot"], transform=val_tf)
@@ -78,7 +86,14 @@ def evaluate(args) -> dict:
     from IOUEval_total import iouEval
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    loader = build_val_loader(Path(args.cached_data_file), args.scale_in, args.batch_size, args.num_workers)
+    geometry = DeploymentGeometry(args.height, args.width, args.target_scale)
+    loader = build_val_loader(
+        Path(args.cached_data_file),
+        args.scale_in,
+        args.batch_size,
+        args.num_workers,
+        geometry,
+    )
     model = load_fake_quant_model(args, device)
     metric = iouEval(args.classes)
 
@@ -110,6 +125,7 @@ def evaluate(args) -> dict:
         "elapsed_seconds": elapsed,
         "batch_size": args.batch_size,
         "classes": args.classes,
+        "geometry": geometry.to_manifest(),
     }
 
 
@@ -124,6 +140,9 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--scale-in", type=int, default=8)
     parser.add_argument("--classes", type=int, default=2)
+    parser.add_argument("--height", type=int, default=DEFAULT_GEOMETRY.input_height)
+    parser.add_argument("--width", type=int, default=DEFAULT_GEOMETRY.input_width)
+    parser.add_argument("--target-scale", type=int, default=DEFAULT_GEOMETRY.target_scale)
     parser.add_argument("--p", type=int, default=1)
     parser.add_argument("--q", type=int, default=1)
     parser.add_argument("--progress-every", type=int, default=25)

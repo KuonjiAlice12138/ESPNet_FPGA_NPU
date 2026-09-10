@@ -26,6 +26,7 @@ BLOCKERS = [
     PatternRule("stream read/write in same function", re.compile(r"(HLS 200-975|cannot be read and written in the same function)", re.IGNORECASE)),
     PatternRule("dataflow return-value violation", re.compile(r"(HLS 200-964|HLS 200-965|HLS 200-966|cannot have a return value|failed dataflow checking)", re.IGNORECASE)),
     PatternRule("scalar m_axi address computation", re.compile(r"(HLS 214-323|Address computation on scalar port)", re.IGNORECASE)),
+    PatternRule("address discarded on scalar port", re.compile(r"(HLS 214-450|Ignore address on register port)", re.IGNORECASE)),
     PatternRule("resource over-utilized", re.compile(r"(DRC UTLZ-1|over-utilized|requires more .* than are available)", re.IGNORECASE)),
 ]
 
@@ -91,6 +92,7 @@ def default_inputs(root: Path, backup_count: int) -> list[Path]:
             files.extend(sorted([p for p in sd.glob("*.cpp") if p.is_file()], key=lambda p: p.stat().st_mtime, reverse=True)[:3])
 
     if verilog_dir.exists():
+        files.extend(existing([verilog_dir / "espnet_encoder_int8_core.v"]))
         files.extend(sorted([p for p in verilog_dir.glob("*row_region*.v") if p.is_file()], key=lambda p: p.stat().st_mtime, reverse=True)[:1])
 
     deduped: list[Path] = []
@@ -131,7 +133,39 @@ def scan_file(path: Path, rules: list[PatternRule], max_matches: int) -> list[tu
                     break
     except OSError as exc:
         matches.append(("read failure", 0, str(exc)))
+    if rules is BLOCKERS and path.name == "espnet_encoder_int8_core.v":
+        matches.extend(check_top_interfaces(path))
     return matches
+
+
+def check_top_interfaces(path: Path) -> list[tuple[str, int, str]]:
+    """Check actual module ports, not names elsewhere in generated RTL."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    module = re.search(r"\bmodule\s+espnet_encoder_int8_core\s*\((.*?)\);", text, re.S)
+    if not module:
+        return [("missing top module", 0, str(path))]
+    ports = set(re.findall(r"\b\w+\b", module.group(1)))
+    required = {
+        "m_axi_gmem0_ARADDR", "m_axi_gmem0_RDATA",
+        "m_axi_gmem1_AWADDR", "m_axi_gmem1_WDATA",
+        "m_axi_gmem2_ARADDR", "m_axi_gmem2_RDATA",
+        "s_axi_control_AWADDR", "s_axi_control_WDATA",
+        "s_axi_control_ARADDR", "s_axi_control_RDATA",
+        "prof_stage_id", "prof_stage_id_ap_vld", "prof_active", "prof_pc",
+        "prof_issue_kind", "prof_conv_win_state", "prof_conv_sa_state",
+        "prof_conv_post_state",
+    }
+    findings = []
+    for port in sorted(required - ports):
+        findings.append(("missing hardware interface", 0, port))
+    for port in ("gmem_frame_in", "gmem_frame_out", "gmem_param"):
+        if port in ports:
+            findings.append(("scalarized memory pointer", 0, port))
+    for port in required:
+        if port.startswith("prof_") and port != "prof_stage_id":
+            if port + "_ap_vld" in ports:
+                findings.append(("unexpected profiling handshake", 0, port))
+    return findings
 
 
 def print_matches(title: str, paths: list[Path], rules: list[PatternRule], max_matches: int) -> int:

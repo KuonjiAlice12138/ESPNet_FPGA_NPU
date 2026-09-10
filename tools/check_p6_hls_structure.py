@@ -359,8 +359,11 @@ def check_stage_counter_interfaces(core: str, ctrl: str, main_ctrl: str, conv_en
         if token not in core:
             return fail(f"top signature missing profile pin: {token}")
         expected_iface = "ap_vld" if token == "prof_stage_id" else "ap_none"
-        if f"#pragma HLS INTERFACE {expected_iface} port={token}" not in core:
-            return fail(f"profile pin must be {expected_iface}, not AXI-Lite: {token}")
+        expected_pragma = f"#pragma HLS INTERFACE {expected_iface} port={token} register"
+        if expected_pragma not in core:
+            return fail(
+                f"5R-A profile pin must be a registered {expected_iface} boundary: {token}"
+            )
         if f"s_axilite port={token}" in core:
             return fail(f"profile pin incorrectly exposed as AXI-Lite: {token}")
     for token in (
@@ -736,6 +739,7 @@ def check_executor_gateways(
             return fail(f"Round0717 BLOCK5 row owner must have one {helper} call site")
     if "vec_alu_apply_" in ppu:
         return fail("PPU-5 failed: ppu.cpp still calls or declares vec_alu_apply_*")
+
     fixed_affine_body = function_body(vec_alu, "run_fixed_affine_common") or ""
     if re.search(r"\bvec_alu_apply_affine_only\s*\(", fixed_affine_body):
         return fail("common fixed-affine path still calls generic vec_alu_apply_affine_only")
@@ -1089,15 +1093,44 @@ def check_p7_bans(sources: dict[str, str]) -> int:
             return fail(f"avgpool reintroduced duplicated C3 pack/write path: {token}")
     if count_call_sites(avgpool, "avgpool_c3_group32_pack_write") != 2:
         return fail("avgpool must have exactly one C3 group32 pack/write call site plus its definition")
+    for gateway in (
+        "on_chip_memory_read_main_uram_word",
+        "on_chip_memory_read_pool_bram_word",
+        "on_chip_memory_write_pool_bram_word",
+    ):
+        if function_body(memory, gateway) is None or gateway not in avgpool:
+            return fail(f"Round3R resolved AvgPool memory gateway missing: {gateway}")
+    for forbidden in (
+        "on_chip_memory_write_fmbuf_abs_word",
+        "on_chip_memory_write_bank_abs_word",
+        "on_chip_memory_write_main_uram_word",
+    ):
+        if forbidden in avgpool:
+            return fail(f"Round3R AvgPool must not write through a generic/URAM gateway: {forbidden}")
     if "SA_ACTIVE_TM = 32" not in sa_core or "SA_OUTPUT_TM = 16" not in sa_core:
         return fail("SA core must keep the P7 32-lane MAC / 16-lane output grouping")
+    if "SA_K_TILE_II = 1" not in sa_core or "PIPELINE II=SA_K_TILE_II" not in sa_core:
+        return fail("SA must preserve the performance-safe II=1 K-tile schedule")
+    if sa_core.count("mac_tile_active_lanes(") != 2:
+        return fail("SA must keep one 32-lane MAC owner and one call site")
+    if "mac_tile_low_group(" in sa_core or "mac_tile_high_group(" in sa_core:
+        return fail("SA must not retain the resource-regressive split MAC paths")
+    if "window_assembler_cfg_t" not in win_gen:
+        return fail("WinGen assembler must consume the narrow row-local config")
+    if "hls::stream<window_row_cfg_t> assembler_cfg_stream" in win_gen:
+        return fail("WinGen must not broadcast the full loader config to the assembler")
+    if "RESET variable=s_shared_row_contig_words off" not in vec_alu:
+        return fail("Vec shared row buffer must not add a global reset control set")
     if "cyclic factor=SA_ACTIVE_TM" not in sa_core:
         return fail("SA core must partition arrays by the active 32-lane MAC group")
     if "emit_fullres_rows(" in upsample and upsample.count("emit_fullres_rows(") > 2:
         return fail("upsample fullres emitter has multiple specialized call sites")
-    for token in ("resolve_block5_scratch_descs", "copy_src1_row_to_b2_backup", "read_b2_backup_src1_tile"):
+    for token in ("resolve_block5_scratch_descs",):
         if token not in scratch:
             return fail(f"scratch_mgr.cpp missing storage helper: {token}")
+    for token in ("copy_src1_row_to_b2_backup", "read_b2_backup_src1_tile", "s_shared_b2_src1_saved"):
+        if token in scratch or token in vec_alu:
+            return fail(f"retired H512 B2 backup logic remains after H256 layout compaction: {token}")
 
     risky_enum_cast = re.compile(
         r"static_cast<\s*(?:u8_t|u16_t|u32_t)\s*>\(\s*"
@@ -1221,7 +1254,7 @@ def check_round2_wingen_structure(win_gen: str, exporter: str) -> int:
         if token not in pipeline_body:
             return fail(f"Round2 bounded DATAFLOW region missing: {token}")
 
-    emit_body = function_body(win_gen, "emit_narrow_words_for_mode")
+    emit_body = function_body(win_gen, "emit_narrow_words_for_mode") or ""
     if "s_narrow_cache_row" in emit_body:
         return fail("narrow packer still reads the BRAM cache directly instead of the 9-word snapshot")
     if "4 * dilation" not in exporter:

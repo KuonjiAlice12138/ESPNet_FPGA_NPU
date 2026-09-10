@@ -142,6 +142,43 @@ static bool resolve_pool2_alias_addr(u32_t byte_offset, u32_t& phys_addr) {
            static_cast<unsigned>(FMBUF_POOL2_ALIAS_BASE + FMBUF_POOL2_ALIAS_BYTES);
 }
 
+static bool resolve_pool_bram_addr(u8_t bank_id,
+                                   u32_t byte_offset,
+                                   u32_t& phys_addr) {
+#pragma HLS INLINE
+    const unsigned bank = bank_id.to_uint();
+    const unsigned offset = byte_offset.to_uint();
+    if ((offset & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U) {
+        phys_addr = 0;
+        return false;
+    }
+
+    if (bank == static_cast<unsigned>(BANK_BRAM_SCR0)) {
+        if (offset + AXI_WORD_BYTES > static_cast<unsigned>(BRAM_SCR0_BYTES)) {
+            phys_addr = 0;
+            return false;
+        }
+        phys_addr = static_cast<u32_t>(FMBUF_POOL_TMP_BASE) + byte_offset;
+    } else if (bank == static_cast<unsigned>(BANK_BRAM_SCR1)) {
+        if (offset + AXI_WORD_BYTES > static_cast<unsigned>(BRAM_SCR1_BYTES)) {
+            phys_addr = 0;
+            return false;
+        }
+        phys_addr = static_cast<u32_t>(FMBUF_POOL1_BASE) + byte_offset;
+    } else if (bank == static_cast<unsigned>(BANK_FMEM0) ||
+               bank == static_cast<unsigned>(BANK_FMEM1) ||
+               bank == static_cast<unsigned>(BANK_FMEM2)) {
+        phys_addr = byte_offset;
+    } else {
+        phys_addr = 0;
+        return false;
+    }
+
+    const unsigned phys = phys_addr.to_uint();
+    return phys >= static_cast<unsigned>(FMBUF_URAM_BYTES) &&
+           phys + AXI_WORD_BYTES <= static_cast<unsigned>(FMBUF_BYTES);
+}
+
 static bool read_bank_word(u8_t bank_id, u32_t byte_offset, axi_vec_t& value) {
 #pragma HLS INLINE
     if (bank_id.to_uint() == static_cast<unsigned>(BANK_BRAM_SCR1)) {
@@ -265,6 +302,52 @@ bool on_chip_memory_read_aligned_tensor_word(const tensor_desc_t& desc,
         return false;
     }
     return read_bank_word(desc.bank_id, byte_offset, packed);
+}
+
+bool on_chip_memory_read_main_uram_word(u8_t bank_id,
+                                        u32_t byte_offset,
+                                        axi_vec_t& packed) {
+#pragma HLS INLINE off
+#pragma HLS PIPELINE off
+    packed = 0;
+    const unsigned bank = bank_id.to_uint();
+    if ((bank != static_cast<unsigned>(BANK_FMEM0) &&
+         bank != static_cast<unsigned>(BANK_FMEM1) &&
+         bank != static_cast<unsigned>(BANK_FMEM2)) ||
+        (byte_offset.to_uint() & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U ||
+        byte_offset.to_uint() + AXI_WORD_BYTES > static_cast<unsigned>(FMBUF_URAM_BYTES)) {
+        return false;
+    }
+    return read_fmbuf_uram_word(byte_offset >> 5, packed);
+}
+
+bool on_chip_memory_read_pool_bram_word(u8_t bank_id,
+                                        u32_t byte_offset,
+                                        axi_vec_t& packed) {
+#pragma HLS INLINE off
+#pragma HLS PIPELINE off
+    packed = 0;
+    u32_t phys_addr = 0;
+    if (!resolve_pool_bram_addr(bank_id, byte_offset, phys_addr)) {
+        return false;
+    }
+    const u32_t local_word =
+        (phys_addr - static_cast<u32_t>(FMBUF_URAM_BYTES)) >> 5;
+    return read_fmbuf_bram_word(local_word, packed);
+}
+
+bool on_chip_memory_write_pool_bram_word(u8_t bank_id,
+                                         u32_t byte_offset,
+                                         axi_vec_t packed) {
+#pragma HLS INLINE off
+#pragma HLS PIPELINE off
+    u32_t phys_addr = 0;
+    if (!resolve_pool_bram_addr(bank_id, byte_offset, phys_addr)) {
+        return false;
+    }
+    const u32_t local_word =
+        (phys_addr - static_cast<u32_t>(FMBUF_URAM_BYTES)) >> 5;
+    return write_fmbuf_bram_word(local_word, packed);
 }
 
 bool on_chip_memory_read_packed_tile(const tensor_desc_t& desc,

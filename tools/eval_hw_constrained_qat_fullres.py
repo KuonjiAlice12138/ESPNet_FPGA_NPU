@@ -31,9 +31,32 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from eval_hw_constrained_qat import add_espnet, load_fake_quant_model, remap_target  # noqa: E402
+from geometry_contract import (  # noqa: E402
+    DEFAULT_GEOMETRY,
+    DeploymentGeometry,
+    geometry_from_manifest,
+)
 
 
-def build_fullres_val_loader(cached_data_file: Path, batch_size: int, num_workers: int):
+def load_model_geometry(
+    artifact_dir: Path,
+    fallback: DeploymentGeometry = DEFAULT_GEOMETRY,
+) -> DeploymentGeometry:
+    """Read geometry from a model artifact, with an explicit compatibility fallback."""
+    for name in ("manifest.json", "export_manifest.json"):
+        path = artifact_dir / name
+        if path.exists():
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            return geometry_from_manifest(manifest)
+    return fallback
+
+
+def build_fullres_val_loader(
+    cached_data_file: Path,
+    batch_size: int,
+    num_workers: int,
+    geometry: DeploymentGeometry = DEFAULT_GEOMETRY,
+):
     import DataSet as myDataLoader
     import Transforms as myTransforms
 
@@ -42,7 +65,7 @@ def build_fullres_val_loader(cached_data_file: Path, batch_size: int, num_worker
 
     val_tf = myTransforms.Compose([
         myTransforms.Normalize(mean=data["mean"], std=data["std"]),
-        myTransforms.Scale(1024, 512),
+        myTransforms.Scale(geometry.input_width, geometry.input_height),
         myTransforms.ToTensor(1),
     ])
     val_dataset = myDataLoader.MyDataset(data["valIm"], data["valAnnot"], transform=val_tf)
@@ -82,7 +105,19 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     from IOUEval_total import iouEval
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    loader = build_fullres_val_loader(Path(args.cached_data_file), args.batch_size, args.num_workers)
+    requested_geometry = DeploymentGeometry(args.height, args.width, args.target_scale)
+    geometry = load_model_geometry(Path(args.artifact_dir), fallback=requested_geometry)
+    if geometry != requested_geometry:
+        raise ValueError(
+            "CLI geometry disagrees with model artifact: "
+            f"requested={requested_geometry.to_manifest()} artifact={geometry.to_manifest()}"
+        )
+    loader = build_fullres_val_loader(
+        Path(args.cached_data_file),
+        args.batch_size,
+        args.num_workers,
+        geometry,
+    )
     model = load_fake_quant_model(args, device)
 
     lowres_metric = iouEval(args.classes)
@@ -152,6 +187,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "device": str(device),
         "batch_size": args.batch_size,
         "classes": args.classes,
+        "geometry": geometry.to_manifest(),
         "input_shape_last_batch": input_shape,
         "encoder_output_shape_last_batch": output_shape,
         "fullres_target_shape_last_batch": target_shape,
@@ -177,6 +213,9 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--classes", type=int, default=2)
+    parser.add_argument("--height", type=int, default=DEFAULT_GEOMETRY.input_height)
+    parser.add_argument("--width", type=int, default=DEFAULT_GEOMETRY.input_width)
+    parser.add_argument("--target-scale", type=int, default=DEFAULT_GEOMETRY.target_scale)
     parser.add_argument("--p", type=int, default=1)
     parser.add_argument("--q", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0)

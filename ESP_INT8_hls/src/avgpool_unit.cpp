@@ -8,15 +8,14 @@ constexpr int AVGPOOL_C3_GROUP_INPUT_COLS = 65;
 constexpr int AVGPOOL_C3_GROUP_BYTES = AVGPOOL_C3_GROUP_INPUT_COLS * 3;
 constexpr int AVGPOOL_C3_CACHE_WORDS = 7;
 
-bool on_chip_memory_read_fmbuf_abs_word(u8_t bank_id,
+bool on_chip_memory_read_main_uram_word(u8_t bank_id,
                                         u32_t byte_offset,
                                         act_vec_t& packed);
-bool on_chip_memory_read_pool2_abs_word(u32_t byte_offset,
+bool on_chip_memory_read_pool_bram_word(u8_t bank_id,
+                                        u32_t byte_offset,
                                         act_vec_t& packed);
-bool on_chip_memory_write_fmbuf_abs_word(u8_t bank_id,
+bool on_chip_memory_write_pool_bram_word(u8_t bank_id,
                                          u32_t byte_offset,
-                                         act_vec_t packed);
-bool on_chip_memory_write_pool2_abs_word(u32_t byte_offset,
                                          act_vec_t packed);
 
 static i32_t round_div9(i32_t x) {
@@ -54,9 +53,12 @@ static bool read_avgpool_abs_word(u8_t src_bank,
                                   act_vec_t& word) {
 #pragma HLS INLINE off
 #pragma HLS PIPELINE off
-    return (src_bank.to_uint() == static_cast<unsigned>(BANK_BRAM_SCR1))
-               ? on_chip_memory_read_pool2_abs_word(byte_offset, word)
-               : on_chip_memory_read_fmbuf_abs_word(src_bank, byte_offset, word);
+    const unsigned bank = src_bank.to_uint();
+    if (bank == static_cast<unsigned>(BANK_BRAM_SCR0) ||
+        bank == static_cast<unsigned>(BANK_BRAM_SCR1)) {
+        return on_chip_memory_read_pool_bram_word(src_bank, byte_offset, word);
+    }
+    return on_chip_memory_read_main_uram_word(src_bank, byte_offset, word);
 }
 
 static bool write_avgpool_aligned_abs_word(u8_t dst_bank,
@@ -64,9 +66,7 @@ static bool write_avgpool_aligned_abs_word(u8_t dst_bank,
                                            act_vec_t word) {
 #pragma HLS INLINE off
 #pragma HLS PIPELINE off
-    return (dst_bank.to_uint() == static_cast<unsigned>(BANK_BRAM_SCR1))
-               ? on_chip_memory_write_pool2_abs_word(byte_offset, word)
-               : on_chip_memory_write_fmbuf_abs_word(dst_bank, byte_offset, word);
+    return on_chip_memory_write_pool_bram_word(dst_bank, byte_offset, word);
 }
 
 static bool pool_shape_supported(const tensor_desc_t& src,
