@@ -17,7 +17,7 @@ import json
 import math
 import shutil
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -1560,6 +1560,7 @@ WINDOW_ROW_REUSE_MODE_MASK = 0x3
 WINDOW_ROW_REUSE_WORDS_SHIFT = 2
 WINDOW_ROW_REUSE_WORDS_MASK = 0x7F
 WINDOW_ROW_REUSE_RESERVED_SHIFT = 9
+WINGEN_NARROW_ROW_WORDS = 96
 
 
 def compile_window_row_reuse_word(
@@ -1580,12 +1581,8 @@ def compile_window_row_reuse_word(
     ):
         return 0
 
-    reuse_mode = WINDOW_ROW_REUSE_NONE
-    if in_c == 12 and stride == 1:
-        reuse_mode = WINDOW_ROW_REUSE_STRIDE1_KEEP2
-    elif in_c == 3 and stride == 2:
-        reuse_mode = WINDOW_ROW_REUSE_STRIDE2_KEEP1
-    if reuse_mode == WINDOW_ROW_REUSE_NONE:
+    # C12 KEEP2 bypasses horizontal column reuse and regressed on hardware.
+    if in_c != 3 or stride != 2:
         return 0
 
     row_bytes = source_w * in_c
@@ -1595,13 +1592,11 @@ def compile_window_row_reuse_word(
             f"source_w={source_w} in_c={in_c}"
         )
     packed_words = row_bytes // TK
-    if packed_words <= 0 or packed_words > WINDOW_ROW_REUSE_WORDS_MASK:
+    if packed_words <= 0 or packed_words > WINGEN_NARROW_ROW_WORDS:
         raise ValueError(
             f"row-reuse packed word count out of range: {packed_words}"
         )
-    if packed_words != 96:
-        return 0
-    return reuse_mode | (packed_words << WINDOW_ROW_REUSE_WORDS_SHIFT)
+    return WINDOW_ROW_REUSE_STRIDE2_KEEP1 | (packed_words << WINDOW_ROW_REUSE_WORDS_SHIFT)
 
 
 def encode_window_loader_run(start_delta: int, count: int) -> int:
@@ -4664,19 +4659,15 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
                 and dilation == 1
                 and loader_class == WIN_LOADER_3X3_NARROW
                 and bool(flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
-                and packed_words == 96
-            )
-            stride1_ok = (
-                reuse_mode == WINDOW_ROW_REUSE_STRIDE1_KEEP2
-                and in_c == 12
-                and stride == 1
+                and mode == WIN_MODE_3X3_STAGED_C3
+                and 0 < packed_words <= WINGEN_NARROW_ROW_WORDS
             )
             stride2_ok = (
                 reuse_mode == WINDOW_ROW_REUSE_STRIDE2_KEEP1
                 and in_c == 3
                 and stride == 2
             )
-            if not common_reuse or not (stride1_ok or stride2_ok):
+            if not common_reuse or not stride2_ok:
                 raise ValueError(
                     f"window schedule[{sid}] invalid row-reuse contract: "
                     f"mode={reuse_mode} words={packed_words}"
@@ -4717,6 +4708,9 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
             raise ValueError(f"row_consumer[{rid}] unsupported PPU-1 mode={name}")
 
     conv_off = offsets["conv_exec_desc"]
+    # Cross-check each schedule against the physical source, not just its word.
+    from hw_param_replay import ParamBlob
+    ParamBlob(path)
     weight_words = (offsets["conv_qparam"] - offsets["weight_packed"]) // TK
     for cid in range(counts["conv_exec_desc_count"]):
         off = conv_off + cid * 36
@@ -4778,8 +4772,117 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
                 raise ValueError(f"audit reports failed compact-memory check: {check_name}")
 
 
+def compile_window_reuse_param(path: Path) -> bytes:
+    """Recompile reuse words without touching frozen numeric/control sections."""
+    from hw_param_replay import ParamBlob, window_row_reuse_contract_valid
+    blob = ParamBlob(path)
+    data = bytearray(path.read_bytes())
+    for sid, sched in enumerate(blob.window_sched_by_index):
+        references = [conv for conv in blob.conv_exec_by_index if conv.window_sched_id == sid]
+        word = 0
+        if references:
+            word = compile_window_row_reuse_word(
+                source_w=references[0].in_w, in_c=sched.in_c, kernel=sched.kernel,
+                stride=sched.stride, dilation=sched.dilation,
+                loader_class=sched.loader_class, flags=sched.flags)
+        reserved = list(sched.reserved)
+        reserved[WINDOW_LOADER_ROW_REUSE_WORD] = word
+        compiled = replace(sched, reserved=reserved)
+        if word and not all(window_row_reuse_contract_valid(
+                compiled, conv, blob.tensor_desc[conv.src_tensor]) for conv in references):
+            raise ValueError(f"schedule[{sid}] has invalid row-reuse source layout")
+        offset = blob.header["window_sched_offset"] + sid * 128 + 126
+        struct.pack_into("<H", data, offset, word)
+    return bytes(data)
+
+
+def recompile_window_reuse_artifact(source_dir: Path, out_dir: Path) -> dict:
+    """Schedule-only export when model-side export files are no longer present.
+
+    Serialized weights/qparams are authoritative and remain byte-identical.
+    Replay is rerun from the new PARAM; the previous golden is a hard gate.
+    """
+    from hw_param_replay import ParamBlob
+    source_dir, out_dir = source_dir.resolve(), out_dir.resolve()
+    if source_dir == out_dir or source_dir in out_dir.parents:
+        raise ValueError("output must be separate from the frozen artifact")
+    if out_dir.exists() and any(out_dir.iterdir()):
+        raise ValueError(f"refusing to overwrite existing artifact: {out_dir}")
+    original = (source_dir / "PARAM.BIN").read_bytes()
+    compiled = compile_window_reuse_param(source_dir / "PARAM.BIN")
+    blob = ParamBlob(source_dir / "PARAM.BIN")
+    if (blob.geometry.input_height, blob.geometry.input_width) != (256, 512):
+        raise ValueError("this recovery export is limited to H256W512")
+    original_golden = (source_dir / "golden_output_q.bin").read_bytes()
+    shutil.copytree(source_dir, out_dir, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("sa_utilization*"))
+    for filename in ("PARAM.BIN", "param_blob.bin"):
+        (out_dir / filename).write_bytes(compiled)
+    # The replay publisher expects the model reference as input. Do not
+    # accidentally relabel a previous hardware replay as a PyTorch golden.
+    shutil.copyfile(out_dir / "model_golden_output_q_nhwc.npy",
+                    out_dir / "golden_output_q_nhwc.npy")
+    replay_report = build_param_replay_golden(out_dir, geometry=blob.geometry,
+                                            classes=blob.class_count)
+    if (out_dir / "golden_output_q.bin").read_bytes() != original_golden:
+        raise ValueError("schedule-only recompile changed frozen logits")
+    new_blob = ParamBlob(out_dir / "PARAM.BIN")
+    provenance = {"kind": "window_row_reuse_only",
+                  "source_artifact_dir": str(source_dir),
+                  "source_param_sha256": hashlib.sha256(original).hexdigest(),
+                  "numeric_sections_unchanged": True,
+                  "changed_byte_offsets": [i for i, (a, b) in enumerate(zip(original, compiled)) if a != b],
+                  "frozen_logits_identical": True,
+                  "window_row_reuse": [
+                      {"schedule_id": i, "mode": sched.row_reuse_mode,
+                       "packed_words": sched.packed_words_per_source_row}
+                      for i, sched in enumerate(new_blob.window_sched_by_index)]}
+
+    def relocate(value):
+        if isinstance(value, dict):
+            return {key: relocate(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [relocate(item) for item in value]
+        if isinstance(value, str):
+            return value.replace(str(source_dir), str(out_dir)).replace(
+                source_dir.as_posix(), out_dir.as_posix())
+        return value
+
+    # Refresh schedule audit rows and hashes in all copied metadata.
+    for filename in out_dir.glob("*.json"):
+        metadata = relocate(load_json(filename))
+        if filename.name == "param_audit.json":
+            metadata["window_row_reuse_recompile"] = provenance
+        if filename.name in ("export_manifest.json", "single_manifest.json"):
+            metadata["model_artifact_dir_at_original_export"] = metadata.pop("artifact_dir", None)
+            metadata["artifact_dir"] = str(source_dir)
+            metadata["schedule_recompile"] = provenance
+            metadata["param_blob_sha256"] = sha256_file(out_dir / "PARAM.BIN")
+            metadata["param_blob_bytes"] = len(compiled)
+            metadata["frame_data"].update(replay_report)
+            for key, entry in metadata["artifact_hashes"].items():
+                entry["sha256"] = sha256_file(out_dir / entry["file"])
+            metadata["frame_data"]["sha256"] = metadata["artifact_hashes"]
+        filename.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+    audit_path = out_dir / "param_audit.json"
+    audit = load_json(audit_path)
+    # Existing detailed audit entries are keyed by their compiled schedule id.
+    for entry in audit.get("window_schedules", []):
+        sid = int(entry["id"])
+        sched = new_blob.window_sched[sid]
+        entry["row_reuse_mode"] = sched.row_reuse_mode
+        entry["packed_words_per_source_row"] = sched.packed_words_per_source_row
+    audit_path.write_text(json.dumps(audit, indent=2, ensure_ascii=False), encoding="utf-8")
+    parse_and_check_blob_v4(out_dir / "PARAM.BIN", audit)
+    return load_json(out_dir / "export_manifest.json")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--recompile-window-reuse-from", type=Path,
+        help="Schedule-only export from a frozen H256W512 v4 hardware artifact; never retrains.",
+    )
     parser.add_argument(
         "--artifact-dir",
         default=r"D:\ESP_INT8\quantized_artifacts_hw_constrained_qat_3ep",
@@ -4817,7 +4920,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    manifest = build_blob_v4(args)
+    manifest = (recompile_window_reuse_artifact(args.recompile_window_reuse_from, Path(args.out_dir))
+                if args.recompile_window_reuse_from is not None else build_blob_v4(args))
     parse_and_check_blob_v4(Path(manifest["param_blob"]), load_json(Path(args.out_dir) / "param_audit.json"))
 
     print(f"Exported param blob: {manifest['param_blob']}")

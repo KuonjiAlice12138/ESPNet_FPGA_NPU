@@ -11,6 +11,12 @@ MAIN = (ROOT / "ESP_INT8_app" / "src" / "main.c").read_text(encoding="utf-8")
 HAL = (ROOT / "ESP_INT8_app" / "src" / "hal" / "int8_npu.c").read_text(
     encoding="utf-8"
 )
+APP_YAML = (ROOT / "ESP_INT8_app" / "src" / "app.yaml").read_text(
+    encoding="utf-8"
+)
+README = (ROOT / "ESP_INT8_app" / "src" / "README.txt").read_text(
+    encoding="utf-8"
+)
 
 
 def macro(name: str) -> str:
@@ -43,6 +49,30 @@ class DualProfileAppContract(unittest.TestCase):
         self.assertEqual(macro("INT8_APP_REQUIRE_CONV_PROFILE"), "1U")
         self.assertIn("stage_counter_dump_conv_csv();", HAL)
         self.assertIn("stage_counter_has_conv_profile()", MAIN)
+
+    def test_round1_post_profile_uses_word_class_labels(self):
+        start = HAL.index("static const char *stage_counter_conv_post_name(")
+        end = HAL.index("\nstatic void ", start + 1)
+        names = HAL[start:end]
+        self.assertIn('case 1U: return "STAGING_WORD_OR_WAIT_PSUM";', names)
+        self.assertIn('case 2U: return "COMMIT_WORD_OR_WAIT_PSUM";', names)
+        self.assertNotIn('return "ROWBUF_WRITE";', names)
+        self.assertNotIn('return "REQUANT_OR_WAIT_PSUM";', names)
+        self.assertIn("POST bins classify psum words", HAL)
+        self.assertIn("not phase times", HAL)
+
+    def test_build_identifies_round4r_platform_and_retains_timer_units(self):
+        self.assertIn("-H256W512-R4R-DUAL-PROF",
+                      macro("INT8_APP_BUILD_TAG"))
+        self.assertIn(r"platform_r4_0922\export\platform_r4_0922", APP_YAML)
+        self.assertIn("Platform: platform_r4_0922", README)
+        self.assertIn("Round 4R", README)
+        self.assertIn("WNS=+0.293 ns", README)
+        self.assertIn("routing errors=0", README)
+        self.assertEqual(macro("INT8_APP_PL_TARGET_HZ"), "100000000ULL")
+        self.assertEqual(macro("INT8_APP_PL_TARGET_PERIOD_NS"), "10U")
+        self.assertIn("CNTPCT_EL0", MAIN)
+        self.assertIn("CNTFRQ_EL0", MAIN)
 
     def test_model_files_are_short_and_resolution_specific(self):
         expected = {

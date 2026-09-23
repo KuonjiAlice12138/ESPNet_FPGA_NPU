@@ -143,9 +143,16 @@ WINDOW_ROW_REUSE_MODE_MASK = 0x3
 WINDOW_ROW_REUSE_WORDS_SHIFT = 2
 WINDOW_ROW_REUSE_WORDS_MASK = 0x7F
 WINDOW_ROW_REUSE_RESERVED_SHIFT = 9
+WINGEN_NARROW_ROW_WORDS = 96
 
 
-def window_row_reuse_contract_valid(desc: "WindowSchedDesc") -> bool:
+def window_row_reuse_contract_valid(
+    desc: "WindowSchedDesc",
+    conv: "ConvExecDesc | None" = None,
+    src: "TensorDesc | None" = None,
+) -> bool:
+    if len(desc.reserved) != WINDOW_LOADER_RESERVED_WORDS:
+        return False
     word = desc.reserved[WINDOW_LOADER_ROW_REUSE_WORD]
     if word >> WINDOW_ROW_REUSE_RESERVED_SHIFT:
         return False
@@ -154,19 +161,31 @@ def window_row_reuse_contract_valid(desc: "WindowSchedDesc") -> bool:
     if mode == WINDOW_ROW_REUSE_NONE:
         return words == 0
     common = (
-        desc.kernel == 3
+        mode == WINDOW_ROW_REUSE_STRIDE2_KEEP1
+        and desc.mode == WIN_MODE_3X3_STAGED_C3
+        and desc.kernel == 3
+        and desc.stride == 2
+        and desc.in_c == 3
         and desc.dilation == 1
         and desc.loader_class == WIN_LOADER_3X3_NARROW
         and bool(desc.flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
-        and words == 96
+        and 0 < words <= WINGEN_NARROW_ROW_WORDS
     )
-    if not common:
+    if not common or conv is None or src is None:
         return False
-    if mode == WINDOW_ROW_REUSE_STRIDE1_KEEP2:
-        return desc.in_c == 12 and desc.stride == 1
-    if mode == WINDOW_ROW_REUSE_STRIDE2_KEEP1:
-        return desc.in_c == 3 and desc.stride == 2
-    return False
+    row_bytes = src.w * src.phys_c
+    out_w = (conv.in_w + 2 * conv.padding - 3) // 2 + 1
+    return (
+        src.h > 0 and src.w > 0 and src.c == 3 and src.phys_c == 3
+        and src.elem_bytes == 1 and src.c_offset == 0 and src.base_offset % 32 == 0
+        and src.h == conv.in_h and src.w == conv.in_w
+        and row_bytes % 32 == 0 and row_bytes // 32 == words
+        and conv.out_c > 0 and conv.out_c <= 16
+        and all(getattr(conv, field) == getattr(desc, field)
+                for field in ("in_c", "kernel", "stride", "dilation", "padding", "k_tiles"))
+        and desc.k_tiles == 1 and desc.out_w == out_w
+        and bool(desc.flags & 2) == bool(out_w % 2)
+    )
 STAGED_3X3_MODES = {
     WIN_MODE_3X3_STAGED_C3,
     WIN_MODE_3X3_STAGED_C12,
@@ -204,6 +223,7 @@ class TensorDesc:
     c: int = 0
     reserved0: int = 0
     reserved1: int = 0
+    elem_bytes: int = 1
     @property
     def phys_c(self) -> int:
         return self.reserved0 if self.reserved0 else self.c
@@ -450,6 +470,7 @@ class ParamBlob:
             bo = td_off + i * 16
             self.tensor_desc.append(TensorDesc(
                 bank_id=self._u8(bo),
+                elem_bytes=self._u8(bo + 1),
                 reserved0=self._u16(bo + 2),
                 base_offset=self._u32(bo + 4),
                 h=self._u16(bo + 8),
@@ -599,7 +620,16 @@ class ParamBlob:
                 loader_steady_mask=self._u8(bo + 107),
                 reserved=[self._u16(bo + 108 + j * 2) for j in range(10)],
             )
-            if not window_row_reuse_contract_valid(desc):
+            references = [conv for conv in self.conv_exec_by_index
+                          if conv.window_sched_id == i]
+            valid = window_row_reuse_contract_valid(desc)
+            if desc.row_reuse_mode != WINDOW_ROW_REUSE_NONE:
+                valid = bool(references) and all(
+                    0 <= conv.src_tensor < len(self.tensor_desc)
+                    and window_row_reuse_contract_valid(
+                        desc, conv, self.tensor_desc[conv.src_tensor])
+                    for conv in references)
+            if not valid:
                 raise ValueError(
                     f"window_sched[{i}] has invalid row-reuse contract: "
                     f"mode={desc.row_reuse_mode} "

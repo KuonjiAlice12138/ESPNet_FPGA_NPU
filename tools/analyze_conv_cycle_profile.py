@@ -145,9 +145,7 @@ def build_useful_cycle_model(artifact_dir: Path) -> dict[int, dict[str, int]]:
             issue_rows = stats.out_h * stats.issue_count_per_row * stats.oc_tiles
             owner_cycles["win"] += issue_rows * stats.k_tiles
             owner_cycles["sa"] += issue_rows * stats.sa_cycles_per_issue
-            owner_cycles["post"] += issue_rows * (
-                stats.postprocess_cycles_per_issue + 1
-            )
+            owner_cycles["post"] += issue_rows * stats.postprocess_cycles_per_issue
         result[exec_index] = owner_cycles
     return result
 
@@ -192,17 +190,11 @@ def build_attribution_rows(
         known_overheads = {
             owner: value for owner, value in overheads.items() if value is not None
         }
-        if conv_cycles == 0:
-            limiter_owner = "NONE"
-        elif known_overheads:
-            limiter_owner = max(known_overheads, key=known_overheads.get)
-        else:
-            active_by_owner = {
-                "WIN": win_active,
-                "SA": sa_active,
-                "POST": post_active,
-            }
-            limiter_owner = max(active_by_owner, key=active_by_owner.get)
+        # Active bins include blocking and pipeline residency. Their maximum
+        # (or excess over an ideal model) cannot identify a causal bottleneck.
+        limiter_owner = "NONE" if conv_cycles == 0 else "UNRESOLVED"
+        largest_excess_owner = (max(known_overheads, key=known_overheads.get)
+                                if conv_cycles and known_overheads else "NONE")
 
         row: dict[str, object] = {
             "prefix": record.get("prefix", ""),
@@ -227,6 +219,8 @@ def build_attribution_rows(
             "sa_amplification": _amplification(sa_active, sa_useful),
             "post_amplification": _amplification(post_active, post_useful),
             "limiter_owner": limiter_owner,
+            "largest_excess_owner": largest_excess_owner,
+            "attribution_status": "state_residency_not_causal_stall",
         }
         for column, value in zip(WIN_COLUMNS, win_values):
             row[column] = value

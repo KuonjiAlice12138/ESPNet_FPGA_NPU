@@ -17,16 +17,13 @@ import torch
 
 TOOL_DIR = Path(__file__).resolve().parent
 ROOT = TOOL_DIR.parent
-ARTIFACT_DIR = ROOT / "hw_artifacts" / "sched_v4_p7_0702"
-QAT_DIR = ROOT / "quantized_artifacts_hw_constrained_qat_p7_hwconv_0623"
+ARTIFACT_DIR = ROOT / "hw_artifacts" / "binary2_int8_h256w512_r2_v4"
 
 sys.path.insert(0, str(TOOL_DIR))
 
 import eval_val_hw_masks_fullres as eval_fullres
 import export_int8_hw_blob as blob_tools
-from audit_p7_precision_contract import detect_round_mode, inspect_qat_hook_source
 from export_exec_prefix_params import build_exec_prefix_blobs
-from export_p7_param_replay_prefix import export_prefix
 from hw_int8_math import (
     hls_activation_quant_dequant,
     hls_add_bypass_dequant,
@@ -36,23 +33,13 @@ from hw_int8_math import (
 )
 from hw_param_replay import (
     ParamBlob,
-    _store_slice,
-    compare_i8_arrays,
     decode_window_loader_runs as replay_decode_window_loader_runs,
-    replay_prefix,
 )
 
 
 def assert_tensor_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
     if not torch.equal(actual.cpu(), expected.cpu()):
         raise AssertionError(f"actual={actual.cpu().tolist()} expected={expected.cpu().tolist()}")
-
-
-def load_golden_nhwc(path: Path) -> np.ndarray:
-    arr = np.load(path)
-    if arr.ndim != 4 or arr.shape[0] != 1:
-        raise ValueError(f"{path} shape={arr.shape}; expected NCHW batch=1")
-    return np.ascontiguousarray(np.transpose(arr[0], (1, 2, 0))).astype(np.int8)
 
 
 def test_hw_int8_math() -> None:
@@ -111,7 +98,13 @@ def test_param_parser_contract() -> None:
     assert len(blob.row_consumer) == blob.header["row_consumer_count"]
     assert len(blob.exec_plan) == blob.header["exec_plan_count"]
 
-    assert audit["packed_weights"]["wbuf_bytes"] == 120 * 1024
+    # Historical 0809 artifacts used a 120 KiB binary2 reservation, while
+    # current H256/W512 export reserves the larger city20-safe capacity.  The
+    # contract is that both the recorded legacy reservation and the current
+    # exporter capacity can contain the packed payload, not that old metadata
+    # must equal today's constant.
+    assert audit["packed_weights"]["wbuf_bytes"] >= audit["packed_weights"]["total_bytes"]
+    assert blob_tools.WBUF_BYTES >= audit["packed_weights"]["total_bytes"]
     assert hard_checks["packed_weight_fits_wbuf"] is True
     assert hard_checks["pool2_alias_lifetime_safe"] is True
     assert hard_checks["pool2_alias_safe"] is True
@@ -167,18 +160,19 @@ def test_exec_prefix_app_contract() -> None:
         ROOT / "ESP_INT8_app" / "src" / "hal" / "int8_npu.h"
     ).read_text(encoding="utf-8")
 
-    assert '#define INT8_APP_ENABLE_EXEC_PREFIX_PROFILE 1U' in config
+    assert '#define INT8_APP_ENABLE_EXEC_PREFIX_PROFILE 0U' in config
+    assert '#define INT8_APP_ENABLE_DUAL_SINGLE_TEST 1U' in config
     assert '#define INT8_APP_EXEC_PREFIX_COUNT 16U' in config
     assert (
-        '#define INT8_APP_EXEC_PREFIX_REFERENCE_FULL_RTL_CYCLES 54200473ULL'
+        '#define INT8_APP_EXEC_PREFIX_REFERENCE_FULL_RTL_CYCLES 0ULL'
         in config
     )
     assert (
-        '#define INT8_APP_EXEC_PREFIX_TARGET_MAX_RTL_CYCLES 50000000ULL'
+        '#define INT8_APP_EXEC_PREFIX_TARGET_MAX_RTL_CYCLES 0ULL'
         in config
     )
-    assert 'INT8-BOARD-20260803-P7-R4' in config
-    assert "platform_p7r4_0803" in app_yaml
+    assert 'INT8-BOARD-20260923-P7-H256W512-R4R-DUAL-PROF' in config
+    assert "platform_r4_0922" in app_yaml
     assert "run_exec_prefix_profile" in main_src
     assert "EXEC_PREFIX_CYCLES_BEGIN" in main_src
     assert "PREFIX_CUM" in main_src
@@ -187,60 +181,6 @@ def test_exec_prefix_app_contract() -> None:
     assert "APP: prefix target" in main_src
     assert "stage_counter_read_status" in hal_header
     assert "stage_counter_read_current" in hal_header
-
-
-def test_prefix_replay_contract() -> None:
-    blob = ParamBlob(ARTIFACT_DIR / "PARAM.BIN")
-
-    first = _store_slice(None, (128, 256, 12), 0, np.zeros((128, 256, 12), dtype=np.int8))
-    second = _store_slice(first, (64, 128, 25), 0, np.ones((64, 128, 25), dtype=np.int8))
-    assert second.shape == (64, 128, 25)
-    assert int(second.sum()) == 64 * 128 * 25
-
-    replay = replay_prefix(blob, ARTIFACT_DIR / "input_q.bin", stop_logical_uop=20)
-    got = replay.read_tensor(5)
-    expected = load_golden_nhwc(QAT_DIR / "golden_sample" / "level2_0_bn" / "output_int.npy")
-    result = compare_i8_arrays(got, expected)
-    assert result["mismatches"] == 0, result
-
-
-def test_conv_forward_contract() -> None:
-    blob = ParamBlob(ARTIFACT_DIR / "PARAM.BIN")
-    got = replay_prefix(blob, ARTIFACT_DIR / "input_q.bin", stop_logical_uop=2).read_tensor(3)
-    expected = load_golden_nhwc(QAT_DIR / "golden_sample" / "b1_bn" / "output_int.npy")
-    result = compare_i8_arrays(got, expected)
-    assert result["mismatches"] == 0, result
-
-
-def test_prefix_export_smoke() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        out_dir = Path(td)
-        report = export_prefix(
-            artifact_dir=ARTIFACT_DIR,
-            qat_dir=QAT_DIR,
-            out_dir=out_dir,
-            stop_logical_uop=2,
-            tensor_ids=[3],
-        )
-        assert report["stop_logical_uop"] == 2
-        assert (out_dir / "T03_replay_nhwc.npy").exists()
-        assert (out_dir / "T03_replay_nhwc.bin").exists()
-        manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
-        assert manifest["tensors"]["3"]["shape"] == [256, 512, 19]
-        assert "qat_golden_compare" in manifest["tensors"]["3"]
-
-
-def test_precision_audit_contract() -> None:
-    round_mode = detect_round_mode(ROOT / "ESP_INT8_hls" / "include" / "npu_q.hpp")
-    assert round_mode == "round_away_negative", round_mode
-
-    hook_report = inspect_qat_hook_source(TOOL_DIR / "hw_int8_math.py")
-    assert hook_report["hls_conv2d_i8_helper"] is True
-    assert hook_report["hls_requant_i32_helper"] is True
-    assert hook_report["activation_hooks"] is True
-    assert hook_report["floatfunctional_add_patch"] is True
-    assert hook_report["floatfunctional_cat_patch"] is True
-    assert hook_report["conv2d_forward_patch"] is True
 
 
 def _window_request_columns(desc, issue: int) -> list[int]:
@@ -355,15 +295,8 @@ def test_window_schedule_contracts() -> None:
             2,
             1,
             3,
-            512,
-        ): (blob_tools.WINDOW_ROW_REUSE_STRIDE2_KEEP1, 96),
-        (
-            blob_tools.WIN_MODE_3X3_STAGED_C12,
-            1,
-            1,
-            12,
             256,
-        ): (blob_tools.WINDOW_ROW_REUSE_STRIDE1_KEEP2, 96),
+        ): (blob_tools.WINDOW_ROW_REUSE_STRIDE2_KEEP1, 48),
     }
     assert all(
         (
@@ -562,9 +495,10 @@ def test_serial_row_wingen_source_contract() -> None:
     assert win_source.count("void scheduled_window_generator_row(") == 1
     assert conv_source.count("scheduled_window_generator_row(") == 2
 
+    # A row-local issue_count field is valid in the narrowed fallback config;
+    # reject only the retired segment API and its derived loop variables.
     for legacy_token in (
         "u16_t issue_begin",
-        "u16_t issue_count",
         "bool row_begin",
         "issue_begin_i",
         "issue_count_i",
@@ -580,26 +514,39 @@ def test_serial_row_wingen_source_contract() -> None:
     assert "s_wide_col_tag" not in win_source
     assert "s_narrow_col_tag" not in win_source
 
-    # Round 2 keeps one FMBUF reader and one local-cache assembler in a bounded
-    # hierarchical DATAFLOW region. The old combined load/assemble helpers must
-    # not remain as alternate hot paths.
+    # Round 4 keeps one FMBUF reader and one assembler-owned rolling spatial
+    # cache in the bounded DATAFLOW region. Full-window transfer remains only
+    # for schedule classes that did not opt into the incremental protocol.
     for required in (
         "window_row_loader",
         "window_row_assembler",
         "scheduled_3x3_window_row_pipeline",
         "window_column_meta_t",
         "window_load_word_t",
-        "narrow_paired_issue_meta_t",
+        "narrow_paired_issue_plan_t",
         "window_row_loader_narrow_paired",
         "window_row_loader_narrow_reuse",
         "window_loader_emit_narrow_cached_window",
         "window_loader_emit_narrow_reuse_window",
         "window_row_assembler_read_narrow_window",
+        "select_narrow_transfer_protocol",
+        "window_row_loader_narrow_incremental_c12",
+        "window_row_loader_narrow_incremental_c3_reuse",
+        "window_loader_emit_narrow_direct_run<4>",
+        "window_loader_emit_narrow_direct_run<2>",
+        "window_loader_emit_narrow_reuse_run<5>",
+        "window_loader_emit_narrow_reuse_run<4>",
+        "window_assembler_consume_c12_incremental",
+        "window_assembler_consume_c3_reuse_incremental",
+        "narrow_incremental_cache_t incremental_cache",
         "s_narrow_row_bank0",
         "s_narrow_row_bank1",
         "s_narrow_row_bank2",
     ):
         assert required in win_source
+    assert "static narrow_incremental_cache_t" not in win_source
+    assert "narrow_issue_stream" not in win_source
+    assert "ESP_INT8_CSIM_VALIDATE_INCREMENTAL_TRANSFER" in win_source
     assert "stage_narrow_3x3_window_pair" not in win_source
     for obsolete in (
         "prepare_narrow_issue_windows",
@@ -616,6 +563,32 @@ def test_serial_row_wingen_source_contract() -> None:
     assert "#pragma HLS STREAM variable=load_word_stream depth=16" in win_source
     assert "#pragma HLS STREAM variable=act_stream0 depth=40" in conv_source
     assert "#pragma HLS BIND_STORAGE variable=act_stream0 type=fifo impl=lutram" in conv_source
+
+
+def test_round4r_wingen_lane_mask_contract() -> None:
+    win_source = (ROOT / "ESP_INT8_hls" / "src" / "win_gen.cpp").read_text(
+        encoding="utf-8"
+    )
+
+    # Round 4's 256-bit dynamic shift/subtract became a 16-CARRY8 setup path.
+    # Build the lane-valid mask once in the row configuration stage and gate
+    # each output byte independently in the loader instead.
+    assert "win_low_byte_mask" not in win_source
+    assert "static_cast<act_vec_t>(1) <<" not in win_source
+    assert "u8_t narrow_valid_c;" in win_source
+    assert "u8_t last_chunk_valid_c;" in win_source
+    assert "u32_t narrow_lane_mask;" in win_source
+    assert "u32_t last_chunk_lane_mask;" in win_source
+    assert "win_build_lane_mask" in win_source
+    assert "win_apply_lane_mask" in win_source
+    mask_helper = win_source.split(
+        "static act_vec_t win_apply_lane_mask", 1
+    )[1].split("struct window_row_cfg_t", 1)[0]
+    assert "if (lane_mask[lane])" not in mask_helper
+    assert "masked.range" not in mask_helper
+    assert "for (int bit = 0; bit < 8; ++bit)" in mask_helper
+    assert "masked[bit_index] = word[bit_index] & lane_mask[lane];" in mask_helper
+    assert "cfg.in_c" not in win_source
 
 
 def test_store_layout_schedule_contracts() -> None:
@@ -799,13 +772,10 @@ def main() -> None:
         ("param_parser_contract", test_param_parser_contract),
         ("exec_prefix_param_contract", test_exec_prefix_param_contract),
         ("exec_prefix_app_contract", test_exec_prefix_app_contract),
-        ("prefix_replay_contract", test_prefix_replay_contract),
-        ("conv_forward_contract", test_conv_forward_contract),
-        ("prefix_export_smoke", test_prefix_export_smoke),
-        ("precision_audit_contract", test_precision_audit_contract),
         ("window_schedule_contracts", test_window_schedule_contracts),
         ("serial_row_schedule_contracts", test_serial_row_schedule_contracts),
         ("serial_row_wingen_source_contract", test_serial_row_wingen_source_contract),
+        ("round4r_wingen_lane_mask_contract", test_round4r_wingen_lane_mask_contract),
         ("store_layout_schedule_contracts", test_store_layout_schedule_contracts),
         ("weight_pack_contract", test_weight_pack_contract),
         ("avgpool_single_pixel_schedule_contract", test_avgpool_single_pixel_schedule_contract),

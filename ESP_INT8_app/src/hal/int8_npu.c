@@ -31,8 +31,15 @@
 #define STAGE_COUNTER_TOTAL_HI_OFFSET 0x014U
 #define STAGE_COUNTER_ACTIVE_LO_OFFSET 0x018U
 #define STAGE_COUNTER_ACTIVE_HI_OFFSET 0x01CU
+#define STAGE_COUNTER_CAPABILITY_OFFSET 0x020U
+#define STAGE_COUNTER_CONV_CURRENT_OFFSET 0x024U
 #define STAGE_COUNTER_STAGE_BASE_OFFSET 0x040U
+#define STAGE_COUNTER_CONV_WIN_BASE_OFFSET 0x100U
+#define STAGE_COUNTER_CONV_SA_BASE_OFFSET 0x140U
+#define STAGE_COUNTER_CONV_POST_BASE_OFFSET 0x180U
 #define STAGE_COUNTER_STAGE_STRIDE 0x008U
+
+#define STAGE_COUNTER_CAP_CONV_PROFILE 0x00000001U
 
 #define STAGE_COUNTER_CTRL_ENABLE 0x00000001U
 #define STAGE_COUNTER_CTRL_CLEAR 0x00000002U
@@ -155,6 +162,181 @@ u32 stage_counter_read_status(void)
     return stage_counter_read32(STAGE_COUNTER_STATUS_OFFSET);
 }
 
+int stage_counter_has_conv_profile(void)
+{
+    return ((stage_counter_read32(STAGE_COUNTER_CAPABILITY_OFFSET) &
+             STAGE_COUNTER_CAP_CONV_PROFILE) != 0U) ? 1 : 0;
+}
+
+static u64 stage_counter_read_conv_raw(u32 base, unsigned state,
+                                       unsigned state_count)
+{
+    if (state == 0U || state >= state_count) {
+        return 0ULL;
+    }
+    return stage_counter_read64(base + state * STAGE_COUNTER_STAGE_STRIDE);
+}
+
+static u64 stage_counter_derive_conv_idle(u32 base, unsigned state_count)
+{
+    const u64 conv_cycles = stage_counter_read_stage(5U);
+    u64 active_cycles = 0ULL;
+    unsigned state;
+
+    for (state = 1U; state < state_count; ++state) {
+        active_cycles += stage_counter_read_conv_raw(base, state,
+                                                     state_count);
+    }
+    return (conv_cycles >= active_cycles) ?
+               (conv_cycles - active_cycles) : 0ULL;
+}
+
+u64 stage_counter_read_conv_win(unsigned state)
+{
+    if (state >= INT8_CONV_WIN_STATE_COUNT ||
+        !stage_counter_has_conv_profile()) {
+        return 0ULL;
+    }
+    if (state == 0U) {
+        return stage_counter_derive_conv_idle(
+            STAGE_COUNTER_CONV_WIN_BASE_OFFSET,
+            INT8_CONV_WIN_STATE_COUNT);
+    }
+    return stage_counter_read_conv_raw(STAGE_COUNTER_CONV_WIN_BASE_OFFSET,
+                                       state, INT8_CONV_WIN_STATE_COUNT);
+}
+
+u64 stage_counter_read_conv_sa(unsigned state)
+{
+    if (state >= INT8_CONV_SA_STATE_COUNT ||
+        !stage_counter_has_conv_profile()) {
+        return 0ULL;
+    }
+    if (state == 0U) {
+        return stage_counter_derive_conv_idle(
+            STAGE_COUNTER_CONV_SA_BASE_OFFSET,
+            INT8_CONV_SA_STATE_COUNT);
+    }
+    return stage_counter_read_conv_raw(STAGE_COUNTER_CONV_SA_BASE_OFFSET,
+                                       state, INT8_CONV_SA_STATE_COUNT);
+}
+
+u64 stage_counter_read_conv_post(unsigned state)
+{
+    if (state >= INT8_CONV_POST_STATE_COUNT ||
+        !stage_counter_has_conv_profile()) {
+        return 0ULL;
+    }
+    if (state == 0U) {
+        return stage_counter_derive_conv_idle(
+            STAGE_COUNTER_CONV_POST_BASE_OFFSET,
+            INT8_CONV_POST_STATE_COUNT);
+    }
+    return stage_counter_read_conv_raw(STAGE_COUNTER_CONV_POST_BASE_OFFSET,
+                                       state, INT8_CONV_POST_STATE_COUNT);
+}
+
+u32 stage_counter_read_conv_current(void)
+{
+    if (!stage_counter_has_conv_profile()) {
+        return 0U;
+    }
+    return stage_counter_read32(STAGE_COUNTER_CONV_CURRENT_OFFSET);
+}
+
+static const char *stage_counter_conv_win_name(unsigned state)
+{
+    switch (state) {
+    case 0U: return "IDLE_OR_DONE";
+    case 1U: return "ACTIVE";
+    default: return "UNKNOWN";
+    }
+}
+
+static const char *stage_counter_conv_sa_name(unsigned state)
+{
+    switch (state) {
+    case 0U: return "IDLE_OR_DONE";
+    case 1U: return "COMPUTE_OR_WAIT_ACT";
+    case 2U: return "PSUM_EMIT_OR_WAIT";
+    default: return "UNKNOWN";
+    }
+}
+
+static const char *stage_counter_conv_post_name(unsigned state)
+{
+    switch (state) {
+    case 0U: return "IDLE_OR_DONE";
+    case 1U: return "STAGING_WORD_OR_WAIT_PSUM";
+    case 2U: return "COMMIT_WORD_OR_WAIT_PSUM";
+    default: return "UNKNOWN";
+    }
+}
+
+static void stage_counter_print_conv_row(const char *owner, unsigned state,
+                                         const char *name, u64 cycles,
+                                         u64 conv_cycles)
+{
+    u64 pct_x100 = (conv_cycles > 0ULL) ?
+                       ((cycles * 10000ULL) / conv_cycles) : 0ULL;
+    xil_printf("%s,%u,%s,%llu,%llu.%02llu\r\n",
+               owner, state, name, cycles,
+               pct_x100 / 100ULL, pct_x100 % 100ULL);
+}
+
+void stage_counter_dump_conv_csv(void)
+{
+#if INT8_STAGE_COUNTER_PRESENT
+    u64 conv_cycles;
+    u64 win_sum = 0ULL;
+    u64 sa_sum = 0ULL;
+    u64 post_sum = 0ULL;
+    unsigned state;
+
+    if (!stage_counter_has_conv_profile()) {
+        xil_printf("RTL_CONV_CYCLES_UNAVAILABLE: capability bit absent\r\n");
+        return;
+    }
+
+    conv_cycles = stage_counter_read_stage(5U);
+    xil_printf("APP: POST bins classify psum words (wait/requant/pack included); "
+               "not phase times\r\n");
+    xil_printf("RTL_CONV_CYCLES_BEGIN\r\n");
+    xil_printf("owner,state_id,state_name,cycles,percent_conv\r\n");
+    for (state = 0U; state < INT8_CONV_WIN_STATE_COUNT; ++state) {
+        const u64 cycles = stage_counter_read_conv_win(state);
+        win_sum += cycles;
+        stage_counter_print_conv_row("WIN", state,
+                                     stage_counter_conv_win_name(state),
+                                     cycles, conv_cycles);
+    }
+    for (state = 0U; state < INT8_CONV_SA_STATE_COUNT; ++state) {
+        const u64 cycles = stage_counter_read_conv_sa(state);
+        sa_sum += cycles;
+        stage_counter_print_conv_row("SA", state,
+                                     stage_counter_conv_sa_name(state),
+                                     cycles, conv_cycles);
+    }
+    for (state = 0U; state < INT8_CONV_POST_STATE_COUNT; ++state) {
+        const u64 cycles = stage_counter_read_conv_post(state);
+        post_sum += cycles;
+        stage_counter_print_conv_row("POST", state,
+                                     stage_counter_conv_post_name(state),
+                                     cycles, conv_cycles);
+    }
+    xil_printf("RTL_CONV_CHECK,conv_stage=%llu,win_sum=%llu,sa_sum=%llu,"
+               "post_sum=%llu,%s\r\n",
+               conv_cycles, win_sum, sa_sum, post_sum,
+               (win_sum == conv_cycles && sa_sum == conv_cycles &&
+                post_sum == conv_cycles) ? "PASS" : "FAIL");
+    xil_printf("RTL_CONV_CURRENT,0x%08x\r\n",
+               stage_counter_read_conv_current());
+    xil_printf("RTL_CONV_CYCLES_END\r\n");
+#else
+    xil_printf("RTL_CONV_CYCLES_UNAVAILABLE: npu_stage_counter base macro not found\r\n");
+#endif
+}
+
 void stage_counter_dump_csv(void)
 {
 #if INT8_STAGE_COUNTER_PRESENT
@@ -181,6 +363,7 @@ void stage_counter_dump_csv(void)
                stage_counter_read32(STAGE_COUNTER_STATUS_OFFSET),
                (u32)INT8_STAGE_COUNTER_BASEADDR);
     xil_printf("RTL_STAGE_CYCLES_END\r\n");
+    stage_counter_dump_conv_csv();
 #else
     xil_printf("RTL_STAGE_CYCLES_UNAVAILABLE: npu_stage_counter base macro not found\r\n");
 #endif
@@ -456,7 +639,7 @@ int int8_npu_validate_param_header(const Int8ParamBlobHeader *header,
         xil_printf("NPU: bad param magic=0x%08x\r\n", header->magic);
         return XST_FAILURE;
     }
-    if (header->version != INT8_PARAM_BLOB_VERSION) {
+    if (header->version != INT8_PARAM_BLOB_VERSION_CURRENT) {
         xil_printf("NPU: bad param version=0x%08x\r\n", header->version);
         return XST_FAILURE;
     }
@@ -465,12 +648,15 @@ int int8_npu_validate_param_header(const Int8ParamBlobHeader *header,
                    header->uop_count, INT8_EXPECTED_UOP_COUNT);
         return XST_FAILURE;
     }
-    if (header->exec_plan_count != INT8_EXPECTED_EXEC_PLAN_COUNT ||
+    {
+        const u32 expected_exec_count = INT8_EXPECTED_EXEC_PLAN_COUNT;
+        if (header->exec_plan_count != expected_exec_count ||
         header->exec_plan_count > INT8_MAX_EXEC_PLAN_COUNT) {
-        xil_printf("NPU: invalid exec_plan_count=%u expected=%u max=%u\r\n",
-                   header->exec_plan_count, INT8_EXPECTED_EXEC_PLAN_COUNT,
-                   INT8_MAX_EXEC_PLAN_COUNT);
-        return XST_FAILURE;
+            xil_printf("NPU: invalid exec_plan_count=%u expected=%u max=%u\r\n",
+                       header->exec_plan_count, expected_exec_count,
+                       INT8_MAX_EXEC_PLAN_COUNT);
+            return XST_FAILURE;
+        }
     }
     if (header->uop_offset > param_bytes) {
         xil_printf("NPU: invalid uop_offset=%u bytes=%u\r\n",

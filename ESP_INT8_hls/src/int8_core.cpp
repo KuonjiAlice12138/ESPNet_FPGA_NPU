@@ -16,16 +16,7 @@ void param_dma_init(const axi_vec_t* gmem_param);
 bool param_dma_ready();
 bool param_dma_is_schedule_blob();
 bool param_dma_get_pool_qparam(u8_t param_id, pool_q_t& qparam);
-bool param_dma_get_conv_qparam(u8_t param_id, conv_q_t& qparam);
-bool param_dma_get_conv_exec_desc(u8_t id, conv_exec_desc_t& desc);
-bool param_dma_get_window_sched(u8_t id, window_sched_desc_t& desc);
-bool param_dma_get_row_consumer(u8_t id, row_consumer_desc_t& desc);
-bool param_dma_get_exec_entry(u8_t pc, exec_plan_entry_t& entry);
 bool param_dma_get_fixed_exec_desc(u8_t id, fixed_exec_desc_t& desc);
-bool param_dma_get_block5_sched(u8_t id, block5_sched_desc_t& desc);
-bool param_dma_get_packed_weight_vec(const conv_exec_desc_t& desc, u16_t tm, u16_t kt, wgt_vec_t& word);
-bool param_dma_get_affine_qparam(u8_t param_id, u8_t block_id, aff_q_t& qparam);
-bool param_dma_get_add_qparam(u8_t param_id, add_q_t& qparam);
 void frame_dma_load(const axi_vec_t* gmem_frame_in);
 bool avgpool_unit_checked(const tensor_desc_t& src,
                           const tensor_desc_t& dst,
@@ -37,32 +28,6 @@ bool on_chip_memory_read_packed_tile(const tensor_desc_t& desc,
                                      u16_t c_begin,
                                      u8_t valid_c,
                                      act_vec_t& packed);
-bool on_chip_memory_read_aligned_full_tile(const tensor_desc_t& desc,
-                                           i32_t h,
-                                           i32_t w,
-                                           u16_t c_begin,
-                                           act_vec_t& packed);
-bool on_chip_memory_read_fmbuf_abs_word(u8_t bank_id,
-                                        u32_t byte_offset,
-                                        axi_vec_t& packed);
-bool on_chip_memory_write_fmbuf_abs_word(u8_t bank_id,
-                                         u32_t byte_offset,
-                                         axi_vec_t packed);
-bool on_chip_memory_read_pool2_abs_word(u32_t byte_offset,
-                                        axi_vec_t& packed);
-bool on_chip_memory_write_pool2_abs_word(u32_t byte_offset,
-                                         axi_vec_t packed);
-bool conv_store_write_aligned_tile(const tensor_desc_t& dst,
-                                   u16_t h,
-                                   u16_t w,
-                                   u16_t c,
-                                   const act_vec_t& word);
-bool conv_store_write_row_contiguous_word(const tensor_desc_t& dst,
-                                          u32_t abs_offset,
-                                          const axi_vec_t& word);
-bool conv_store_row_contiguous_plan_ok(const tensor_desc_t& dst,
-                                       u16_t width,
-                                       u16_t valid_c);
 void reset_scratch_state();
 void select_scratch_region_for_fields(u8_t opcode,
                                       u8_t param_id,
@@ -81,17 +46,6 @@ bool alias_scratch_tensor_to_slice(u8_t tensor_id,
                                    const tensor_desc_t& base_desc,
                                    u16_t c_offset,
                                    u16_t c);
-bool resolve_block5_scratch_descs(u16_t pattern,
-                                  u8_t first_branch_param,
-                                  u16_t rows,
-                                  u16_t out_w,
-                                  tensor_desc_t& s0,
-                                  tensor_desc_t& s1,
-                                  tensor_desc_t& s2,
-                                  tensor_desc_t& s3,
-                                  tensor_desc_t& s4);
-void upsample_fused_begin();
-
 static param_blob_header_t s_param_header;
 static bool s_param_ready = false;
 

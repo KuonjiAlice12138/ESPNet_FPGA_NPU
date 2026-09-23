@@ -1,0 +1,154 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+\begin{document}
+
+\title{\textbf{INT8 NPU for ESPNet Encoder：算法-硬件协同设计与架构创新}}
+\author{}
+\date{\today}
+\maketitle
+
+\vspace{-8mm}
+\begin{center}
+\small 硬件基线：P6J-100MHz-Timing-Clean \quad 器件：Xilinx xczu15eg-ffvb1156-2-i \quad PL时钟：100 MHz
+\end{center}
+
+%=========================================================================
+
+\section*{创新点一：对称INT8量化算法-硬件协同设计}
+
+\textbf{权重、激活值均采用对称INT8量化，省去零点这一参数。} Activation使用整个张量共用的scale参数，权重使用逐通道共用的scale参数。MAC阵列在计算卷积时直接使用这些scale参数，无需非对称量化的零点补偿，每个MAC运算节省一次额外的INT32累加。
+
+\textbf{硬件对权重、激活值的对称量化要求反向约束模型侧的量化感知训练（QAT）。} 在模型训练阶段，必须确保所有权重和激活值都经过对称量化处理，且零点为0。ESPNet中的ADD/CONCAT分支算子前必须重量化到统一目标scale；这一约束由导出脚本在离线阶段保证，运行时由后处理单元对每一个后接ADD/CONCAT算子的卷积层流水实现。
+
+\begin{table}[h]
+\centering
+\caption{量化方案与类似工作对比}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+方案 & 量化 & 零点补偿 & 中间特征存储 & 精度 \\
+\midrule
+FINN (FPGA 2017) & 二值/三值 & 无 & 片上逐层数据流 & 精度退化显著 \\
+DNNBuilder (ICCAD 2018) & INT8对称/非对称 & 数据通路内 & 读写DDR & 接近FP32 \\
+Angel-Eye (TCAD 2018) & INT8定点 & 算法端预补偿 & 读写DDR & 接近FP32 \\
+\textbf{本设计} & INT8对称 & 无零点补偿 & 全片上存储 & 与INT8模型保持一致，相比FP32无损 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=========================================================================
+
+\section*{创新点二：按输出通道行级流式卷积数据流}
+
+\textbf{核心设计：} 将每个卷积分解为逐输出行的HLS数据流区域。四进程流水线执行，写回在行级数据流外部完成。
+
+\begin{table}[h]
+\centering
+\caption{数据流方案与类似工作对比}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+方案 & 阵列尺寸 & 小通道利用率 & 模型灵活性 & 片上存储复用 \\
+\midrule
+TPU脉动 (ISCA 2017) & 128$\times$128+ & $<20\%$ & 通用 & 无逐层DDR \\
+FINN流式 (FPGA 2017) & 逐层定制 & 100\% & 固定拓扑 & 是 \\
+DNNBuilder (ICCAD 2018) & 可配置 & 中等 & 通用模板 & 读写DDR \\
+\textbf{本设计} & 32$\times$32 & \textbf{50--100\%} & UOP通用 & 5.86MB的URAM特征图缓存 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=========================================================================
+
+\section*{创新点三：自定义指令集——通用多模型部署}
+
+\textbf{ESPNet可解析为：} CONV (26) / POOL (3) / ADD (14) / AFFINE (7) / STORE/CONCAT (23) / LOAD\_FM (1) / END (1)，编码为 32 字节描述符，封装在统一 PARAM.BIN 中，初始化阶段加载到PL端，一次性加载后可循环做完整推理。
+
+\textbf{模型无关部署：} 任何可分解为上述六类算子的卷积神经网络均可在我们的设计上运行，仅需通过脚本编译模型得到PARAM.BIN，修改SD卡初始文件，无需重走Vivado综合、实现流程。
+
+%=========================================================================
+
+\section*{创新点四：适配多精度INT量化的数据通路}
+
+我们当前的MAC阵列以INT8为基准，下一步可简单拓展支持任何低于INT8位宽的INT量化。
+\begin{itemize}
+\item \textbf{INT6：} 不需要硬件修改，仅需导出模型权重、激活值到新的量化格式，与INT8的理论峰值性能持平。
+\item \textbf{INT4：} 阵列中单个PE可并行处理两个独立的4-bit MAC，理论峰值性能为INT8的两倍，且节省一半的存储开销，时序相比INT8版本将明显更优，可以追求更高的系统时钟频率。
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{多精度支持对比}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+方案 & INT8 & INT4 & DSP策略 \\
+\midrule
+FINN (FPGA 2017) & 逐层 & 支持 & 逐层定制DSP \\
+BiS-KM (FPGA 2022) & 支持 & 支持(独立引擎) & 双模DSP \\
+DNNBuilder (ICCAD 2018) & 支持 & 不支持 & 固定INT8 \\
+\textbf{本设计} & 支持 & 支持 & \textbf{统一阵列，统一PE} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=========================================================================
+
+\section*{创新点五：全分辨率片上输出}
+
+传统FPGA神经网络加速器通常只输出低分辨率logits，例如图像分类标注任务典型像素224*224，即使是图像语义分割任务，也通常只输出低分辨率的分割结果（如256*128）。本设计在PL侧NPU完成ESPNet的编码器部分神经网络推理，配合插值上采样计算得到1024*512全像素的mask输出，通过AXI总线直接写出。PS端仅需保存输出掩模文件，无需任何后处理计算或额外DDR搬移。
+
+%=========================================================================
+
+\section*{综合对比：本设计与代表性 FPGA 加速方案}
+
+\begin{table}[h]
+\centering
+\caption{综合对比表}
+\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+ & FINN & DNNBuilder & Angel-Eye & NullHop & \textbf{本设计} \\
+\midrule
+器件 & Z-7045 & ZU3EG & Z-7045 & Z-7100 & \textbf{ZU15EG} \\
+频率 & 200 MHz & 200 MHz & 214 MHz & 125 MHz & \textbf{100 MHz} \\
+量化 & Binary/Tern & INT8/16 & INT8 Fix & FP16/INT8 & \textbf{INT8/6/4 zp=0} \\
+阵列 & 逐层流 & 可配置 & 32$\times$32 & 12$\times$14 & \textbf{32$\times$32} \\
+数据流 & Stream/layer & Dbl-buffer & Systolic & LB sparse & \textbf{Row-Level} \\
+片上存储 & BRAM/layer & BRAM & BRAM & BRAM+URAM & \textbf{5.86MB FMBUF} \\
+灵活性 & 固定拓扑 & 模板参数化 & 编译工具链 & RTL编译器 & \textbf{UOP（换PARAM.BIN）} \\
+输出 & 分类logits & 分类/检测 & 分类/检测 & 分类logits & \textbf{全分辨率mask} \\
+网络 & 二值小网 & General CNN & CNN分类 & Sparse CNN & \textbf{ESPNet分割} \\
+精度 & 小网Top-1 & 公开数据 & 公开数据 & 公开数据 & \textbf{PA 0.978 mIoU 0.864} \\
+状态 & 完整 & 完整 & 完整 & 完整 & \textbf{100MHz时序收敛} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\vspace{4mm}
+\textbf{器件资源对比（ZU15EG vs ZU3EG vs Z-7045 vs Z-7100）：}
+
+\begin{table}[h]
+\centering
+\caption{器件资源与资源利用率对比}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+ & xczu15eg (本) & xczu3eg & xc7z045 & xc7z100 \\
+\midrule
+CLB LUT & 341,280 & 154,320 & 218,600 & 277,400 \\
+BRAM (Mb) & 26.2 & 7.6 & 19.2 & 26.5 \\
+URAM (Mb) & 31.6 & 13.5 & 0 & 0 \\
+DSP & 3,528 & 360 & 900 & 2,020 \\
+\hline
+本设计使用 & 193,651 (56.7\%) & — & — & — \\
+本设计BRAM & 726 tiles (97.6\%) & — & — & — \\
+本设计URAM & 112 (100\%) & — & — & — \\
+本设计DSP & 1,261 (35.7\%) & — & — & — \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

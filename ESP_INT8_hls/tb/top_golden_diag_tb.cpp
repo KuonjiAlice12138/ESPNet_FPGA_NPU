@@ -61,8 +61,8 @@ static void print_desc(const char* name, esp_int8::u8_t tensor_id) {
 }
 
 int main() {
-  const char* param_path = "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_v4/PARAM.BIN";
-  const char* input_path = "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_v4/input_q.bin";
+  const char* param_path = "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_r2_v4/PARAM.BIN";
+  const char* input_path = "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_r2_v4/input_q.bin";
 
   std::vector<std::uint8_t> param_bytes;
   std::vector<std::uint8_t> input_bytes;

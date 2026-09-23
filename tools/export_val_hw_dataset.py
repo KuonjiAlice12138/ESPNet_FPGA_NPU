@@ -328,7 +328,8 @@ def assert_observer_matches_scale_table(observer: Any, table: dict[str, tuple[fl
     if abs(got[0] - expected[0]) > max(1e-8, abs(expected[0]) * 1e-5) or got[1] != expected[1]:
         raise ValueError(
             f"{name} observer qparams {got} do not match hardware scale_table {expected}; "
-            "rerun export_quantized_artifacts.py and export_int8_hw_blob.py."
+            "rerun D:/ESPNet/export_quantized_artifacts.py and "
+            "tools/export_int8_hw_blob.py."
         )
 
 

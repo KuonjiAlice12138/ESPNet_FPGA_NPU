@@ -202,6 +202,72 @@ static void test_tail_and_multi_ktile() {
     run_case("SA_TAIL_MULTI_KTILE", cfg, act, wgt, 35, 1);
 }
 
+static void run_k_tile_case(int expected_tiles,
+                            int in_c,
+                            int kernel,
+                            const char* tag) {
+    constexpr int MAX_TEST_K = esp_int8::TK * 37;
+    static std::int8_t act[MAX_TEST_K];
+    static std::int8_t wgt[esp_int8::TM * MAX_TEST_K];
+    const int k_total = in_c * kernel * kernel;
+    const int actual_tiles = (k_total + esp_int8::TK - 1) / esp_int8::TK;
+    if (actual_tiles != expected_tiles || k_total > MAX_TEST_K) {
+        std::printf("[FAIL] %s setup tiles=%d expected=%d k_total=%d\n",
+                    tag, actual_tiles, expected_tiles, k_total);
+        ++g_failures;
+        return;
+    }
+    for (int k = 0; k < k_total; ++k) {
+        act[k] = static_cast<std::int8_t>((7 * k + expected_tiles) % 17 - 8);
+    }
+    for (int oc = 0; oc < 31; ++oc) {
+        for (int k = 0; k < k_total; ++k) {
+            wgt[oc * k_total + k] =
+                static_cast<std::int8_t>((5 * oc + 3 * k) % 19 - 9);
+        }
+    }
+
+    esp_int8::conv_cfg_t cfg;
+    cfg.in_h = 1;
+    cfg.in_w = 1;
+    cfg.in_c = in_c;
+    cfg.out_c = 31;
+    cfg.kernel = kernel;
+    cfg.stride = 1;
+    cfg.dilation = 1;
+    cfg.bias_en = 0;
+    run_case(tag, cfg, act, wgt, k_total, 1);
+}
+
+static void test_k_tile_depths() {
+    run_k_tile_case(1, 31, 1, "SA_KTILE_1");
+    run_k_tile_case(2, 33, 1, "SA_KTILE_2");
+    run_k_tile_case(4, 12, 3, "SA_KTILE_4");
+    run_k_tile_case(8, 25, 3, "SA_KTILE_8");
+    run_k_tile_case(37, 131, 3, "SA_KTILE_37");
+}
+
+static void test_signed_extremes() {
+    static std::int8_t act[esp_int8::TK];
+    static std::int8_t wgt[2 * esp_int8::TK];
+    for (int k = 0; k < esp_int8::TK; ++k) {
+        act[k] = -128;
+        wgt[k] = -128;
+        wgt[esp_int8::TK + k] = 127;
+    }
+
+    esp_int8::conv_cfg_t cfg;
+    cfg.in_h = 1;
+    cfg.in_w = 1;
+    cfg.in_c = esp_int8::TK;
+    cfg.out_c = 2;
+    cfg.kernel = 1;
+    cfg.stride = 1;
+    cfg.dilation = 1;
+    cfg.bias_en = 0;
+    run_case("SA_SIGNED_EXTREMES", cfg, act, wgt, esp_int8::TK, 1);
+}
+
 static void test_3x3_flatten() {
     static std::int8_t act[18];
     static std::int8_t wgt[4 * 18];
@@ -228,10 +294,10 @@ static void test_3x3_flatten() {
     run_case("SA_3X3_FLATTEN", cfg, act, wgt, 18, 1);
 }
 
-static void test_two_pixel_mapping() {
-    static std::int8_t act[4 * 12];
+static void test_two_pixel_odd_tail() {
+    static std::int8_t act[3 * 12];
     static std::int8_t wgt[12 * 12];
-    for (int pix = 0; pix < 4; ++pix) {
+    for (int pix = 0; pix < 3; ++pix) {
         for (int k = 0; k < 12; ++k) {
             act[pix * 12 + k] = static_cast<std::int8_t>(((pix + 2) * (k + 1)) % 9 - 4);
         }
@@ -243,21 +309,23 @@ static void test_two_pixel_mapping() {
     }
     esp_int8::conv_cfg_t cfg;
     cfg.in_h = 1;
-    cfg.in_w = 4;
+    cfg.in_w = 3;
     cfg.in_c = 12;
     cfg.out_c = 12;
     cfg.kernel = 1;
     cfg.stride = 1;
     cfg.dilation = 1;
     cfg.bias_en = 0;
-    run_case("SA_TWO_PIXEL", cfg, act, wgt, 12, 4, true);
+    run_case("SA_TWO_PIXEL_ODD_TAIL", cfg, act, wgt, 12, 3, true);
 }
 
 int main() {
     test_1x1_basic();
     test_tail_and_multi_ktile();
+    test_k_tile_depths();
+    test_signed_extremes();
     test_3x3_flatten();
-    test_two_pixel_mapping();
+    test_two_pixel_odd_tail();
 
     if (g_failures != 0) {
         std::printf("sa_core_tb failed: %d failure(s)\n", g_failures);

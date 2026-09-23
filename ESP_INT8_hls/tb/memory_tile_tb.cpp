@@ -185,7 +185,6 @@ int main() {
     test_b2_concat_and_cin_tail();
     test_padding_and_oob();
     test_scratch_banks();
-
     if (g_failures != 0) {
         std::printf("memory_tile_tb failed: %d failure(s)\n", g_failures);
         return 1;

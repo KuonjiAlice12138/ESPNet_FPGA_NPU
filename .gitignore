@@ -67,6 +67,7 @@
 *.bit
 *.bin
 *.csv
+!/tools/testdata/*.csv
 *.tmp
 *.log
 *.out
@@ -76,4 +77,8 @@
 *.str
 *.wdb
 *.vcd
+*.aux
+*.synctex.gz
+*.fdb_latexmk
+*.fls
 __pycache__/

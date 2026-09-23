@@ -15,7 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 class ConvCycleProfileAnalysisTests(unittest.TestCase):
     def test_release_artifact_builds_exec_useful_cycle_model(self) -> None:
-        artifact_dir = REPO_ROOT / "hw_artifacts/binary2_int8_0809"
+        artifact_dir = REPO_ROOT / "hw_artifacts/binary2_int8_h256w512_r2_v4"
         useful = build_useful_cycle_model(artifact_dir)
         self.assertEqual(set(useful), {1, 4, 5, 6, 7, 9, 10, 11, 12, 14})
         for owner_cycles in useful.values():
@@ -58,7 +58,9 @@ class ConvCycleProfileAnalysisTests(unittest.TestCase):
         self.assertEqual(row["sa_active"], 10)
         self.assertEqual(row["post_active"], 8)
         self.assertAlmostEqual(row["sa_amplification"], 10.0 / 7.0)
-        self.assertEqual(row["limiter_owner"], "SA")
+        self.assertEqual(row["limiter_owner"], "UNRESOLVED")
+        self.assertEqual(row["largest_excess_owner"], "SA")
+        self.assertEqual(row["attribution_status"], "state_residency_not_causal_stall")
 
     def test_non_conv_prefix_keeps_zero_owner_sums(self) -> None:
         header = (

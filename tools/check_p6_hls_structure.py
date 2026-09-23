@@ -570,9 +570,17 @@ def check_executor_gateways(
         return fail("post_process_conv_row_to_buffer body not found")
     if "set_act_vec_i8_dynamic" in post_body:
         return fail("Round0722 postprocess still performs dynamic packed-word RMW")
-    for token in ("POST_LANES_PER_CYCLE", "out_lanes", "POST_REQUANT_GROUPS"):
+    for token in ("POST_LANES_PER_CYCLE = 16", "psum_half_vec_t psum_word",
+                  "packed_half", "upper_channels", "PSUM_HALVES_PER_ISSUE"):
         if token not in post_body:
-            return fail(f"Round0722 shared lane postprocess structure missing: {token}")
+            return fail(f"Round0910 shared word-wide postprocess structure missing: {token}")
+    for legacy in ("POST_REQUANT_GROUPS", "out_lanes", "qparam.bias[q_lane]"):
+        if legacy in post_body:
+            return fail(f"Round0910 legacy postprocess staging remains: {legacy}")
+    if post_body.count("requant_i32_to_i8(") != 1 or post_body.count("psum_stream.read()") != 1:
+        return fail("Round0910 postprocess must share one psum read and one lane arithmetic call site")
+    if len(re.findall(r"row_buf\[[^]]+\]\s*=", post_body)) != 1:
+        return fail("Round0910 postprocess must have one common row-buffer write tail")
 
     if re.search(r"static\s+[^;\n]*\bs_compact_", ppu):
         return fail("Round0722 compact PPU still carries segment-persistent static packet state")
@@ -1113,6 +1121,20 @@ def check_p7_bans(sources: dict[str, str]) -> int:
         return fail("SA must preserve the performance-safe II=1 K-tile schedule")
     if sa_core.count("mac_tile_active_lanes(") != 2:
         return fail("SA must keep one 32-lane MAC owner and one call site")
+    if sa_core.count("dot_product_tree_32(") != 2:
+        return fail("Round3 SA must keep one balanced 32-product reduction owner and one call site")
+    for token in (
+        "ap_int<16> products[TK]",
+        "ap_int<17> sum_l1[16]",
+        "ap_int<18> sum_l2[8]",
+        "ap_int<19> sum_l3[4]",
+        "ap_int<20> sum_l4[2]",
+        "ap_int<21> sum_l5[1]",
+    ):
+        if token not in sa_core:
+            return fail(f"Round3 SA balanced reduction stage missing: {token}")
+    if "partial +=" in sa_core:
+        return fail("Round3 SA must not restore the linear 32-product accumulation chain")
     if "mac_tile_low_group(" in sa_core or "mac_tile_high_group(" in sa_core:
         return fail("SA must not retain the resource-regressive split MAC paths")
     if "window_assembler_cfg_t" not in win_gen:
@@ -1457,8 +1479,52 @@ def check_round0727_supply_structure(
         return fail("Round0727 memory.cpp is missing the aligned tensor-word gateway")
 
     post_body = function_body(conv_engine, "post_process_conv_row_to_buffer") or ""
-    if not re.search(r"POST_LANES_PER_CYCLE\s*=\s*8\s*;", post_body):
-        return fail("Round0727 postprocess is not fixed at 8 lanes/cycle")
+    if not re.search(r"POST_LANES_PER_CYCLE\s*=\s*16\s*;", post_body):
+        return fail("Round0910 postprocess is not matched to the 16-lane psum word")
+    return 0
+
+
+def check_round4r2_fallback_cfg(win_gen: str) -> int:
+    expected_cfg = {
+        "make_narrow_paired_issue_plan": "narrow_fallback_cfg_t",
+        "window_loader_update_narrow_run": "narrow_fallback_read_cfg_t",
+        "window_row_loader_narrow_paired": "narrow_fallback_cfg_t",
+        "window_row_loader_narrow_unpaired": "narrow_fallback_cfg_t",
+    }
+    for name, cfg_type in expected_cfg.items():
+        if not re.search(
+            rf"\b{name}\s*\(\s*const\s+{cfg_type}\s*&",
+            win_gen,
+        ):
+            return fail(f"Round4R-2 fallback still receives full row config: {name}")
+    loader_body = function_body(win_gen, "window_row_loader") or ""
+    if "make_narrow_fallback_cfg(cfg)" not in loader_body:
+        return fail("Round4R-2 fallback config must be created once at row dispatch")
+    return 0
+
+
+def check_round4r4_packed_reader(memory: str) -> int:
+    if function_body(memory, "make_low_byte_mask") is not None:
+        return fail("Round4R-4 legacy 256-bit low-byte mask helper remains")
+
+    lane_mask = function_body(memory, "make_low_byte_lane_mask") or ""
+    byte_gate = function_body(memory, "mask_packed_bytes") or ""
+    packed_reader = function_body(memory, "read_tile_packed_word") or ""
+    if not lane_mask or not byte_gate or not packed_reader:
+        return fail("Round4R-4 packed-reader lane-mask structure is incomplete")
+    if "ap_uint<AXI_WORD_BYTES>" not in lane_mask or "#pragma HLS UNROLL" not in lane_mask:
+        return fail("Round4R-4 lane-valid mask must be a fully unrolled 32-bit mask")
+    if "#pragma HLS UNROLL" not in byte_gate or ".range(" not in byte_gate:
+        return fail("Round4R-4 packed-byte gating must use fixed unrolled byte slices")
+    if "make_low_byte_lane_mask" not in packed_reader or "mask_packed_bytes" not in packed_reader:
+        return fail("Round4R-4 packed reader bypasses the lane-mask byte gate")
+    for banned in (
+        "static_cast<axi_vec_t>(1) <<",
+        "axi_vec_t(1) <<",
+        "byte_count * 8U",
+    ):
+        if banned in packed_reader or banned in lane_mask or banned in byte_gate:
+            return fail(f"Round4R-4 retains a dynamic wide-mask expression: {banned}")
     return 0
 
 
@@ -1599,6 +1665,10 @@ def main() -> int:
         sources["memory"],
         sources["conv_engine"],
     ) != 0:
+        return 1
+    if check_round4r2_fallback_cfg(sources["win_gen"]) != 0:
+        return 1
+    if check_round4r4_packed_reader(sources["memory"]) != 0:
         return 1
     if check_round4a_ppu_structure(sources["ppu"], sources["conv_engine"]) != 0:
         return 1

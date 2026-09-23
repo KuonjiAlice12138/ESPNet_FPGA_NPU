@@ -1,0 +1,181 @@
+
+\documentclass[11pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{ragged2e}
+\usepackage{makecell}
+\usepackage{graphicx}
+\newcolumntype{Y}{>{\RaggedRight\arraybackslash}X}
+\newcolumntype{P}[1]{>{\RaggedRight\arraybackslash}p{#1}}
+
+\begin{document}
+
+\title{\textbf{INT8 NPU for ESPNet设计创新点与可比工作对比}}
+\author{高心咏}
+\date{}
+\maketitle
+
+
+%=========================================================================
+
+\section{创新点一：对称INT8量化算法-硬件协同设计}
+
+\textbf{权重、激活值均采用对称INT8量化，省去零点这一参数。} 激活值使用整个per-tensor的scale参数，权重使用per-channel的scale参数。MAC阵列在计算卷积时直接使用这些scale参数，无需非对称量化的零点补偿，每个MAC运算节省一次额外的INT32累加。
+
+\textbf{硬件对权重、激活值的对称量化要求反向约束模型侧的量化感知训练（QAT）。} 在模型训练阶段，必须确保所有权重和激活值都经过对称量化处理，且零点为0\footnote{传统Pytorch框架下权重一般采用torch.qint8格式，表示范围-128到127，激活值一般采用torch.quint8格式，表示范围0到255。}。ESPNet中的ADD/CONCAT多分支算子前必须将中间结果特征图重量化到统一目标scale；模型中各处的重量化参数离线导出，运行时由卷积后处理单元实现。
+
+
+\begin{table}[!htbp]
+\centering
+\caption{量化方案与类似工作对比}
+\small
+\setlength{\tabcolsep}{2pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{@{}P{0.14\textwidth}P{0.12\textwidth}P{0.14\textwidth}P{0.15\textwidth}P{0.17\textwidth}P{0.20\textwidth}@{}}
+\toprule
+方案 & 量化 & 零点补偿 & 面向模型 & 中间特征存储 & 精度/任务场景 \\
+\midrule
+FINN (FPGA'17) & \makecell[l]{Binary/\\Ternary} & 无 & 低比特CNN & 片上逐卷积层数据流 & 任务相关，常有精度折中 \\
+DNNBuilder (ICCAD'18) & INT8/16 & 额外硬件单元支持 & 通用CNN & 多层DDR往返 & 接近软件模型 \\
+Angel-Eye (TCAD'18) & INT8定点 & 算法/编译端处理 & 分类/检测CNN & DDR+片上缓存 & 接近FP32 \\
+hls4ml-ENet (2022) & 异构低比特QAT & 定点图吸收 & 低分辨率图像分割 & 全片上 & Cityscapes低分辨率mIoU约36.8\% \\
+LMIINet-CGRA4ML (2025) & Pytorch INT8 QAT & 框架内处理 & \makecell[l]{Cityscapes\\分割} & CGRA/片外skip & PA约90\%, mIoU约45.2\% \\
+\textbf{我们的设计} & \textbf{对称INT8 QAT} & \textbf{无零点补偿} & \textbf{面向ESPNet二分类图像分割，原生支持通用CNN} & \textbf{全片上URAM存储} & \textbf{PA=97.8\%, mIoU=86.4\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\textbf{与现有其他工作差异点：} 现有低比特FPGA图像分割工作通常仅仅将量化作为压缩存储代价的手段，采用定点数或与Pytorch INT8格式保持一致；本设计充分考虑硬件乘累加操作的数据流，为节省计算资源、简化数据通路、提升计算效率选择了对称INT8量化，反推回模型侧采用对称量化的量化感知训练，体现算法-硬件协同设计的理念。
+
+%=========================================================================
+
+\section{创新点二：按输出通道行级流式卷积数据流}
+
+\textbf{核心设计：} 将每个卷积分解为按输出通道并行的行级流式数据流，配合K tiling将输入特征图分块到行级，并逐行做部分积累加，避免大面积组合逻辑加法树实现，降低数据通路的时序压力。同时配合行级buffer实现部分积累加的中间结果存储，避免将中间结果写回片外DDR。
+
+\begin{table}[!htbp]
+\centering
+\caption{数据流方案与类似工作对比}
+\small
+\setlength{\tabcolsep}{2pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{@{}P{0.15\textwidth}P{0.16\textwidth}P{0.14\textwidth}P{0.20\textwidth}P{0.13\textwidth}P{0.16\textwidth}@{}}
+\toprule
+方案 & 阵列/并行形态 & 目标网络 & 数据流特征 & 模型灵活性 & 分割适配 \\
+\midrule
+TPU脉动阵列 (ISCA'17) & \makecell[l]{128$\times$128} & GEMM/CNN通用 & 大矩阵块级复用，可选输出/权重驻留 & 全通用 & 小通道卷积层阵列填充率、利用率低 \\
+FINN (FPGA'17) & 逐层定制 & INT8量化CNN/BNN & 对每层设计专用硬件 & 固定拓扑 & 对模型全定制，无通用性 \\
+hls4ml-ENet (2022) & \makecell[l]{HLS layer\\pipeline} & 轻量化ENet & 全片上低延迟 & 对模型全定制，无通用性 & 低分辨率图像分割 \\
+EDSSA-SegNet (Sensors'20) & \makecell[l]{OpenCL\\可配置PE} & SegNet & encoder-decoder tiling & 参数化 & 支持224$\times$224/480$\times$360两种分辨率\\
+Shimoda PSPNet (2021) & \makecell[l]{tile\\pipeline} & \makecell[l]{MobileNetV1-\\PSPNet} & overlap tiling+稀疏剪枝 & 针对模型定制 & Cityscapes 1024$\times$512 \\
+\textbf{我们的设计} & \makecell[l]{32$\times$32 \\MAC阵列} & \makecell[l]{\textbf{INT8}\\\textbf{ESPNet}，\\对各种CNN\\理论上通用} & \textbf{按输出通道行级并行} & \textbf{通过编译微指令对CNN通用} & \textbf{理论上对任意分辨率均适配} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=========================================================================
+
+\section{创新点三：自定义指令集——通用多模型部署}
+
+\textbf{ESPNet可解析为如下自定义ISA微指令：} CONV / POOL / ADD / AFFINE / STORE / CONCAT / LOAD\_FM / END，每条微指令编码为32B，封装在初始化文件\texttt{PARAM.BIN}中，初始化阶段由PS端控制从SD卡加载到PL端，开机一次性加载后可循环做完整推理。
+
+\textbf{模型无关部署：} 任何可分解为上述算子集合的卷积神经网络均可在本设计上运行，仅需通过脚本编译模型得到 \texttt{PARAM.BIN} 并替换SD卡文件，无需重走Vivado综合、实现流程。与hls4ml/FINN等直接固化模型的全静态生成方法相比，本设计更接近通用NPU：硬件保持不变，模型结构、tensor描述符、qparam和weight通过文件更新。
+
+%=========================================================================
+
+\section{创新点四：适配多精度INT量化的数据通路}
+
+当前MAC阵列以INT8为基准，可拓展支持低于8bit位宽的INT量化（也可支持Microscaling）。
+\begin{itemize}
+\item \textbf{INT6：} 仅需导出新的权重/激活量化格式；理论峰值性能与INT8持平，存储开销下降。
+\item \textbf{INT4：} 单个PE可并行处理两个4-bit MAC，理论峰值性能为INT8的两倍，并降低片上权重/激活带宽压力。
+\end{itemize}
+
+
+\begin{table}[!htbp]
+\centering
+\caption{多精度支持对比}
+\small
+\setlength{\tabcolsep}{2pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{@{}P{0.16\textwidth}P{0.08\textwidth}P{0.10\textwidth}P{0.15\textwidth}P{0.18\textwidth}P{0.25\textwidth}@{}}
+\toprule
+方案 & INT8 & INT6 & INT4/更低 & DSP/PE策略 & 备注 \\
+\midrule
+FINN (FPGA'17) & 支持 & 逐层可配 & \makecell[l]{Binary/\\Ternary} & 逐层定制PE & 低比特高效，但对模型依赖性强 \\
+hls4ml-ENet (2022) & 支持 & 可异构定点 & 可异构低比特 & HLS层定制 & 低延迟依赖强压缩网络 \\
+BiS-KM (FPGA'22) & 支持 & 不支持 & 支持 & 双模DSP & 多精度算术贡献强，对高分辨率分割任务不适配 \\
+DNNBuilder (ICCAD'18) & 支持 & 不支持 & 不支持 & 固定/模板化INT & 通用CNN加速框架 \\
+\textbf{本设计} & \textbf{支持} & \textbf{可扩展} & \textbf{可扩展} & \textbf{统一MAC阵列} & \textbf{当前性能和精度结果仍为INT8格式} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+%=========================================================================
+
+\section{创新点五：全分辨率片上输出}
+
+传统FPGA神经网络加速器通常只输出低分辨率logits，例如图像分类任务典型像素224$\times$224；即使是语义分割任务，也常通过降低输入/输出分辨率或只报告encoder输出降低片上存储压力。本设计在PL侧完成ESPNet完整INT8推理，并输出1024$\times$512全像素分割mask，通过AXI总线直接写出。PS端仅保存输出掩模文件，不参与分割后处理计算。
+\pagebreak
+
+
+\begin{table}[!htbp]
+\centering
+\caption{FPGA语义分割工作与本设计对比}
+\footnotesize
+\setlength{\tabcolsep}{1.5pt}
+\renewcommand{\arraystretch}{1.10}
+\begin{tabular}{@{}P{0.13\textwidth}P{0.13\textwidth}P{0.13\textwidth}P{0.13\textwidth}P{0.10\textwidth}P{0.19\textwidth}P{0.14\textwidth}@{}}
+\toprule
+工作 & 网络 & FPGA型号 & 输入/输出 & 参数量 & 精度 & 延迟/吞吐 \\
+\midrule
+hls4ml-ENet & 轻量化ENet & ZCU102 & 约240$\times$152 & 4.7k--14k & PA 77.6--81.1\%, mIoU 33.9--36.8\% & 4.8--4.9 ms \\
+EDSSA & SegNet & \makecell[l]{Arria10} & 224$\times$224 & 未提及 & PA 82.8\%, mIoU 46.3\% & 141.8 ms \\
+Shimoda et al. & \makecell[l]{MobileNetV1-\\PSPNet} & ZCU102 & 1024$\times$512 & 约0.86 Mb & mIoU 64.2\% & 139 FPS \\
+Li et al. & \makecell[l]{Lightweight\\ENet} & ZCU104 & \makecell[l]{CamVid\\480$\times$360} & 未提及 & mIoU 51.18\% & 130.75 FPS \\
+LMIINet-CGRA4ML & LMIINet & \makecell[l]{ZCU104} & Cityscapes数据集，未提及分辨率 & 未提及 & PA约90\%, mIoU约45.2\% & 50.1 ms \\
+\textbf{本设计} & \textbf{ESPNet} & \textbf{\makecell[l]{ZU15EG}} & \textbf{\makecell[l]{1024$\times$512}} & \textbf{0.34M} & \textbf{PA 0.978, mIoU 0.864} & \textbf{1003 ms} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\textbf{差异点：} 与追求极低延迟的低分辨率/强压缩分割实现不同，本设计更强调高分辨率二分类任务以及较强通用性的PL端NPU实现；当前推理延时仍有较大优化空间。
+
+%=========================================================================
+
+\section{综合对比：本设计与代表性FPGA加速方案}
+
+
+\begin{table}[!htbp]
+\centering
+\caption{综合对比}
+\footnotesize
+\setlength{\tabcolsep}{1.5pt}
+\renewcommand{\arraystretch}{1.10}
+\begin{tabular}{@{}P{0.10\textwidth}P{0.12\textwidth}P{0.12\textwidth}P{0.12\textwidth}P{0.12\textwidth}P{0.14\textwidth}P{0.20\textwidth}@{}}
+\toprule
+ & FINN & DNNBuilder & hls4ml-ENet & EDSSA & LMIINet-CGRA4ML & \textbf{本设计} \\
+\midrule
+实现方式 & Dataflow生成 & HLS/模板 & hls4ml HLS & OpenCL HLS & CGRA框架 & \textbf{HLS硬件NPU} \\
+网络 & 低比特CNN & 通用CNN & 轻量化ENet & SegNet & LMIINet & \textbf{ESPNet（及其他通用CNN）} \\
+任务 & 分类/检测为主 & 分类/检测为主 & \makecell[l]{Cityscapes\\分割} & \makecell[l]{VOC/CamVid} & \makecell[l]{Cityscapes\\分割} & \textbf{Cityscapes二分类分割} \\
+输入/输出 & 逐任务 & 逐任务 & 约240$\times$152 & 224$\times$224 & Cityscapes & \textbf{\makecell[l]{1024$\times$512}} \\
+量化 & \makecell[l]{Binary/\\Ternary} & INT8/16 & 异构低比特 & 8-bit定点 & 8-bit QAT & \textbf{对称INT8} \\
+模型更新 & 重新生成、综合、实现 & 模板重综合 & 重新生成、综合、实现 & kernel重编译 & 框架映射 & \textbf{更换SD卡初始化文件} \\
+片上存储 & BRAM & BRAM+DDR & 全片上 & tiling+DDR & 框架缓存+片外 & \textbf{全片上URAM/BRAM配合} \\
+性能 & 高吞吐 & 通用 & 4.9 ms & 141.8 ms & 50.1 ms & \textbf{1003 ms} \\
+精度 & 任务相关 & 任务相关 & mIoU约36.8\% & mIoU 46.3\% & mIoU 45.2\% & \textbf{mIoU 0.864} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

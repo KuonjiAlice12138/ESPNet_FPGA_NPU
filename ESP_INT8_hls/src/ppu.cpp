@@ -26,8 +26,6 @@ bool on_chip_memory_read_packed_tile(const tensor_desc_t& desc,
 bool on_chip_memory_read_fmbuf_abs_word(u8_t bank_id,
                                         u32_t byte_offset,
                                         axi_vec_t& packed);
-bool on_chip_memory_read_pool2_abs_word(u32_t byte_offset,
-                                        axi_vec_t& packed);
 bool on_chip_memory_write_fmbuf_abs_word(u8_t bank_id,
                                          u32_t byte_offset,
                                          act_vec_t packed);

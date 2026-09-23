@@ -3,13 +3,28 @@
 #include "../include/npu_schedule.hpp"
 #include "../include/npu_types.hpp"
 
-#if !defined(__SYNTHESIS__) && defined(ESP_INT8_CSIM_DUMP_U40_ACT)
-#include <cstdint>
-#include <cstdio>
-#include <fstream>
-#endif
-
 namespace esp_int8 {
+
+#if !defined(__SYNTHESIS__) && \
+    defined(ESP_INT8_CSIM_VALIDATE_INCREMENTAL_TRANSFER)
+static unsigned long long s_csim_narrow_transfer_words = 0;
+
+void csim_reset_narrow_transfer_words() {
+    s_csim_narrow_transfer_words = 0;
+}
+
+unsigned long long csim_get_narrow_transfer_words() {
+    return s_csim_narrow_transfer_words;
+}
+
+static void csim_count_narrow_transfer_word() {
+    ++s_csim_narrow_transfer_words;
+}
+#else
+static void csim_count_narrow_transfer_word() {
+#pragma HLS INLINE
+}
+#endif
 
 bool on_chip_memory_read_packed_tile(const tensor_desc_t& desc,
                                      i32_t h,
@@ -75,7 +90,7 @@ struct narrow_3x3_window_t {
 };
 
 // One physical owner serves two mutually exclusive compiled modes:
-// - legacy narrow schedules use [0, 64) as the horizontal column ring;
+// - fallback narrow schedules use [0, 64) as the horizontal column ring;
 // - row-reuse schedules use [0, 96) as packed physical source-row words.
 // Four 64-bit stripes preserve one 256-bit read/write per cycle while allowing
 // a row-reuse pixel to read up to three adjacent stripes from single-port RAMs.
@@ -128,7 +143,7 @@ struct window_load_word_t {
     u8_t chunk;
 };
 
-struct narrow_paired_issue_meta_t {
+struct narrow_paired_issue_plan_t {
     u8_t slot00;
     u8_t slot01;
     u8_t slot02;
@@ -139,6 +154,38 @@ struct narrow_paired_issue_meta_t {
     u8_t phase0_update_cols;
     u8_t has_second_window;
 };
+
+enum narrow_transfer_protocol_t : unsigned char {
+    NARROW_TRANSFER_FULL_WINDOWS = 0,
+    NARROW_TRANSFER_C12_S1_INCREMENTAL = 1,
+    NARROW_TRANSFER_C3_S2_REUSE_INCREMENTAL = 2,
+};
+
+static u32_t win_build_lane_mask(u8_t byte_count) {
+#pragma HLS INLINE
+    u32_t lane_mask = 0;
+    for (int lane = 0; lane < AXI_WORD_BYTES; ++lane) {
+#pragma HLS UNROLL
+        lane_mask[lane] =
+            lane < static_cast<int>(byte_count.to_uint()) ? 1 : 0;
+    }
+    return lane_mask;
+}
+
+static act_vec_t win_apply_lane_mask(const act_vec_t& word,
+                                     const u32_t& lane_mask) {
+#pragma HLS INLINE
+    act_vec_t masked;
+    for (int lane = 0; lane < AXI_WORD_BYTES; ++lane) {
+#pragma HLS UNROLL
+        for (int bit = 0; bit < 8; ++bit) {
+#pragma HLS UNROLL
+            const int bit_index = lane * 8 + bit;
+            masked[bit_index] = word[bit_index] & lane_mask[lane];
+        }
+    }
+    return masked;
+}
 
 struct window_row_cfg_t {
     tensor_desc_t src_desc;
@@ -173,10 +220,48 @@ struct window_row_cfg_t {
     u16_t loader_steady_run2;
     u8_t row_reuse_mode;
     u8_t packed_words_per_source_row;
+    u8_t narrow_transfer_protocol;
     u16_t out_row;
-    u16_t in_c;
+    u8_t narrow_valid_c;
+    u8_t last_chunk_valid_c;
+    u32_t narrow_lane_mask;
+    u32_t last_chunk_lane_mask;
     u16_t out_w;
-    u16_t k_tiles;
+};
+
+struct narrow_fallback_read_cfg_t {
+    tensor_desc_t src_desc;
+    u32_t row_base0;
+    u32_t row_base1;
+    u32_t row_base2;
+    u8_t row_valid_mask;
+    u8_t valid_c;
+    u32_t lane_mask;
+};
+
+struct narrow_fallback_cfg_t {
+    narrow_fallback_read_cfg_t read;
+    u8_t stride;
+    u8_t dilation;
+    u8_t padding;
+    u8_t slot_mask;
+    u16_t issue_count;
+    u8_t odd_tail;
+    u8_t warmup_issues;
+    u8_t warmup_new_cols;
+    u8_t steady_new_cols;
+    u8_t warmup_phase0_cols;
+    u8_t steady_phase0_cols;
+    u8_t warmup_mask;
+    u8_t steady_mask;
+    u8_t warmup_run_count;
+    u8_t steady_run_count;
+    u16_t warmup_run0;
+    u16_t warmup_run1;
+    u16_t warmup_run2;
+    u16_t steady_run0;
+    u16_t steady_run1;
+    u16_t steady_run2;
 };
 
 struct window_assembler_cfg_t {
@@ -186,7 +271,59 @@ struct window_assembler_cfg_t {
     u16_t out_w;
     u8_t loader_request_cols;
     u8_t loader_words_per_col;
+    u8_t narrow_transfer_protocol;
 };
+
+static u8_t select_narrow_transfer_protocol(const window_row_cfg_t& cfg) {
+#pragma HLS INLINE
+    const bool paired =
+        (cfg.flags.to_uint() &
+         static_cast<unsigned>(WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)) != 0U;
+    if (cfg.loader_class.to_uint() !=
+            static_cast<unsigned>(WIN_LOADER_3X3_NARROW) ||
+        !paired ||
+        cfg.loader_warmup_issues.to_uint() != 1U ||
+        cfg.loader_warmup_run_count.to_uint() != 1U ||
+        cfg.loader_steady_run_count.to_uint() != 1U ||
+        cfg.loader_words_per_col.to_uint() != 3U) {
+        return static_cast<u8_t>(
+            static_cast<unsigned>(NARROW_TRANSFER_FULL_WINDOWS));
+    }
+
+    const unsigned warmup_run_count =
+        (cfg.loader_warmup_run0.to_uint() >> 8) & 0xFFU;
+    const unsigned steady_run_count =
+        (cfg.loader_steady_run0.to_uint() >> 8) & 0xFFU;
+    if (cfg.mode.to_uint() ==
+            static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12) &&
+        cfg.row_reuse_mode.to_uint() ==
+            static_cast<unsigned>(WINDOW_ROW_REUSE_NONE) &&
+        cfg.cache_col_slots.to_uint() == 4U &&
+        cfg.loader_warmup_new_cols.to_uint() == 4U &&
+        cfg.loader_steady_new_cols.to_uint() == 2U &&
+        warmup_run_count == 4U &&
+        steady_run_count == 2U &&
+        cfg.loader_warmup_phase0_cols.to_uint() == 0U &&
+        cfg.loader_steady_phase0_cols.to_uint() == 0U) {
+        return static_cast<u8_t>(
+            static_cast<unsigned>(NARROW_TRANSFER_C12_S1_INCREMENTAL));
+    }
+    if (cfg.mode.to_uint() ==
+            static_cast<unsigned>(WIN_MODE_3X3_STAGED_C3) &&
+        cfg.row_reuse_mode.to_uint() ==
+            static_cast<unsigned>(WINDOW_ROW_REUSE_STRIDE2_KEEP1) &&
+        cfg.loader_warmup_new_cols.to_uint() == 5U &&
+        cfg.loader_steady_new_cols.to_uint() == 4U &&
+        warmup_run_count == 5U &&
+        steady_run_count == 4U &&
+        cfg.loader_warmup_phase0_cols.to_uint() == 3U &&
+        cfg.loader_steady_phase0_cols.to_uint() == 2U) {
+        return static_cast<u8_t>(
+            static_cast<unsigned>(NARROW_TRANSFER_C3_S2_REUSE_INCREMENTAL));
+    }
+    return static_cast<u8_t>(
+        static_cast<unsigned>(NARROW_TRANSFER_FULL_WINDOWS));
+}
 
 static u32_t window_cfg_row_base(const window_row_cfg_t& cfg, int row) {
 #pragma HLS INLINE
@@ -211,6 +348,62 @@ static int window_issue_count(const window_row_cfg_t& cfg) {
         (cfg.flags.to_uint() &
          static_cast<unsigned>(WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)) != 0U;
     return paired ? ((out_w + 1) / 2) : out_w;
+}
+
+static narrow_fallback_cfg_t make_narrow_fallback_cfg(
+    const window_row_cfg_t& cfg) {
+#pragma HLS INLINE
+    narrow_fallback_cfg_t fallback;
+    fallback.read.src_desc = cfg.src_desc;
+    fallback.read.row_base0 = cfg.row_base0;
+    fallback.read.row_base1 = cfg.row_base1;
+    fallback.read.row_base2 = cfg.row_base2;
+    fallback.read.row_valid_mask = cfg.row_valid_mask;
+    fallback.read.valid_c = cfg.narrow_valid_c;
+    fallback.read.lane_mask = cfg.narrow_lane_mask;
+    fallback.stride = cfg.stride;
+    fallback.dilation = cfg.dilation;
+    fallback.padding = cfg.padding;
+    fallback.slot_mask = static_cast<u8_t>(
+        static_cast<unsigned>(cfg.cache_col_slots.to_uint()) - 1U);
+    fallback.issue_count = static_cast<u16_t>(window_issue_count(cfg));
+    fallback.odd_tail = static_cast<u8_t>(
+        (cfg.flags.to_uint() &
+         static_cast<unsigned>(WINDOW_SCHED_FLAG_ODD_TAIL)) != 0U);
+    fallback.warmup_issues = cfg.loader_warmup_issues;
+    fallback.warmup_new_cols = cfg.loader_warmup_new_cols;
+    fallback.steady_new_cols = cfg.loader_steady_new_cols;
+    fallback.warmup_phase0_cols = cfg.loader_warmup_phase0_cols;
+    fallback.steady_phase0_cols = cfg.loader_steady_phase0_cols;
+    fallback.warmup_mask = cfg.loader_warmup_mask;
+    fallback.steady_mask = cfg.loader_steady_mask;
+    fallback.warmup_run_count = cfg.loader_warmup_run_count;
+    fallback.steady_run_count = cfg.loader_steady_run_count;
+    fallback.warmup_run0 = cfg.loader_warmup_run0;
+    fallback.warmup_run1 = cfg.loader_warmup_run1;
+    fallback.warmup_run2 = cfg.loader_warmup_run2;
+    fallback.steady_run0 = cfg.loader_steady_run0;
+    fallback.steady_run1 = cfg.loader_steady_run1;
+    fallback.steady_run2 = cfg.loader_steady_run2;
+    return fallback;
+}
+
+static u32_t narrow_fallback_row_base(
+    const narrow_fallback_read_cfg_t& cfg, int row) {
+#pragma HLS INLINE
+    if (row == 0) {
+        return cfg.row_base0;
+    }
+    if (row == 1) {
+        return cfg.row_base1;
+    }
+    return cfg.row_base2;
+}
+
+static bool narrow_fallback_row_valid(
+    const narrow_fallback_read_cfg_t& cfg, int row) {
+#pragma HLS INLINE
+    return ((cfg.row_valid_mask.to_uint() >> row) & 1U) != 0U;
 }
 
 static i32_t window_request_column(const window_row_cfg_t& cfg,
@@ -280,10 +473,32 @@ static void configure_window_row(const tensor_desc_t& src_desc,
     cfg.packed_words_per_source_row = static_cast<u8_t>(
         (row_reuse_word >> WINDOW_ROW_REUSE_WORDS_SHIFT) &
         WINDOW_ROW_REUSE_WORDS_MASK);
+    cfg.narrow_transfer_protocol = select_narrow_transfer_protocol(cfg);
     cfg.out_row = out_row;
-    cfg.in_c = sched.in_c;
+    const unsigned input_channels = sched.in_c.to_uint();
+    unsigned narrow_valid_c = input_channels;
+    if (narrow_valid_c == 0U ||
+        narrow_valid_c > static_cast<unsigned>(AXI_WORD_BYTES)) {
+        narrow_valid_c = static_cast<unsigned>(AXI_WORD_BYTES);
+    }
+    const unsigned cache_chunks = sched.cache_chunks.to_uint();
+    const unsigned last_chunk_begin =
+        cache_chunks == 0U
+            ? 0U
+            : (cache_chunks - 1U) * static_cast<unsigned>(AXI_WORD_BYTES);
+    unsigned last_chunk_valid_c =
+        input_channels > last_chunk_begin
+            ? input_channels - last_chunk_begin
+            : static_cast<unsigned>(AXI_WORD_BYTES);
+    if (last_chunk_valid_c == 0U ||
+        last_chunk_valid_c > static_cast<unsigned>(AXI_WORD_BYTES)) {
+        last_chunk_valid_c = static_cast<unsigned>(AXI_WORD_BYTES);
+    }
+    cfg.narrow_valid_c = static_cast<u8_t>(narrow_valid_c);
+    cfg.last_chunk_valid_c = static_cast<u8_t>(last_chunk_valid_c);
+    cfg.narrow_lane_mask = win_build_lane_mask(cfg.narrow_valid_c);
+    cfg.last_chunk_lane_mask = win_build_lane_mask(cfg.last_chunk_valid_c);
     cfg.out_w = sched.out_w;
-    cfg.k_tiles = sched.k_tiles;
 
     const i32_t base_h =
         static_cast<i32_t>(
@@ -319,19 +534,8 @@ static void configure_window_row(const tensor_desc_t& src_desc,
     assembler_cfg.out_w = cfg.out_w;
     assembler_cfg.loader_request_cols = cfg.loader_request_cols;
     assembler_cfg.loader_words_per_col = cfg.loader_words_per_col;
+    assembler_cfg.narrow_transfer_protocol = cfg.narrow_transfer_protocol;
     assembler_cfg_stream.write(assembler_cfg);
-}
-
-static act_vec_t win_low_byte_mask(unsigned byte_count) {
-#pragma HLS INLINE
-    if (byte_count == 0U) {
-        return 0;
-    }
-    if (byte_count >= static_cast<unsigned>(AXI_WORD_BYTES)) {
-        return ~act_vec_t(0);
-    }
-    return static_cast<act_vec_t>(
-        (static_cast<act_vec_t>(1) << (byte_count * 8U)) - 1);
 }
 
 static void reset_packed_word_cursors() {
@@ -525,7 +729,7 @@ static bool read_packed_tile_from_reuse_row(
         input_col >= static_cast<i32_t>(cfg.src_desc.w)) {
         return true;
     }
-    const unsigned lane_count = cfg.in_c.to_uint();
+    const unsigned lane_count = cfg.narrow_valid_c.to_uint();
     const unsigned byte_offset =
         static_cast<unsigned>(input_col.to_int()) *
         win_desc_phys_c(cfg.src_desc).to_uint();
@@ -586,7 +790,7 @@ static bool read_packed_tile_from_reuse_row(
             break;
     }
     packed = static_cast<act_vec_t>(rotated >> (byte_in_stripe * 8U));
-    packed &= win_low_byte_mask(lane_count);
+    packed = win_apply_lane_mask(packed, cfg.narrow_lane_mask);
     return true;
 }
 
@@ -626,6 +830,7 @@ static bool read_packed_tile_from_row_cached(const tensor_desc_t& src_desc,
                                              i32_t input_col,
                                              u16_t c_begin,
                                              u8_t valid_c,
+                                             u32_t lane_mask,
                                              act_vec_t& packed) {
 #pragma HLS INLINE
     packed = 0;
@@ -673,7 +878,7 @@ static bool read_packed_tile_from_row_cached(const tensor_desc_t& src_desc,
         packed |= static_cast<act_vec_t>(word1 << carry_bits);
     }
     if (read_count < static_cast<unsigned>(AXI_WORD_BYTES)) {
-        packed &= win_low_byte_mask(read_count);
+        packed = win_apply_lane_mask(packed, lane_mask);
     }
     return true;
 }
@@ -712,17 +917,22 @@ static void window_loader_emit_column(
             }
             act_vec_t word = 0;
             const unsigned c_begin_u = static_cast<unsigned>(chunk * TK);
-            unsigned valid = cfg.in_c.to_uint() - c_begin_u;
-            if (valid > static_cast<unsigned>(TK)) {
-                valid = static_cast<unsigned>(TK);
-            }
+            const bool last_chunk =
+                chunk + 1 == static_cast<int>(cfg.cache_chunks.to_uint());
+            const u8_t valid =
+                last_chunk ? cfg.last_chunk_valid_c
+                           : static_cast<u8_t>(AXI_WORD_BYTES);
+            const u32_t lane_mask =
+                last_chunk ? cfg.last_chunk_lane_mask
+                           : static_cast<u32_t>(~u32_t(0));
             read_packed_tile_from_row_cached(cfg.src_desc,
                                              cursor,
                                              window_cfg_row_base(cfg, kh),
                                              window_cfg_row_valid(cfg, kh),
                                              input_col,
                                              static_cast<u16_t>(c_begin_u),
-                                             static_cast<u8_t>(valid),
+                                             valid,
+                                             lane_mask,
                                              word);
             window_load_word_t token;
             token.word = word;
@@ -748,26 +958,35 @@ static bool window_cfg_uses_row_reuse(const window_row_cfg_t& cfg) {
            static_cast<unsigned>(WINDOW_ROW_REUSE_NONE);
 }
 
-static u16_t window_cfg_loader_run_word(const window_row_cfg_t& cfg,
-                                        bool warmup,
-                                        int run_index) {
+static u16_t narrow_fallback_run_word(const narrow_fallback_cfg_t& cfg,
+                                      bool warmup,
+                                      int run_index) {
 #pragma HLS INLINE
     if (warmup) {
         if (run_index == 0) {
-            return cfg.loader_warmup_run0;
+            return cfg.warmup_run0;
         }
         if (run_index == 1) {
-            return cfg.loader_warmup_run1;
+            return cfg.warmup_run1;
         }
-        return cfg.loader_warmup_run2;
+        return cfg.warmup_run2;
     }
     if (run_index == 0) {
-        return cfg.loader_steady_run0;
+        return cfg.steady_run0;
     }
     if (run_index == 1) {
-        return cfg.loader_steady_run1;
+        return cfg.steady_run1;
     }
-    return cfg.loader_steady_run2;
+    return cfg.steady_run2;
+}
+
+static int window_loader_run_start_delta(u16_t run_word) {
+#pragma HLS INLINE
+    int delta = static_cast<int>(run_word.to_uint() & 0xFFU);
+    if ((delta & 0x80) != 0) {
+        delta -= 0x100;
+    }
+    return delta;
 }
 
 static u8_t window_cache_slot(i32_t input_col, unsigned slot_mask) {
@@ -776,8 +995,8 @@ static u8_t window_cache_slot(i32_t input_col, unsigned slot_mask) {
         static_cast<unsigned>(input_col.to_int()) & slot_mask);
 }
 
-static narrow_paired_issue_meta_t make_narrow_paired_issue_meta(
-    const window_row_cfg_t& cfg,
+static narrow_paired_issue_plan_t make_narrow_paired_issue_plan(
+    const narrow_fallback_cfg_t& cfg,
     int issue,
     bool warmup,
     unsigned slot_mask) {
@@ -791,7 +1010,7 @@ static narrow_paired_issue_meta_t make_narrow_paired_issue_meta(
     const i32_t base1 =
         static_cast<i32_t>((pixel0 + 1) * stride - padding);
 
-    narrow_paired_issue_meta_t meta;
+    narrow_paired_issue_plan_t meta;
     meta.slot00 = window_cache_slot(base0, slot_mask);
     meta.slot01 =
         window_cache_slot(base0 + static_cast<i32_t>(dilation), slot_mask);
@@ -803,16 +1022,14 @@ static narrow_paired_issue_meta_t make_narrow_paired_issue_meta(
     meta.slot12 =
         window_cache_slot(base1 + static_cast<i32_t>(2 * dilation), slot_mask);
     meta.update_cols =
-        warmup ? cfg.loader_warmup_new_cols
-               : cfg.loader_steady_new_cols;
+        warmup ? cfg.warmup_new_cols
+               : cfg.steady_new_cols;
     meta.phase0_update_cols =
-        warmup ? cfg.loader_warmup_phase0_cols
-               : cfg.loader_steady_phase0_cols;
-    const bool odd_tail =
-        (cfg.flags.to_uint() &
-         static_cast<unsigned>(WINDOW_SCHED_FLAG_ODD_TAIL)) != 0U;
+        warmup ? cfg.warmup_phase0_cols
+               : cfg.steady_phase0_cols;
     const bool tail_issue =
-        odd_tail && issue == window_issue_count(cfg) - 1;
+        cfg.odd_tail.to_uint() != 0U &&
+        issue == static_cast<int>(cfg.issue_count.to_uint()) - 1;
     meta.has_second_window =
         tail_issue ? static_cast<u8_t>(0)
                    : static_cast<u8_t>(1);
@@ -820,20 +1037,16 @@ static narrow_paired_issue_meta_t make_narrow_paired_issue_meta(
 }
 
 static void window_loader_update_narrow_run(
-    const window_row_cfg_t& cfg,
+    const narrow_fallback_read_cfg_t& cfg,
     i32_t start_col,
     int column_count,
     unsigned slot_mask) {
 #pragma HLS INLINE
-    unsigned valid = cfg.in_c.to_uint();
-    if (valid > static_cast<unsigned>(TK)) {
-        valid = static_cast<unsigned>(TK);
-    }
     for (int kh = 0; kh < 3; ++kh) {
 #pragma HLS PIPELINE off
         packed_word_cursor_t& cursor = s_packed_word_cursor[kh];
-        const u32_t row_base = window_cfg_row_base(cfg, kh);
-        const bool row_valid = window_cfg_row_valid(cfg, kh);
+        const u32_t row_base = narrow_fallback_row_base(cfg, kh);
+        const bool row_valid = narrow_fallback_row_valid(cfg, kh);
         for (int offset = 0; offset < 6; ++offset) {
 #pragma HLS PIPELINE off
             if (offset >= column_count) {
@@ -849,7 +1062,8 @@ static void window_loader_update_narrow_run(
                 row_valid,
                 input_col,
                 static_cast<u16_t>(0),
-                static_cast<u8_t>(valid),
+                cfg.valid_c,
+                cfg.lane_mask,
                 word);
             narrow_row_bank_write(
                 static_cast<unsigned>(kh),
@@ -874,6 +1088,7 @@ static void window_loader_emit_narrow_cached_window(
             token.slot = 0;
             token.row = static_cast<u8_t>(kh);
             token.chunk = static_cast<u8_t>(kw);
+            csim_count_narrow_transfer_word();
             load_word_stream.write(token);
         }
     }
@@ -907,19 +1122,141 @@ static void window_loader_emit_narrow_reuse_window(
             token.slot = 0;
             token.row = static_cast<u8_t>(kh);
             token.chunk = static_cast<u8_t>(kw);
+            csim_count_narrow_transfer_word();
             load_word_stream.write(token);
         }
     }
 }
 
-static void window_row_loader_narrow_paired(
+template <int COLUMN_COUNT>
+static void window_loader_emit_narrow_direct_run(
     const window_row_cfg_t& cfg,
-    hls::stream<narrow_paired_issue_meta_t>& narrow_issue_stream,
+    i32_t start_col,
+    hls::stream<window_load_word_t>& load_word_stream) {
+#pragma HLS INLINE
+    for (int offset = 0; offset < COLUMN_COUNT; ++offset) {
+#pragma HLS PIPELINE off
+        const i32_t input_col = start_col + static_cast<i32_t>(offset);
+        for (int kh = 0; kh < 3; ++kh) {
+#pragma HLS PIPELINE off
+            act_vec_t word = 0;
+            read_packed_tile_from_row_cached(
+                cfg.src_desc,
+                s_packed_word_cursor[kh],
+                window_cfg_row_base(cfg, kh),
+                window_cfg_row_valid(cfg, kh),
+                input_col,
+                static_cast<u16_t>(0),
+                cfg.narrow_valid_c,
+                cfg.narrow_lane_mask,
+                word);
+            window_load_word_t token;
+            token.word = word;
+            token.slot = static_cast<u8_t>(offset);
+            token.row = static_cast<u8_t>(kh);
+            token.chunk = 0;
+            csim_count_narrow_transfer_word();
+            load_word_stream.write(token);
+        }
+    }
+}
+
+template <int COLUMN_COUNT>
+static void window_loader_emit_narrow_reuse_run(
+    const window_row_cfg_t& cfg,
+    const u8_t logical_bank[3],
+    i32_t start_col,
+    hls::stream<window_load_word_t>& load_word_stream) {
+#pragma HLS INLINE
+#pragma HLS ARRAY_PARTITION variable=logical_bank complete dim=1
+    for (int offset = 0; offset < COLUMN_COUNT; ++offset) {
+#pragma HLS PIPELINE off
+        const i32_t input_col = start_col + static_cast<i32_t>(offset);
+        for (int kh = 0; kh < 3; ++kh) {
+#pragma HLS PIPELINE II=1
+            act_vec_t word = 0;
+            read_packed_tile_from_reuse_row(
+                cfg,
+                logical_bank[kh].to_uint(),
+                window_cfg_row_valid(cfg, kh),
+                input_col,
+                word);
+            window_load_word_t token;
+            token.word = word;
+            token.slot = static_cast<u8_t>(offset);
+            token.row = static_cast<u8_t>(kh);
+            token.chunk = 0;
+            csim_count_narrow_transfer_word();
+            load_word_stream.write(token);
+        }
+    }
+}
+
+static void window_row_loader_narrow_incremental_c12(
+    const window_row_cfg_t& cfg,
     hls::stream<window_load_word_t>& load_word_stream) {
 #pragma HLS INLINE off
     const int issue_count = window_issue_count(cfg);
-    const unsigned slot_mask =
-        static_cast<unsigned>(cfg.cache_col_slots.to_uint()) - 1U;
+    const int stride = static_cast<int>(cfg.stride.to_uint());
+    const int padding = static_cast<int>(cfg.padding.to_uint());
+    for (int issue = 0; issue < MAX_FM_W; ++issue) {
+#pragma HLS PIPELINE off
+        if (issue >= issue_count) {
+            break;
+        }
+        const bool warmup = issue == 0;
+        const u16_t run_word =
+            warmup ? cfg.loader_warmup_run0 : cfg.loader_steady_run0;
+        const i32_t start_col = static_cast<i32_t>(
+            issue * 2 * stride - padding +
+            window_loader_run_start_delta(run_word));
+        if (warmup) {
+            window_loader_emit_narrow_direct_run<4>(
+                cfg, start_col, load_word_stream);
+        } else {
+            window_loader_emit_narrow_direct_run<2>(
+                cfg, start_col, load_word_stream);
+        }
+    }
+}
+
+static void window_row_loader_narrow_incremental_c3_reuse(
+    const window_row_cfg_t& cfg,
+    hls::stream<window_load_word_t>& load_word_stream) {
+#pragma HLS INLINE off
+    u8_t logical_bank[3];
+#pragma HLS ARRAY_PARTITION variable=logical_bank complete dim=1
+    narrow_reuse_prepare_rows(cfg, logical_bank);
+    const int issue_count = window_issue_count(cfg);
+    const int stride = static_cast<int>(cfg.stride.to_uint());
+    const int padding = static_cast<int>(cfg.padding.to_uint());
+    for (int issue = 0; issue < MAX_FM_W; ++issue) {
+#pragma HLS PIPELINE off
+        if (issue >= issue_count) {
+            break;
+        }
+        const bool warmup = issue == 0;
+        const u16_t run_word =
+            warmup ? cfg.loader_warmup_run0 : cfg.loader_steady_run0;
+        const i32_t start_col = static_cast<i32_t>(
+            issue * 2 * stride - padding +
+            window_loader_run_start_delta(run_word));
+        if (warmup) {
+            window_loader_emit_narrow_reuse_run<5>(
+                cfg, logical_bank, start_col, load_word_stream);
+        } else {
+            window_loader_emit_narrow_reuse_run<4>(
+                cfg, logical_bank, start_col, load_word_stream);
+        }
+    }
+}
+
+static void window_row_loader_narrow_paired(
+    const narrow_fallback_cfg_t& cfg,
+    hls::stream<window_load_word_t>& load_word_stream) {
+#pragma HLS INLINE off
+    const int issue_count = static_cast<int>(cfg.issue_count.to_uint());
+    const unsigned slot_mask = cfg.slot_mask.to_uint();
     const int stride = static_cast<int>(cfg.stride.to_uint());
     const int padding = static_cast<int>(cfg.padding.to_uint());
     for (int issue = 0; issue < MAX_FM_W; ++issue) {
@@ -927,14 +1264,13 @@ static void window_row_loader_narrow_paired(
             break;
         }
         const bool warmup =
-            issue < static_cast<int>(cfg.loader_warmup_issues.to_uint());
+            issue < static_cast<int>(cfg.warmup_issues.to_uint());
         const int run_count = static_cast<int>(
-            warmup ? cfg.loader_warmup_run_count.to_uint()
-                   : cfg.loader_steady_run_count.to_uint());
-        const narrow_paired_issue_meta_t meta =
-            make_narrow_paired_issue_meta(
+            warmup ? cfg.warmup_run_count.to_uint()
+                   : cfg.steady_run_count.to_uint());
+        const narrow_paired_issue_plan_t meta =
+            make_narrow_paired_issue_plan(
                 cfg, issue, warmup, slot_mask);
-        narrow_issue_stream.write(meta);
         u8_t slot_for_kw0[3] = {
             meta.slot00, meta.slot01, meta.slot02};
         u8_t slot_for_kw1[3] = {
@@ -965,13 +1301,9 @@ static void window_row_loader_narrow_paired(
                     break;
                 }
                 const u16_t run_word =
-                    window_cfg_loader_run_word(
+                    narrow_fallback_run_word(
                         cfg, warmup, run_index);
-                int start_delta =
-                    static_cast<int>(run_word.to_uint() & 0xFFU);
-                if ((start_delta & 0x80) != 0) {
-                    start_delta -= 0x100;
-                }
+                const int start_delta = window_loader_run_start_delta(run_word);
                 const int run_columns = static_cast<int>(
                     (run_word.to_uint() >> 8) & 0xFFU);
                 int local_begin = phase_begin - run_column_base;
@@ -988,7 +1320,7 @@ static void window_row_loader_narrow_paired(
                         static_cast<i32_t>(
                             base_column + start_delta + local_begin);
                     window_loader_update_narrow_run(
-                        cfg,
+                        cfg.read,
                         start_col,
                         emit_columns,
                         slot_mask);
@@ -1008,38 +1340,37 @@ static void window_row_loader_narrow_paired(
 }
 
 static void window_row_loader_narrow_unpaired(
-    const window_row_cfg_t& cfg,
-    hls::stream<narrow_paired_issue_meta_t>& narrow_issue_stream,
+    const narrow_fallback_cfg_t& cfg,
     hls::stream<window_load_word_t>& load_word_stream) {
 #pragma HLS INLINE off
-    const int issue_count = window_issue_count(cfg);
-    const unsigned slot_mask =
-        static_cast<unsigned>(cfg.cache_col_slots.to_uint()) - 1U;
+    const int issue_count = static_cast<int>(cfg.issue_count.to_uint());
+    const unsigned slot_mask = cfg.slot_mask.to_uint();
+    const int stride = static_cast<int>(cfg.stride.to_uint());
+    const int dilation = static_cast<int>(cfg.dilation.to_uint());
+    const int padding = static_cast<int>(cfg.padding.to_uint());
     for (int issue = 0; issue < MAX_FM_W; ++issue) {
         if (issue >= issue_count) {
             break;
         }
         const bool warmup =
-            issue < static_cast<int>(cfg.loader_warmup_issues.to_uint());
+            issue < static_cast<int>(cfg.warmup_issues.to_uint());
         const unsigned update_mask =
-            warmup ? cfg.loader_warmup_mask.to_uint()
-                   : cfg.loader_steady_mask.to_uint();
+            warmup ? cfg.warmup_mask.to_uint()
+                   : cfg.steady_mask.to_uint();
+        const int base_column = issue * stride - padding;
         u8_t slot_for_kw[3];
 #pragma HLS ARRAY_PARTITION variable=slot_for_kw complete dim=1
         for (int request = 0; request < 3; ++request) {
 #pragma HLS PIPELINE off
-            const i32_t input_col =
-                window_request_column(cfg, issue, request);
+            const i32_t input_col = static_cast<i32_t>(
+                base_column + request * dilation);
             slot_for_kw[request] =
                 window_cache_slot(input_col, slot_mask);
             if (((update_mask >> request) & 1U) != 0U) {
                 window_loader_update_narrow_run(
-                    cfg, input_col, 1, slot_mask);
+                    cfg.read, input_col, 1, slot_mask);
             }
         }
-        narrow_paired_issue_meta_t meta = narrow_paired_issue_meta_t();
-        meta.has_second_window = 0;
-        narrow_issue_stream.write(meta);
         window_loader_emit_narrow_cached_window(
             slot_for_kw, load_word_stream);
     }
@@ -1047,7 +1378,6 @@ static void window_row_loader_narrow_unpaired(
 
 static void window_row_loader_narrow_reuse(
     const window_row_cfg_t& cfg,
-    hls::stream<narrow_paired_issue_meta_t>& narrow_issue_stream,
     hls::stream<window_load_word_t>& load_word_stream) {
 #pragma HLS INLINE off
     u8_t logical_bank[3];
@@ -1063,11 +1393,6 @@ static void window_row_loader_narrow_reuse(
         }
         const bool tail_issue =
             odd_tail && issue == issue_count - 1;
-        narrow_paired_issue_meta_t meta = narrow_paired_issue_meta_t();
-        meta.has_second_window =
-            tail_issue ? static_cast<u8_t>(0)
-                       : static_cast<u8_t>(1);
-        narrow_issue_stream.write(meta);
         window_loader_emit_narrow_reuse_window(
             cfg, logical_bank, issue * 2, load_word_stream);
         if (!tail_issue) {
@@ -1080,7 +1405,6 @@ static void window_row_loader_narrow_reuse(
 static void window_row_loader(
     hls::stream<window_row_cfg_t>& loader_cfg_stream,
     hls::stream<window_column_meta_t>& column_meta_stream,
-    hls::stream<narrow_paired_issue_meta_t>& narrow_issue_stream,
     hls::stream<window_load_word_t>& load_word_stream) {
 #pragma HLS INLINE off
 #pragma HLS ARRAY_PARTITION variable=s_narrow_row_bank0 complete dim=1
@@ -1096,17 +1420,29 @@ static void window_row_loader(
     reset_packed_word_cursors();
     if (cfg.loader_class.to_uint() ==
         static_cast<unsigned>(WIN_LOADER_3X3_NARROW)) {
-        if (window_cfg_uses_row_reuse(cfg)) {
+        if (cfg.narrow_transfer_protocol.to_uint() ==
+            static_cast<unsigned>(NARROW_TRANSFER_C12_S1_INCREMENTAL)) {
+            s_narrow_reuse_identity_valid = false;
+            window_row_loader_narrow_incremental_c12(
+                cfg, load_word_stream);
+        } else if (cfg.narrow_transfer_protocol.to_uint() ==
+                   static_cast<unsigned>(
+                       NARROW_TRANSFER_C3_S2_REUSE_INCREMENTAL)) {
+            window_row_loader_narrow_incremental_c3_reuse(
+                cfg, load_word_stream);
+        } else if (window_cfg_uses_row_reuse(cfg)) {
             window_row_loader_narrow_reuse(
-                cfg, narrow_issue_stream, load_word_stream);
+                cfg, load_word_stream);
         } else {
             s_narrow_reuse_identity_valid = false;
+            const narrow_fallback_cfg_t fallback_cfg =
+                make_narrow_fallback_cfg(cfg);
             if (window_cfg_is_narrow_paired(cfg)) {
                 window_row_loader_narrow_paired(
-                    cfg, narrow_issue_stream, load_word_stream);
+                    fallback_cfg, load_word_stream);
             } else {
                 window_row_loader_narrow_unpaired(
-                    cfg, narrow_issue_stream, load_word_stream);
+                    fallback_cfg, load_word_stream);
             }
         }
         return;
@@ -1849,6 +2185,112 @@ static void window_assembler_store_wide_word(
     }
 }
 
+struct narrow_incremental_column_t {
+    act_vec_t row0;
+    act_vec_t row1;
+    act_vec_t row2;
+};
+
+struct narrow_incremental_cache_t {
+    narrow_incremental_column_t col0;
+    narrow_incremental_column_t col1;
+    narrow_incremental_column_t col2;
+    narrow_incremental_column_t col3;
+    narrow_incremental_column_t col4;
+};
+
+static void window_assembler_read_incremental_column(
+    hls::stream<window_load_word_t>& load_word_stream,
+    narrow_incremental_column_t& column) {
+#pragma HLS INLINE
+    const window_load_word_t row0 = load_word_stream.read();
+    const window_load_word_t row1 = load_word_stream.read();
+    const window_load_word_t row2 = load_word_stream.read();
+    column.row0 = row0.word;
+    column.row1 = row1.word;
+    column.row2 = row2.word;
+}
+
+static void window_assembler_clear_narrow_window(
+    narrow_3x3_window_t& window) {
+#pragma HLS INLINE
+#pragma HLS ARRAY_PARTITION variable=window.spatial complete dim=1
+    for (int spatial = 0; spatial < 9; ++spatial) {
+#pragma HLS UNROLL
+        window.spatial[spatial] = 0;
+    }
+}
+
+template <int KW>
+static void window_assembler_set_narrow_column(
+    narrow_3x3_window_t& window,
+    const narrow_incremental_column_t& column) {
+#pragma HLS INLINE
+    window.spatial[KW] = column.row0;
+    window.spatial[3 + KW] = column.row1;
+    window.spatial[6 + KW] = column.row2;
+}
+
+static void window_assembler_consume_c12_incremental(
+    int issue,
+    bool has_second_window,
+    hls::stream<window_load_word_t>& load_word_stream,
+    narrow_incremental_cache_t& cache,
+    narrow_3x3_window_t& window0,
+    narrow_3x3_window_t& window1) {
+#pragma HLS INLINE
+    if (issue == 0) {
+        window_assembler_read_incremental_column(load_word_stream, cache.col0);
+        window_assembler_read_incremental_column(load_word_stream, cache.col1);
+        window_assembler_read_incremental_column(load_word_stream, cache.col2);
+        window_assembler_read_incremental_column(load_word_stream, cache.col3);
+    } else {
+        cache.col0 = cache.col2;
+        cache.col1 = cache.col3;
+        window_assembler_read_incremental_column(load_word_stream, cache.col2);
+        window_assembler_read_incremental_column(load_word_stream, cache.col3);
+    }
+    window_assembler_set_narrow_column<0>(window0, cache.col0);
+    window_assembler_set_narrow_column<1>(window0, cache.col1);
+    window_assembler_set_narrow_column<2>(window0, cache.col2);
+    if (has_second_window) {
+        window_assembler_set_narrow_column<0>(window1, cache.col1);
+        window_assembler_set_narrow_column<1>(window1, cache.col2);
+        window_assembler_set_narrow_column<2>(window1, cache.col3);
+    }
+}
+
+static void window_assembler_consume_c3_reuse_incremental(
+    int issue,
+    bool has_second_window,
+    hls::stream<window_load_word_t>& load_word_stream,
+    narrow_incremental_cache_t& cache,
+    narrow_3x3_window_t& window0,
+    narrow_3x3_window_t& window1) {
+#pragma HLS INLINE
+    if (issue == 0) {
+        window_assembler_read_incremental_column(load_word_stream, cache.col0);
+        window_assembler_read_incremental_column(load_word_stream, cache.col1);
+        window_assembler_read_incremental_column(load_word_stream, cache.col2);
+        window_assembler_read_incremental_column(load_word_stream, cache.col3);
+        window_assembler_read_incremental_column(load_word_stream, cache.col4);
+    } else {
+        cache.col0 = cache.col4;
+        window_assembler_read_incremental_column(load_word_stream, cache.col1);
+        window_assembler_read_incremental_column(load_word_stream, cache.col2);
+        window_assembler_read_incremental_column(load_word_stream, cache.col3);
+        window_assembler_read_incremental_column(load_word_stream, cache.col4);
+    }
+    window_assembler_set_narrow_column<0>(window0, cache.col0);
+    window_assembler_set_narrow_column<1>(window0, cache.col1);
+    window_assembler_set_narrow_column<2>(window0, cache.col2);
+    if (has_second_window) {
+        window_assembler_set_narrow_column<0>(window1, cache.col2);
+        window_assembler_set_narrow_column<1>(window1, cache.col3);
+        window_assembler_set_narrow_column<2>(window1, cache.col4);
+    }
+}
+
 static void window_row_assembler_read_narrow_window(
     hls::stream<window_load_word_t>& load_word_stream,
     narrow_3x3_window_t& window) {
@@ -1863,7 +2305,6 @@ static void window_row_assembler_read_narrow_window(
 static void window_row_assembler(
     hls::stream<window_assembler_cfg_t>& assembler_cfg_stream,
     hls::stream<window_column_meta_t>& column_meta_stream,
-    hls::stream<narrow_paired_issue_meta_t>& narrow_issue_stream,
     hls::stream<window_load_word_t>& load_word_stream,
     hls::stream<act_vec_t>& act_stream0,
     hls::stream<act_vec_t>& act_stream1) {
@@ -1887,30 +2328,48 @@ static void window_row_assembler(
         static_cast<int>(cfg.loader_request_cols.to_uint());
     const int words_per_col =
         static_cast<int>(cfg.loader_words_per_col.to_uint());
+    narrow_incremental_cache_t incremental_cache;
 
     for (int issue = 0; issue < MAX_FM_W; ++issue) {
         if (issue >= issue_count) {
             break;
         }
         if (narrow) {
-            const narrow_paired_issue_meta_t meta =
-                narrow_issue_stream.read();
             const bool has_second_window =
-                meta.has_second_window.to_uint() != 0U;
+                paired && issue * 2 + 1 < out_w;
             narrow_3x3_window_t window0;
             narrow_3x3_window_t window1;
 #pragma HLS ARRAY_PARTITION variable=window0.spatial complete dim=1
 #pragma HLS ARRAY_PARTITION variable=window1.spatial complete dim=1
-            for (int spatial = 0; spatial < 9; ++spatial) {
-#pragma HLS UNROLL
-                window0.spatial[spatial] = 0;
-                window1.spatial[spatial] = 0;
-            }
-            window_row_assembler_read_narrow_window(
-                load_word_stream, window0);
-            if (has_second_window) {
+            window_assembler_clear_narrow_window(window0);
+            window_assembler_clear_narrow_window(window1);
+            if (cfg.narrow_transfer_protocol.to_uint() ==
+                static_cast<unsigned>(
+                    NARROW_TRANSFER_C12_S1_INCREMENTAL)) {
+                window_assembler_consume_c12_incremental(
+                    issue,
+                    has_second_window,
+                    load_word_stream,
+                    incremental_cache,
+                    window0,
+                    window1);
+            } else if (cfg.narrow_transfer_protocol.to_uint() ==
+                       static_cast<unsigned>(
+                           NARROW_TRANSFER_C3_S2_REUSE_INCREMENTAL)) {
+                window_assembler_consume_c3_reuse_incremental(
+                    issue,
+                    has_second_window,
+                    load_word_stream,
+                    incremental_cache,
+                    window0,
+                    window1);
+            } else {
                 window_row_assembler_read_narrow_window(
-                    load_word_stream, window1);
+                    load_word_stream, window0);
+                if (has_second_window) {
+                    window_row_assembler_read_narrow_window(
+                        load_word_stream, window1);
+                }
             }
             u8_t unused_slots0[3] = {0, 0, 0};
             u8_t unused_slots1[3] = {0, 0, 0};
@@ -1981,16 +2440,13 @@ static void scheduled_3x3_window_row_pipeline(
     hls::stream<window_row_cfg_t> loader_cfg_stream;
     hls::stream<window_assembler_cfg_t> assembler_cfg_stream;
     hls::stream<window_column_meta_t> column_meta_stream;
-    hls::stream<narrow_paired_issue_meta_t> narrow_issue_stream;
     hls::stream<window_load_word_t> load_word_stream;
 #pragma HLS STREAM variable=loader_cfg_stream depth=2
 #pragma HLS STREAM variable=assembler_cfg_stream depth=3
 #pragma HLS STREAM variable=column_meta_stream depth=16
-#pragma HLS STREAM variable=narrow_issue_stream depth=16
 #pragma HLS STREAM variable=load_word_stream depth=16
 #pragma HLS BIND_STORAGE variable=assembler_cfg_stream type=fifo impl=lutram
 #pragma HLS BIND_STORAGE variable=column_meta_stream type=fifo impl=lutram
-#pragma HLS BIND_STORAGE variable=narrow_issue_stream type=fifo impl=lutram
 #pragma HLS BIND_STORAGE variable=load_word_stream type=fifo impl=lutram
 #pragma HLS DATAFLOW
     configure_window_row(
@@ -2002,12 +2458,10 @@ static void scheduled_3x3_window_row_pipeline(
     window_row_loader(
         loader_cfg_stream,
         column_meta_stream,
-        narrow_issue_stream,
         load_word_stream);
     window_row_assembler(
         assembler_cfg_stream,
         column_meta_stream,
-        narrow_issue_stream,
         load_word_stream,
         act_stream0,
         act_stream1);

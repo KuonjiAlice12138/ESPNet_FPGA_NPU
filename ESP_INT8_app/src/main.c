@@ -10,8 +10,9 @@
 #include "xparameters.h"
 #include "xstatus.h"
 
-#if INT8_APP_ENABLE_EXEC_PREFIX_PROFILE && INT8_APP_ENABLE_VAL_SET_TEST
-#error "exec-prefix profiling and validation-set mode are mutually exclusive"
+#if (INT8_APP_ENABLE_EXEC_PREFIX_PROFILE + INT8_APP_ENABLE_VAL_SET_TEST + \
+     INT8_APP_ENABLE_DUAL_VAL_SET_TEST + INT8_APP_ENABLE_DUAL_SINGLE_TEST) > 1
+#error "select only one prefix, validation-set, or dual-single test mode"
 #endif
 
 static inline u64 read_timer_counter(void)
@@ -94,6 +95,11 @@ typedef struct {
     u64 rtl_total;
     u64 rtl_window;
     u64 stage[INT8_STAGE_COUNTER_STAGE_COUNT];
+    u32 has_conv_profile;
+    u64 conv_win[INT8_CONV_WIN_STATE_COUNT];
+    u64 conv_sa[INT8_CONV_SA_STATE_COUNT];
+    u64 conv_post[INT8_CONV_POST_STATE_COUNT];
+    u32 conv_current;
     u32 current_stage;
     u32 status;
 } ExecPrefixProfile;
@@ -173,12 +179,25 @@ static int make_exec_prefix_filename(u32 prefix_index, char *out,
 static void capture_exec_prefix_profile(ExecPrefixProfile *profile)
 {
     u32 stage;
+    u32 state;
 
     profile->rtl_total = stage_counter_read_total();
     profile->rtl_window = stage_counter_read_active();
     for (stage = 0U; stage < INT8_STAGE_COUNTER_STAGE_COUNT; ++stage) {
         profile->stage[stage] = stage_counter_read_stage(stage);
     }
+    profile->has_conv_profile =
+        (stage_counter_has_conv_profile() != 0) ? 1U : 0U;
+    for (state = 0U; state < INT8_CONV_WIN_STATE_COUNT; ++state) {
+        profile->conv_win[state] = stage_counter_read_conv_win(state);
+    }
+    for (state = 0U; state < INT8_CONV_SA_STATE_COUNT; ++state) {
+        profile->conv_sa[state] = stage_counter_read_conv_sa(state);
+    }
+    for (state = 0U; state < INT8_CONV_POST_STATE_COUNT; ++state) {
+        profile->conv_post[state] = stage_counter_read_conv_post(state);
+    }
+    profile->conv_current = stage_counter_read_conv_current();
     profile->current_stage = stage_counter_read_current();
     profile->status = stage_counter_read_status();
 }
@@ -209,6 +228,7 @@ static void print_exec_prefix_rows(const ExecPrefixProfile *current,
                                    const ExecPrefixProfile *previous)
 {
     u32 stage;
+    u32 state;
 
     xil_printf("PREFIX_CUM,");
     print_exec_prefix_metadata(current);
@@ -217,8 +237,18 @@ static void print_exec_prefix_rows(const ExecPrefixProfile *current,
     for (stage = 0U; stage < INT8_STAGE_COUNTER_STAGE_COUNT; ++stage) {
         xil_printf(",%llu", current->stage[stage]);
     }
-    xil_printf(",0x%08x,0x%08x\r\n", current->current_stage,
-               current->status);
+    xil_printf(",%u", current->has_conv_profile);
+    for (state = 0U; state < INT8_CONV_WIN_STATE_COUNT; ++state) {
+        xil_printf(",%llu", current->conv_win[state]);
+    }
+    for (state = 0U; state < INT8_CONV_SA_STATE_COUNT; ++state) {
+        xil_printf(",%llu", current->conv_sa[state]);
+    }
+    for (state = 0U; state < INT8_CONV_POST_STATE_COUNT; ++state) {
+        xil_printf(",%llu", current->conv_post[state]);
+    }
+    xil_printf(",0x%08x,0x%08x,0x%08x\r\n", current->conv_current,
+               current->current_stage, current->status);
 
     xil_printf("PREFIX_DELTA,");
     print_exec_prefix_metadata(current);
@@ -228,8 +258,18 @@ static void print_exec_prefix_rows(const ExecPrefixProfile *current,
     for (stage = 0U; stage < INT8_STAGE_COUNTER_STAGE_COUNT; ++stage) {
         print_csv_delta(current->stage[stage], previous->stage[stage]);
     }
-    xil_printf(",0x%08x,0x%08x\r\n", current->current_stage,
-               current->status);
+    xil_printf(",%u", current->has_conv_profile);
+    for (state = 0U; state < INT8_CONV_WIN_STATE_COUNT; ++state) {
+        print_csv_delta(current->conv_win[state], previous->conv_win[state]);
+    }
+    for (state = 0U; state < INT8_CONV_SA_STATE_COUNT; ++state) {
+        print_csv_delta(current->conv_sa[state], previous->conv_sa[state]);
+    }
+    for (state = 0U; state < INT8_CONV_POST_STATE_COUNT; ++state) {
+        print_csv_delta(current->conv_post[state], previous->conv_post[state]);
+    }
+    xil_printf(",0x%08x,0x%08x,0x%08x\r\n", current->conv_current,
+               current->current_stage, current->status);
 }
 
 static int run_infer_once(Int8NpuContext *npu, u32 uop_count,
@@ -252,7 +292,9 @@ static int run_infer_once(Int8NpuContext *npu, u32 uop_count,
                            INT8_NPU_TIMEOUT_POLLS) != XST_SUCCESS) {
         stage_counter_freeze(1U);
         stage_counter_enable(0U);
-        stage_counter_dump_csv();
+        if (dump_stage_csv != 0U) {
+            stage_counter_dump_csv();
+        }
         return XST_FAILURE;
     }
     end = read_timer_counter();
@@ -270,21 +312,26 @@ static int run_infer_once(Int8NpuContext *npu, u32 uop_count,
 }
 
 static int run_full_infer_once(Int8NpuContext *npu, u32 uop_count,
-                               u64 *cycles)
+                               u64 *cycles, u32 dump_stage_csv)
 {
-    return run_infer_once(npu, uop_count, cycles, 1U);
+    return run_infer_once(npu, uop_count, cycles, dump_stage_csv);
 }
 
-static int validate_output_classes(void)
+static int validate_output_classes(const char *profile_name, u32 expected_classes)
 {
-    u32 class_counts[INT8_APP_EXPECTED_CLASS_COUNT];
+    u32 class_counts[INT8_APP_CLASS20_CLASS_COUNT];
     u32 invalid_count = 0U;
     u32 i;
 
+    if (expected_classes == 0U ||
+        expected_classes > INT8_APP_CLASS20_CLASS_COUNT) {
+        xil_printf("APP: unsupported class count=%u\r\n", expected_classes);
+        return XST_FAILURE;
+    }
     memset(class_counts, 0, sizeof(class_counts));
     for (i = 0U; i < INT8_OUTPUT_BYTES; ++i) {
         const u32 class_id = (u32)g_output[i];
-        if (class_id < INT8_APP_EXPECTED_CLASS_COUNT) {
+        if (class_id < expected_classes) {
             ++class_counts[class_id];
         } else {
             ++invalid_count;
@@ -292,11 +339,10 @@ static int validate_output_classes(void)
     }
 
     xil_printf("APP: output profile=%s classes=%u invalid=%u\r\n",
-               INT8_APP_DEPLOYMENT_NAME,
-               INT8_APP_EXPECTED_CLASS_COUNT,
+               profile_name, expected_classes,
                invalid_count);
     xil_printf("APP: output class histogram");
-    for (i = 0U; i < INT8_APP_EXPECTED_CLASS_COUNT; ++i) {
+    for (i = 0U; i < expected_classes; ++i) {
         xil_printf(" c%u=%u", i, class_counts[i]);
     }
     xil_printf("\r\n");
@@ -315,8 +361,16 @@ static int run_exec_prefix_profile(Int8NpuContext *npu)
     u32 param_size;
     u32 prefix_index;
     u32 performance_gate_failed = 0U;
+    const u32 conv_profile_cap =
+        (stage_counter_has_conv_profile() != 0) ? 1U : 0U;
 
     memset(&previous, 0, sizeof(previous));
+    xil_printf("APP: conv profile capability=%u required=%u\r\n",
+               conv_profile_cap, INT8_APP_REQUIRE_CONV_PROFILE);
+    if (INT8_APP_REQUIRE_CONV_PROFILE && conv_profile_cap == 0U) {
+        xil_printf("APP: incompatible stage counter; abort prefix profiling\r\n");
+        return XST_FAILURE;
+    }
     if (SD_LoadFileToMemory(INT8_APP_SINGLE_PERF_INPUT_FILE,
                             (UINTPTR)g_input, INT8_INPUT_BYTES,
                             &input_size) != XST_SUCCESS ||
@@ -326,13 +380,17 @@ static int run_exec_prefix_profile(Int8NpuContext *npu)
         return XST_FAILURE;
     }
 
-    xil_printf("APP: exec-prefix profiling files=P00.BIN..P15.BIN\r\n");
+    xil_printf("APP: exec-prefix profiling files=P00.BIN..P%02u.BIN\r\n",
+               INT8_APP_EXEC_PREFIX_COUNT - 1U);
     xil_printf("EXEC_PREFIX_CYCLES_BEGIN\r\n");
     xil_printf("record,prefix,active_execs,new_exec_index,logical_uop,kind,"
                "arm_ticks,rtl_total,rtl_window,"
                "s0_idle,s1_param,s2_frame,s3_ctrl,s4_wgt,s5_conv,s6_ppu,"
                "s7_b5,s8_vec,s9_pool,s10_up,s11_store,s12_error,"
-               "current,status\r\n");
+               "conv_cap,cw0_idle_done,cw1_active,"
+               "cs0_idle_done,cs1_compute_wait_act,cs2_emit_wait,"
+               "cp0_idle_done,cp1_requant_wait,cp2_write,"
+               "conv_current,current,status\r\n");
 
     for (prefix_index = 0U;
          prefix_index < INT8_APP_EXEC_PREFIX_COUNT;
@@ -472,7 +530,8 @@ static int run_exec_prefix_profile(Int8NpuContext *npu)
         }
     }
 
-    if (validate_output_classes() != XST_SUCCESS) {
+    if (validate_output_classes(INT8_APP_DEPLOYMENT_NAME,
+                                INT8_APP_EXPECTED_CLASS_COUNT) != XST_SUCCESS) {
         xil_printf("APP: prefix final output class validation failed\r\n");
         return XST_FAILURE;
     }
@@ -487,11 +546,28 @@ static int run_exec_prefix_profile(Int8NpuContext *npu)
     return (performance_gate_failed == 0U) ? XST_SUCCESS : XST_FAILURE;
 }
 
-static int run_single_image(Int8NpuContext *npu, u32 uop_count)
+static int run_single_image(Int8NpuContext *npu, u32 uop_count,
+                            const char *profile_name, u32 expected_classes,
+                            const char *input_file, const char *output_file,
+                            u64 *arm_ticks)
 {
     u32 input_size = 0U;
     u64 cycles = 0ULL;
-    const char *input_file = INT8_APP_SINGLE_PERF_INPUT_FILE;
+    const u32 conv_profile_cap =
+        (stage_counter_has_conv_profile() != 0) ? 1U : 0U;
+
+    s_perf_count = 0U;
+    xil_printf("\r\nAPP: SINGLE_PROFILE_BEGIN profile=%s classes=%u\r\n",
+               profile_name, expected_classes);
+    xil_printf("APP: conv profile capability=%u required=%u\r\n",
+               conv_profile_cap, INT8_APP_REQUIRE_CONV_PROFILE);
+    if (INT8_APP_REQUIRE_CONV_PROFILE && conv_profile_cap == 0U) {
+        xil_printf("APP: incompatible stage counter; abort single profiling\r\n");
+        return XST_FAILURE;
+    }
+    if (conv_profile_cap == 0U) {
+        xil_printf("APP: stage-only profiling on restored platform\r\n");
+    }
 
     if (!SD_FileExists(input_file)) {
 #if INT8_APP_ENABLE_VAL_SET_TEST
@@ -519,29 +595,47 @@ static int run_single_image(Int8NpuContext *npu, u32 uop_count)
         return XST_FAILURE;
     }
 
-    xil_printf("APP: single full MODE_RUN timing start\r\n");
-    if (run_full_infer_once(npu, uop_count, &cycles) != XST_SUCCESS) {
+    xil_printf("APP: single full MODE_RUN timing start profile=%s\r\n",
+               profile_name);
+    if (run_full_infer_once(npu, uop_count, &cycles, 1U) != XST_SUCCESS) {
         xil_printf("APP: MODE_RUN failed\r\n");
         return XST_FAILURE;
     }
     record_perf_value("FULL_MODE_RUN", uop_count, cycles);
+    if (arm_ticks != NULL) {
+        *arm_ticks = cycles;
+    }
 
     xil_printf("APP: single MODE_RUN done\r\n");
     print_perf_summary();
 
-    if (SD_SaveMemoryToFile(INT8_APP_SINGLE_PERF_OUTPUT_FILE, g_output,
+    if (SD_SaveMemoryToFile(output_file, g_output,
                             INT8_OUTPUT_BYTES) != XST_SUCCESS) {
         xil_printf("APP: save output failed\r\n");
         return XST_FAILURE;
     }
 
+    if (validate_output_classes(profile_name, expected_classes) != XST_SUCCESS) {
+        xil_printf("APP: invalid class IDs; saved mask retained for host analysis\r\n");
+        return XST_FAILURE;
+    }
+    if (stage_counter_read_stage(12U) != 0ULL ||
+        stage_counter_read_current() == 12U) {
+        xil_printf("APP: NPU ERROR stage; profile=%s saved=%s, timing rejected\r\n",
+                   profile_name, output_file);
+        return XST_FAILURE;
+    }
     xil_printf("APP: compare offline with %s on host\r\n",
-               INT8_APP_SINGLE_PERF_OUTPUT_FILE);
-    xil_printf("APP: done\r\n");
+               output_file);
+    xil_printf("APP: SINGLE_PROFILE_END profile=%s output=%s\r\n",
+               profile_name, output_file);
     return XST_SUCCESS;
 }
 
-static int run_val_set(Int8NpuContext *npu, u32 uop_count)
+static int run_val_set(Int8NpuContext *npu, u32 uop_count,
+                       const char *profile_name, const char *input_prefix,
+                       const char *output_prefix, u32 max_images,
+                       u32 start_index, u32 expected_classes)
 {
     char input_file[16];
     char output_file[16];
@@ -551,19 +645,19 @@ static int run_val_set(Int8NpuContext *npu, u32 uop_count)
     u64 min_cycles = ~0ULL;
     u64 max_cycles = 0ULL;
 
-    xil_printf("APP: VALSET start max=%u start=%u\r\n",
-               INT8_APP_VAL_MAX_IMAGES, INT8_APP_VAL_START_INDEX);
+    xil_printf("APP: VALSET start profile=%s classes=%u max=%u start=%u\r\n",
+               profile_name, expected_classes, max_images, start_index);
     xil_printf("APP: VALSET input=%s%%04u.BIN output=%s%%04u.BIN\r\n",
-               INT8_APP_VAL_INPUT_PREFIX, INT8_APP_VAL_OUTPUT_PREFIX);
+               input_prefix, output_prefix);
 
-    for (offset = 0U; offset < INT8_APP_VAL_MAX_IMAGES; ++offset) {
-        u32 index = INT8_APP_VAL_START_INDEX + offset;
+    for (offset = 0U; offset < max_images; ++offset) {
+        u32 index = start_index + offset;
         u32 input_size = 0U;
         u64 cycles = 0ULL;
 
-        if (make_val_filename(INT8_APP_VAL_INPUT_PREFIX, index, input_file,
+        if (make_val_filename(input_prefix, index, input_file,
                               sizeof(input_file)) != XST_SUCCESS ||
-            make_val_filename(INT8_APP_VAL_OUTPUT_PREFIX, index, output_file,
+            make_val_filename(output_prefix, index, output_file,
                               sizeof(output_file)) != XST_SUCCESS) {
             xil_printf("APP: bad val filename index=%u\r\n", index);
             return XST_FAILURE;
@@ -591,7 +685,8 @@ static int run_val_set(Int8NpuContext *npu, u32 uop_count)
             return XST_FAILURE;
         }
 
-        if (run_full_infer_once(npu, uop_count, &cycles) != XST_SUCCESS) {
+        if (run_full_infer_once(npu, uop_count, &cycles,
+                                (processed == 0U) ? 1U : 0U) != XST_SUCCESS) {
             xil_printf("APP: VALSET MODE_RUN failed index=%u file=%s\r\n",
                        index, input_file);
             return XST_FAILURE;
@@ -621,20 +716,163 @@ static int run_val_set(Int8NpuContext *npu, u32 uop_count)
         return XST_FAILURE;
     }
 
-    xil_printf("\r\nAPP: ==== VALSET SUMMARY ====\r\n");
-    xil_printf("APP: samples=%u total_cycles=%llu total_ms=%llu\r\n",
+    xil_printf("\r\nAPP: ==== VALSET SUMMARY %s ====\r\n", profile_name);
+    xil_printf("APP: profile=%s samples=%u total_cycles=%llu total_ms=%llu\r\n",
+               profile_name,
                processed, total_cycles, timer_ticks_to_ms(total_cycles));
     xil_printf("APP: avg_cycles=%llu avg_ms=%llu min_ms=%llu max_ms=%llu\r\n",
                total_cycles / processed, timer_ticks_to_ms(total_cycles / processed),
                timer_ticks_to_ms(min_cycles), timer_ticks_to_ms(max_cycles));
-    xil_printf("APP: run host eval_val_hw_masks_fullres on Oxxxx.BIN files\r\n");
+    xil_printf("APP: run host eval_val_hw_masks_fullres on %sxxxx.BIN files\r\n",
+               output_prefix);
+    return XST_SUCCESS;
+}
+
+static int load_param_and_init(Int8NpuContext *npu, const char *param_file,
+                               Int8ParamBlobHeader *header)
+{
+    u32 param_size = 0U;
+
+    memset(g_param, 0, sizeof(g_param));
+    if (SD_LoadFileToMemory(param_file, (UINTPTR)g_param,
+                            INT8_PARAM_HW_MAX_BYTES,
+                            &param_size) != XST_SUCCESS) {
+        xil_printf("APP: load param failed: %s\r\n", param_file);
+        return XST_FAILURE;
+    }
+    if (int8_npu_read_param_header(g_param, param_size, header) !=
+            XST_SUCCESS ||
+        int8_npu_validate_param_header(header, param_size) != XST_SUCCESS) {
+        xil_printf("APP: param validation failed: %s\r\n", param_file);
+        return XST_FAILURE;
+    }
+
+#if INT8_APP_ENABLE_DUAL_SINGLE_TEST
+    /* Do not accidentally time an old ABI or an early-END prefix blob. */
+    if (header->version != INT8_PARAM_BLOB_VERSION_CURRENT ||
+        header->exec_plan_count != INT8_EXPECTED_EXEC_PLAN_COUNT) {
+        xil_printf("APP: dual single requires full PARAM v4: %s\r\n", param_file);
+        return XST_FAILURE;
+    }
+    for (u32 i = 0U; i < header->exec_plan_count; ++i) {
+        Int8ExecPlanEntry entry;
+        if (int8_npu_read_exec_plan_entry(g_param, param_size, header, i,
+                                         &entry) != XST_SUCCESS ||
+            ((entry.kind == INT8_EXEC_KIND_END) !=
+             (i + 1U == header->exec_plan_count))) {
+            xil_printf("APP: incomplete exec plan: %s index=%u\r\n",
+                       param_file, i);
+            return XST_FAILURE;
+        }
+    }
+#endif
+
+    Xil_DCacheFlushRange((UINTPTR)g_param, param_size);
+    Xil_DCacheFlushRange((UINTPTR)g_input, INT8_INPUT_BYTES);
+    Xil_DCacheFlushRange((UINTPTR)g_output, INT8_OUTPUT_BYTES);
+    if (int8_npu_run_init(npu, (UINTPTR)g_param, header->uop_count,
+                          INT8_NPU_TIMEOUT_POLLS) != XST_SUCCESS) {
+        xil_printf("APP: MODE_INIT failed: %s\r\n", param_file);
+        return XST_FAILURE;
+    }
+    xil_printf("APP: MODE_INIT done profile_param=%s uops=%u version=%u exec=%u\r\n",
+               param_file, header->uop_count, header->version,
+               header->exec_plan_count);
+    return XST_SUCCESS;
+}
+
+static int run_dual_single_image(Int8NpuContext *npu)
+{
+    Int8ParamBlobHeader header;
+    u64 binary_ticks = 0ULL;
+    u64 class20_ticks = 0ULL;
+    u64 binary_rtl = 0ULL;
+    u64 class20_rtl = 0ULL;
+    int binary_status = XST_FAILURE;
+    int class20_status = XST_FAILURE;
+
+    if (load_param_and_init(npu, INT8_APP_BINARY_PARAM_FILE, &header) ==
+        XST_SUCCESS) {
+        binary_status = run_single_image(
+            npu, header.uop_count, "binary2", INT8_APP_BINARY_CLASS_COUNT,
+            INT8_APP_BINARY_SINGLE_INPUT_FILE,
+            INT8_APP_BINARY_SINGLE_OUTPUT_FILE, &binary_ticks);
+        binary_rtl = stage_counter_read_total();
+    } else {
+        xil_printf("APP: binary2 init failed; continue with cityscapes20\r\n");
+    }
+
+    if (load_param_and_init(npu, INT8_APP_CLASS20_PARAM_FILE, &header) ==
+        XST_SUCCESS) {
+        class20_status = run_single_image(
+            npu, header.uop_count, "cityscapes20",
+            INT8_APP_CLASS20_CLASS_COUNT,
+            INT8_APP_CLASS20_SINGLE_INPUT_FILE,
+            INT8_APP_CLASS20_SINGLE_OUTPUT_FILE, &class20_ticks);
+        class20_rtl = stage_counter_read_total();
+    } else {
+        xil_printf("APP: cityscapes20 init failed\r\n");
+    }
+
+    xil_printf("DUAL_SINGLE_SUMMARY_BEGIN\r\n");
+    xil_printf("profile,classes,result,arm_ticks,arm_ms,rtl_cycles,output\r\n");
+    xil_printf("binary2,%u,%s,%llu,%llu,%llu,%s\r\n",
+               INT8_APP_BINARY_CLASS_COUNT,
+               (binary_status == XST_SUCCESS) ? "PASS" : "FAIL", binary_ticks,
+               timer_ticks_to_ms(binary_ticks), binary_rtl,
+               INT8_APP_BINARY_SINGLE_OUTPUT_FILE);
+    xil_printf("cityscapes20,%u,%s,%llu,%llu,%llu,%s\r\n",
+               INT8_APP_CLASS20_CLASS_COUNT,
+               (class20_status == XST_SUCCESS) ? "PASS" : "FAIL",
+               class20_ticks,
+               timer_ticks_to_ms(class20_ticks), class20_rtl,
+               INT8_APP_CLASS20_SINGLE_OUTPUT_FILE);
+    xil_printf("DUAL_SINGLE_SUMMARY_END\r\n");
+    xil_printf("APP: dual single done binary2=%s cityscapes20=%s\r\n",
+               (binary_status == XST_SUCCESS) ? "PASS" : "FAIL",
+               (class20_status == XST_SUCCESS) ? "PASS" : "FAIL");
+    return (binary_status == XST_SUCCESS && class20_status == XST_SUCCESS) ?
+               XST_SUCCESS : XST_FAILURE;
+}
+
+static int run_dual_val_set(Int8NpuContext *npu)
+{
+    Int8ParamBlobHeader header;
+
+    if (load_param_and_init(npu, INT8_APP_BINARY_PARAM_FILE, &header) !=
+        XST_SUCCESS) {
+        return XST_FAILURE;
+    }
+    if (run_val_set(npu, header.uop_count, "binary2",
+                    INT8_APP_BINARY_INPUT_PREFIX,
+                    INT8_APP_BINARY_OUTPUT_PREFIX,
+                    INT8_APP_DUAL_VAL_MAX_IMAGES, 0U,
+                    INT8_APP_BINARY_CLASS_COUNT) != XST_SUCCESS) {
+        return XST_FAILURE;
+    }
+
+    if (load_param_and_init(npu, INT8_APP_CLASS20_PARAM_FILE, &header) !=
+        XST_SUCCESS) {
+        return XST_FAILURE;
+    }
+    if (run_val_set(npu, header.uop_count, "cityscapes20",
+                    INT8_APP_CLASS20_INPUT_PREFIX,
+                    INT8_APP_CLASS20_OUTPUT_PREFIX,
+                    INT8_APP_DUAL_VAL_MAX_IMAGES, 0U,
+                    INT8_APP_CLASS20_CLASS_COUNT) != XST_SUCCESS) {
+        return XST_FAILURE;
+    }
+
+    xil_printf("APP: dual VALSET done binary2=%u cityscapes20=%u\r\n",
+               INT8_APP_DUAL_VAL_MAX_IMAGES, INT8_APP_DUAL_VAL_MAX_IMAGES);
     return XST_SUCCESS;
 }
 
 int main(void)
 {
     Int8NpuContext npu;
-#if !INT8_APP_ENABLE_EXEC_PREFIX_PROFILE
+#if !INT8_APP_ENABLE_EXEC_PREFIX_PROFILE && !INT8_APP_ENABLE_DUAL_VAL_SET_TEST && \
+    !INT8_APP_ENABLE_DUAL_SINGLE_TEST
     Int8ParamBlobHeader header;
     u32 param_size = 0U;
 #endif
@@ -656,6 +894,10 @@ int main(void)
 
 #if INT8_APP_ENABLE_EXEC_PREFIX_PROFILE
     return run_exec_prefix_profile(&npu);
+#elif INT8_APP_ENABLE_DUAL_VAL_SET_TEST
+    return run_dual_val_set(&npu);
+#elif INT8_APP_ENABLE_DUAL_SINGLE_TEST
+    return run_dual_single_image(&npu);
 #else
     if (SD_LoadFileToMemory(INT8_PARAM_FILE, (UINTPTR)g_param,
                             INT8_PARAM_HW_MAX_BYTES,
@@ -687,14 +929,23 @@ int main(void)
 
 #if INT8_APP_ENABLE_VAL_SET_TEST
 #if INT8_APP_ENABLE_SINGLE_PERF_BEFORE_VAL
-    if (run_single_image(&npu, header.uop_count) != XST_SUCCESS) {
+    if (run_single_image(&npu, header.uop_count, INT8_APP_DEPLOYMENT_NAME,
+                          INT8_APP_EXPECTED_CLASS_COUNT,
+                          INT8_APP_SINGLE_PERF_INPUT_FILE,
+                          INT8_APP_SINGLE_PERF_OUTPUT_FILE, NULL) != XST_SUCCESS) {
         xil_printf("APP: single perf before valset failed\r\n");
         return XST_FAILURE;
     }
 #endif
-    return run_val_set(&npu, header.uop_count);
+    return run_val_set(&npu, header.uop_count, "single", INT8_APP_VAL_INPUT_PREFIX,
+                       INT8_APP_VAL_OUTPUT_PREFIX, INT8_APP_VAL_MAX_IMAGES,
+                       INT8_APP_VAL_START_INDEX,
+                       INT8_APP_EXPECTED_CLASS_COUNT);
 #else
-    return run_single_image(&npu, header.uop_count);
+    return run_single_image(&npu, header.uop_count, INT8_APP_DEPLOYMENT_NAME,
+                             INT8_APP_EXPECTED_CLASS_COUNT,
+                             INT8_APP_SINGLE_PERF_INPUT_FILE,
+                             INT8_APP_SINGLE_PERF_OUTPUT_FILE, NULL);
 #endif
 #endif
 }

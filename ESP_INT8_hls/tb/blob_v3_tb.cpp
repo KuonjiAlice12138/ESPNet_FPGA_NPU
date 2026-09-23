@@ -121,7 +121,7 @@ static bool validate_v4_schedule_contract() {
 }
 
 int main() {
-    const char* blob_path = "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_v4/PARAM.BIN";
+    const char* blob_path = "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_r2_v4/PARAM.BIN";
     std::vector<esp_int8::axi_vec_t> param;
     std::size_t byte_count = 0;
     if (!load_blob(blob_path, param, byte_count)) {

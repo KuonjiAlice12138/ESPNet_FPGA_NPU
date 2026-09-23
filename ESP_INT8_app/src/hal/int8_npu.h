@@ -50,6 +50,10 @@ typedef struct {
     XEspnet_encoder_int8_core ip;
 } Int8NpuContext;
 
+#define INT8_CONV_WIN_STATE_COUNT 2U
+#define INT8_CONV_SA_STATE_COUNT 3U
+#define INT8_CONV_POST_STATE_COUNT 3U
+
 int int8_npu_init(Int8NpuContext *ctx);
 int int8_npu_read_param_header(const u8 *param_blob, u32 param_bytes,
                                Int8ParamBlobHeader *header);
@@ -74,6 +78,12 @@ u64 stage_counter_read_active(void);
 u64 stage_counter_read_stage(unsigned stage);
 u32 stage_counter_read_current(void);
 u32 stage_counter_read_status(void);
+int stage_counter_has_conv_profile(void);
+u64 stage_counter_read_conv_win(unsigned state);
+u64 stage_counter_read_conv_sa(unsigned state);
+u64 stage_counter_read_conv_post(unsigned state);
+u32 stage_counter_read_conv_current(void);
+void stage_counter_dump_conv_csv(void);
 void stage_counter_dump_csv(void);
 
 #endif

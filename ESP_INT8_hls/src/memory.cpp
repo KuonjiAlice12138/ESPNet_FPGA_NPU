@@ -215,16 +215,27 @@ static bool write_bank_word(u8_t bank_id, u32_t byte_offset, axi_vec_t value) {
     return write_phys_word(phys_addr, value);
 }
 
-static axi_vec_t make_low_byte_mask(unsigned byte_count) {
+static ap_uint<AXI_WORD_BYTES> make_low_byte_lane_mask(unsigned byte_count) {
 #pragma HLS INLINE
-    if (byte_count == 0U) {
-        return 0;
+    ap_uint<AXI_WORD_BYTES> lane_mask = 0;
+    for (int lane = 0; lane < AXI_WORD_BYTES; ++lane) {
+#pragma HLS UNROLL
+        lane_mask[lane] = byte_count > static_cast<unsigned>(lane);
     }
-    if (byte_count >= static_cast<unsigned>(AXI_WORD_BYTES)) {
-        return ~axi_vec_t(0);
+    return lane_mask;
+}
+
+static axi_vec_t mask_packed_bytes(
+    const axi_vec_t& packed,
+    const ap_uint<AXI_WORD_BYTES>& lane_mask) {
+#pragma HLS INLINE
+    axi_vec_t masked = 0;
+    for (int lane = 0; lane < AXI_WORD_BYTES; ++lane) {
+#pragma HLS UNROLL
+        const ap_uint<8> byte_value = packed.range(lane * 8 + 7, lane * 8);
+        masked.range(lane * 8 + 7, lane * 8) = lane_mask[lane] ? byte_value : ap_uint<8>(0);
     }
-    const unsigned bit_count = byte_count * 8U;
-    return static_cast<axi_vec_t>((static_cast<axi_vec_t>(1) << bit_count) - 1);
+    return masked;
 }
 
 static bool read_tile_packed_word(u8_t bank_id,
@@ -262,7 +273,8 @@ static bool read_tile_packed_word(u8_t bank_id,
     }
 
     if (read_count < static_cast<unsigned>(AXI_WORD_BYTES)) {
-        packed &= make_low_byte_mask(read_count);
+        const ap_uint<AXI_WORD_BYTES> lane_mask = make_low_byte_lane_mask(read_count);
+        packed = mask_packed_bytes(packed, lane_mask);
     }
     return true;
 }
@@ -470,18 +482,6 @@ bool on_chip_memory_write_pool2_abs_word(u32_t byte_offset,
         return false;
     }
     return write_phys_word(phys_addr, packed);
-}
-
-bool on_chip_memory_read_pool2_abs_word(u32_t byte_offset,
-                                        axi_vec_t& packed) {
-#pragma HLS INLINE off
-#pragma HLS PIPELINE off
-    u32_t phys_addr = 0;
-    if (!resolve_pool2_alias_addr(byte_offset, phys_addr)) {
-        packed = 0;
-        return false;
-    }
-    return read_phys_word(phys_addr, packed);
 }
 
 bool on_chip_memory_write_input_axi_word(u32_t word_offset, axi_vec_t value) {

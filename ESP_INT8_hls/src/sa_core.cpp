@@ -48,6 +48,59 @@ static void compute_k_valid_lanes(u16_t kt,
     }
 }
 
+static i32_t dot_product_tree_32(const i8_t act_lane0[TK],
+                                 const i8_t act_lane1[TK],
+                                 const wgt_vec_t& wgt_word,
+                                 const bool k_valid[TK],
+                                 bool use_second_pixel) {
+#pragma HLS INLINE
+    ap_int<16> products[TK];
+    ap_int<17> sum_l1[16];
+    ap_int<18> sum_l2[8];
+    ap_int<19> sum_l3[4];
+    ap_int<20> sum_l4[2];
+    ap_int<21> sum_l5[1];
+#pragma HLS ARRAY_PARTITION variable=products complete dim=1
+#pragma HLS ARRAY_PARTITION variable=sum_l1 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=sum_l2 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=sum_l3 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=sum_l4 complete dim=1
+#pragma HLS ARRAY_PARTITION variable=sum_l5 complete dim=1
+
+    for (int tk = 0; tk < TK; ++tk) {
+#pragma HLS UNROLL
+        const i8_t act = use_second_pixel ? act_lane1[tk] : act_lane0[tk];
+        const i8_t weight = get_vec_i8(wgt_word, tk);
+        i16_t product;
+#pragma HLS BIND_OP variable=product op=mul impl=dsp
+        product = static_cast<i16_t>(act * weight);
+        products[tk] = k_valid[tk] ? product : i16_t(0);
+    }
+    for (int i = 0; i < 16; ++i) {
+#pragma HLS UNROLL
+        sum_l1[i] = static_cast<ap_int<17>>(products[2 * i]) +
+                    static_cast<ap_int<17>>(products[2 * i + 1]);
+    }
+    for (int i = 0; i < 8; ++i) {
+#pragma HLS UNROLL
+        sum_l2[i] = static_cast<ap_int<18>>(sum_l1[2 * i]) +
+                    static_cast<ap_int<18>>(sum_l1[2 * i + 1]);
+    }
+    for (int i = 0; i < 4; ++i) {
+#pragma HLS UNROLL
+        sum_l3[i] = static_cast<ap_int<19>>(sum_l2[2 * i]) +
+                    static_cast<ap_int<19>>(sum_l2[2 * i + 1]);
+    }
+    for (int i = 0; i < 2; ++i) {
+#pragma HLS UNROLL
+        sum_l4[i] = static_cast<ap_int<20>>(sum_l3[2 * i]) +
+                    static_cast<ap_int<20>>(sum_l3[2 * i + 1]);
+    }
+    sum_l5[0] = static_cast<ap_int<21>>(sum_l4[0]) +
+                static_cast<ap_int<21>>(sum_l4[1]);
+    return static_cast<i32_t>(sum_l5[0]);
+}
+
 static void mac_tile_active_lanes(const i8_t act_lane0[TK],
                                   const i8_t act_lane1[TK],
                                   const wgt_vec_t weight_buf[TM][MAX_SA_K_TILES],
@@ -64,16 +117,12 @@ static void mac_tile_active_lanes(const i8_t act_lane0[TK],
 #pragma HLS UNROLL
         const int weight_lane = paired && lane >= SA_OUTPUT_TM ? lane - SA_OUTPUT_TM : lane;
         const bool use_second_pixel = paired && lane >= SA_OUTPUT_TM;
-        i32_t partial = 0;
         const wgt_vec_t wgt_word = weight_buf[weight_lane][kt];
-        for (int tk = 0; tk < TK; ++tk) {
-#pragma HLS UNROLL
-            if (k_valid[tk]) {
-                const i8_t act = use_second_pixel ? act_lane1[tk] : act_lane0[tk];
-                partial += static_cast<i32_t>(act) *
-                           static_cast<i32_t>(get_vec_i8(wgt_word, tk));
-            }
-        }
+        const i32_t partial = dot_product_tree_32(act_lane0,
+                                                  act_lane1,
+                                                  wgt_word,
+                                                  k_valid,
+                                                  use_second_pixel);
         psum[lane] += partial;
     }
 }
