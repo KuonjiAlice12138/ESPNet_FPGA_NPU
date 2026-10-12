@@ -1,65 +1,63 @@
-ESP INT8 board app: H256W512 Round 4R timing-repair dual-single profiling.
+ESP INT8 board app: H240W240 grayscale binary2 single-image profiling.
 
-Platform: platform_r4_0922, standalone_psu_cortexa53_0.
-App tag: INT8-BOARD-20260923-P7-H256W512-R4R-DUAL-PROF.
-Build the app manually after these source updates. Download using this
-platform's bitstream and FSBL through Vitis; SD contains model data only.
+Platform: platform_h240_1012, standalone_psu_cortexa53_0, Cortex-A53 0.
+App tag: INT8-BOARD-20261011-P7-H240W240-GRAY-B2.
+The user rebuilt the App on 2026-10-12 at 17:05. The debug launch uses the
+new platform's bitstream and FSBL; it must not use the failed R5A platform.
+BOOT.BIN was packaged from boot_h240.bif and the rebuilt App, then copied to E:/.
+All three SD files were verified by SHA256. No old ELF or BOOT is used.
 
-One boot runs binary2 once, then cityscapes20 once. Each model has its own
-MODE_INIT and quantized input. Prefix and validation-set modes are disabled.
-PARAM v4 ABI remains unchanged: 75 logical UOPs, 16 EXEC records including END,
-U71/U72 separate. Input is 256x512x3 INT8 NHWC; output is a 256x512 uint8 mask.
-Both PARAM files enable C3 KEEP1 row reuse with 48 packed words; C12 reuse
-remains NONE. Round 4R retains the Round 4 incremental C3/C12 WinGen protocol,
-while replacing dynamic low-byte masks and narrowing fallback control. PARAM v4,
-tensor semantics and execution order are unchanged, so the validated Round 2
-PARAM files and inputs remain correct.
+One boot runs binary2 once. Dual-model, EXEC-prefix and validation-set modes
+are disabled. PARAM v4 has 75 logical UOPs, 16 EXEC records including END,
+26 CONV, 7 AFFINE, 14 ADD and 3 POOL; U71/U72 remain separate.
+Input is true grayscale NHWC INT8, 240x240x1. Output is a 240x240 uint8 mask.
+All DDR buffers are 64-byte aligned; PARAM capacity remains 262144 bytes.
 
-Required SD files (8.3 names):
-P2H.BIN   binary2 PARAM, 143424 bytes
-I2H.BIN   binary2 input, 393216 bytes
-P20H.BIN  cityscapes20 PARAM, 148032 bytes
-I20H.BIN  cityscapes20 input, 393216 bytes
+SD files (8.3 names):
+BOOT.BIN  freshly packaged FSBL + H240 bitstream + rebuilt App, for SD boot
+P2G.BIN   PARAM, 143040 bytes
+I2G.BIN   grayscale input, 57600 bytes
+O2G.BIN   generated output, 57600 bytes; remove any old copy before running
 
-Generated outputs, 131072 bytes each:
-O2H.BIN   binary2 mask
-O20H.BIN  cityscapes20 mask
+Copy PARAM.BIN and INPUTQ.BIN from:
+hw_artifacts/binary2_int8_h240w240_gray_v4
+Do not use either preserved H256/RGB artifact with this hardware.
+The input uses center-square crop, resize to 240x240 and the QAT grayscale
+normalization. Labels are vehicles=0, valid background=1, ignored target=255.
+Golden fullres output contains c0=4105, c1=53495 and no invalid class IDs.
+The board mask must match golden_fullres_mask.bin byte for byte. A valid
+histogram alone is not sufficient to pass the output-correctness gate.
 
-Both models print top-level RTL stage cycles, Conv WIN/SA/POST cycles,
-counter consistency checks, ARM timing, and output class histograms.
-The counter capability bit for Conv profiling is required.
+Top-level stage and Conv WIN/SA/POST counter dumps remain enabled; the Conv
+capability bit is required. Reject ERROR stage activity, timeout or invalid IDs.
+POST state 1 classifies staging words; state 2 classifies commit words. Both
+include psum wait, requantization and packing, not pure phase durations.
+WIN/SA/POST overlap within Conv; their cycle totals must not be summed.
 
-POST state 1 now classifies a staging/discard word; state 2 classifies a word
-that commits a row-buffer pixel. Both include any psum wait, requantization,
-and packing; neither is a pure phase-duration counter. State 0 is idle/done.
-Only compare aggregate POST activity with the old baseline's POST activity.
-
-ARM timing uses CNTPCT_EL0 / runtime CNTFRQ_EL0, with BSP reference 33333000 Hz.
+ARM timing uses CNTPCT_EL0 / runtime CNTFRQ_EL0, BSP reference 33333000 Hz.
 PL counters use nominal 100 MHz (10 ns), independently of the ARM timer.
-The measured interval covers MODE_RUN, including hardware frame transfers.
-SD access, MODE_INIT, cache maintenance, and counter/UART printing are outside
-that interval. Reject runs with an ERROR stage or invalid output class IDs.
+MODE_RUN includes hardware frame transfers. SD I/O, MODE_INIT, cache
+maintenance and counter/UART dumps are outside the measured interval.
+Initial target: <=6000000 PL cycles (60 ms); bring-up ceiling: 7000000 (70 ms).
+Actual performance and correctness require the board result, not HLS max latency.
+Only after the single-image gate passes should the 500-image run be prepared.
 
-Host accuracy checks use each model's matching H256W512 artifact and target:
-hw_artifacts/binary2_int8_h256w512_r2_v4
-hw_artifacts/cityscapes20_int8_h256w512_r2_v4
-SD outputs are never prefilled with golden data. Weights, inputs, logits and
-masks are unchanged. Compare Round 4R total/Conv cycles against the measured
-Round 4 baseline: binary2 12046315/7292151, cityscapes20 12064714/7310551.
-Round 4R is cycle neutral: each total and Conv count must regress by no more
-than 1%. The dual-single PASS label checks successful execution and output
-range, not this performance gate.
+Verified SHA256:
+P2G.BIN  bb92bafa4ac297a760ee4880887fdeffe8cee0279107f9f01f3fa355e4244fa0
+I2G.BIN  c1f3b03245d4bc6514c2a2dfcada898453f0d8eca6292ddcd46b40c1c2b5dd87
+Golden   88bc39cb00f9f6056d76ed85f74b69c86ff4808e6f868d40f6f4e6203ce426ce
+XSA      67eb53a804bedf6d1f8a12ad5415569251d370a327b7fcec847c7c72eac9ec56
+Bit      b3f1ddbf970ed68784f28d7bfb1d336b8894024446cb51dd409dddbce65201f3
+App ELF  2f440a0dffa089ab9f845329307e459d23d18252cf98bed4dccb02f7990ae56b
+BOOT.BIN f1d82983e24f08694b42369fc76bfaa32358c219be8fdf86c44f12c05a08a6f2
 
-Expected SHA256 for this run:
-P2H.BIN  d2de465a97c802d69b691bd852e3250e13eae1329ce67df14e20fceaeeb507e4
-I2H.BIN  5a1f93c1247c7de7c6d499f864f1c8af3f8c2931774cc0a1d338b10246295215
-P20H.BIN fe8f9541edcffcb8100582cc7a3b3b0351395a5c18d504f697a24acaed6e71df
-I20H.BIN 5a1f93c1247c7de7c6d499f864f1c8af3f8c2931774cc0a1d338b10246295215
-Platform XSA: 7096f2cff088c513bacdd82d10a6f89aeaaafbdfe8c803029fa33fd772f23c72
-Bitstream: c43845f76de83e27578681316690516a1b44b63755364dbb0a41636ce3ec9713
-Implementation: routing errors=0, WNS=+0.293 ns, WHS=+0.010 ns at 100 MHz.
-Timing and routing are signed off; board output and cycle neutrality remain to
-be checked before accepting Round 4R as the performance baseline.
-
-This README is also copied to SD as RUNINFO.TXT. Existing B/C/D/Q validation
-directories are not used or modified. No local backups directory is created.
+Implementation: routing errors=0, WNS=+0.252 ns, WHS=+0.010 ns at 100 MHz.
+Placed resources: logic LUT=219686, total LUT=236675, FF=192017,
+BRAM tile=203.5, DSP=1298, URAM=28. Post-route phys-opt did not modify the
+netlist. XSA, exported platform XSA and embedded bitstream hashes agree.
+NPU control=0xA0000000; RTL counter=0xA0010000. The stage-valid and all three
+Conv-state ports are connected to the counter in the exported hardware.
+SD root now contains BOOT.BIN, P2G.BIN and I2G.BIN, with O2G.BIN absent.
+Old H256 root test files were removed; validation folders B/C/D/Q were preserved.
+ELF buffers: input=0x28440, output=0x36540, param=0x44640; aligned and nonoverlapping.
+Board execution and output-correctness/performance gates remain pending.

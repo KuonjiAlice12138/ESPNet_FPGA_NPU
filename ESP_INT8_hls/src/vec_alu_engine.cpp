@@ -176,14 +176,10 @@ static u8_t vec_tensor_lanes(u16_t remaining_c) {
   return static_cast<u8_t>((rem > static_cast<unsigned>(TM)) ? TM : rem);
 }
 
-static u16_t vec_tensor_phys_c(const tensor_desc_t& desc) {
-#pragma HLS INLINE
-  return (desc.reserved0.to_uint() == 0U) ? desc.c : desc.reserved0;
-}
 
 static bool vec_can_use_aligned_full_tile(const tensor_desc_t& desc, u16_t c_begin) {
 #pragma HLS INLINE
-  const unsigned phys_c = vec_tensor_phys_c(desc).to_uint();
+  const unsigned phys_c = tensor_phys_c(desc).to_uint();
   const unsigned start_c = desc.reserved1.to_uint() + c_begin.to_uint();
   const unsigned base_start = desc.base_offset.to_uint() + start_c;
   return phys_c >= static_cast<unsigned>(AXI_WORD_BYTES) &&
@@ -449,7 +445,7 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
   const int h_count = static_cast<int>(desc.in_h.to_uint());
   const int w_count = static_cast<int>(desc.in_w.to_uint());
   const unsigned valid_c_u = desc.valid_c.to_uint();
-  const unsigned row_bytes_u = static_cast<unsigned>(desc.in_w.to_uint()) * valid_c_u;
+  const unsigned row_bytes_u = tensor_row_stride_bytes(dst).to_uint();
   const int row_word_count = static_cast<int>(row_bytes_u / static_cast<unsigned>(AXI_WORD_BYTES));
   const int c_blocks = static_cast<int>((valid_c_u + static_cast<unsigned>(TM) - 1U) /
                                         static_cast<unsigned>(TM));
@@ -585,6 +581,23 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
     }
 
     if (row_contiguous) {
+      // Complete the one padded row without reading or overwriting a neighbor.
+      if (packed_carry_bytes != 0U) {
+        vec_set_compact_group(packed_groups, packed_group_slot,
+                              static_cast<ap_uint<32>>(packed_carry));
+        ++packed_group_slot;
+        packed_carry_bytes = 0U;
+      }
+      if (packed_group_slot != 0U) {
+        for (int slot = 0; slot < TM / 4; ++slot) {
+#pragma HLS UNROLL
+          if (static_cast<unsigned>(slot) >= packed_group_slot) {
+            vec_set_compact_group(packed_groups, slot, 0);
+          }
+        }
+        s_shared_row_contig_words[packed_word_idx++] = vec_pack_compact_groups(packed_groups);
+        packed_group_slot = 0U;
+      }
       if (packed_carry_bytes != 0U || packed_group_slot != 0U ||
           packed_word_idx != static_cast<unsigned>(row_word_count)) {
         return ERR_BANK_OVERFLOW;

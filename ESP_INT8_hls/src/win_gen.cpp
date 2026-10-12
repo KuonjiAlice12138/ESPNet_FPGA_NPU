@@ -69,14 +69,10 @@ static act_vec_t read_aligned_or_zero(const tensor_desc_t& desc,
     return ok ? packed : act_vec_t(0);
 }
 
-static u16_t win_desc_phys_c(const tensor_desc_t& desc) {
-#pragma HLS INLINE
-    return (desc.reserved0.to_uint() == 0U) ? desc.c : desc.reserved0;
-}
 
 static bool win_can_read_aligned_1x1(const tensor_desc_t& desc, u16_t c_begin) {
 #pragma HLS INLINE
-    const unsigned phys_c = win_desc_phys_c(desc).to_uint();
+    const unsigned phys_c = tensor_phys_c(desc).to_uint();
     const unsigned start_c = desc.reserved1.to_uint() + c_begin.to_uint();
     const unsigned base_start = desc.base_offset.to_uint() + start_c;
     return phys_c >= static_cast<unsigned>(AXI_WORD_BYTES) &&
@@ -89,11 +85,7 @@ struct narrow_3x3_window_t {
     act_vec_t spatial[9];
 };
 
-// One physical owner serves two mutually exclusive compiled modes:
-// - fallback narrow schedules use [0, 64) as the horizontal column ring;
-// - row-reuse schedules use [0, 96) as packed physical source-row words.
-// Four 64-bit stripes preserve one 256-bit read/write per cycle while allowing
-// a row-reuse pixel to read up to three adjacent stripes from single-port RAMs.
+// One striped column-ring owner serves the compiled narrow schedules.
 constexpr int WINGEN_NARROW_WORD_LANES = AXI_WORD_BYTES / 8;
 static u64_t
     s_narrow_row_bank0[WINGEN_NARROW_WORD_LANES][WINGEN_NARROW_ROW_WORDS];
@@ -102,17 +94,6 @@ static u64_t
 static u64_t
     s_narrow_row_bank2[WINGEN_NARROW_WORD_LANES][WINGEN_NARROW_ROW_WORDS];
 
-static u32_t s_narrow_reuse_row_tag[3];
-static bool s_narrow_reuse_row_valid[3];
-static bool s_narrow_reuse_identity_valid = false;
-static u8_t s_narrow_reuse_bank_id = 0;
-static u32_t s_narrow_reuse_base_offset = 0;
-static u16_t s_narrow_reuse_width = 0;
-static u16_t s_narrow_reuse_phys_c = 0;
-static u16_t s_narrow_reuse_c_offset = 0;
-static u8_t s_narrow_reuse_mode = 0;
-static u8_t s_narrow_reuse_window_mode = 0;
-static u16_t s_narrow_reuse_last_out_row = 0;
 
 struct wide_3x3_cache_t {
     act_vec_t data[3][WINGEN_WIDE_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS];
@@ -158,7 +139,6 @@ struct narrow_paired_issue_plan_t {
 enum narrow_transfer_protocol_t : unsigned char {
     NARROW_TRANSFER_FULL_WINDOWS = 0,
     NARROW_TRANSFER_C12_S1_INCREMENTAL = 1,
-    NARROW_TRANSFER_C3_S2_REUSE_INCREMENTAL = 2,
 };
 
 static u32_t win_build_lane_mask(u8_t byte_count) {
@@ -218,10 +198,7 @@ struct window_row_cfg_t {
     u16_t loader_steady_run0;
     u16_t loader_steady_run1;
     u16_t loader_steady_run2;
-    u8_t row_reuse_mode;
-    u8_t packed_words_per_source_row;
     u8_t narrow_transfer_protocol;
-    u16_t out_row;
     u8_t narrow_valid_c;
     u8_t last_chunk_valid_c;
     u32_t narrow_lane_mask;
@@ -296,8 +273,6 @@ static u8_t select_narrow_transfer_protocol(const window_row_cfg_t& cfg) {
         (cfg.loader_steady_run0.to_uint() >> 8) & 0xFFU;
     if (cfg.mode.to_uint() ==
             static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12) &&
-        cfg.row_reuse_mode.to_uint() ==
-            static_cast<unsigned>(WINDOW_ROW_REUSE_NONE) &&
         cfg.cache_col_slots.to_uint() == 4U &&
         cfg.loader_warmup_new_cols.to_uint() == 4U &&
         cfg.loader_steady_new_cols.to_uint() == 2U &&
@@ -307,19 +282,6 @@ static u8_t select_narrow_transfer_protocol(const window_row_cfg_t& cfg) {
         cfg.loader_steady_phase0_cols.to_uint() == 0U) {
         return static_cast<u8_t>(
             static_cast<unsigned>(NARROW_TRANSFER_C12_S1_INCREMENTAL));
-    }
-    if (cfg.mode.to_uint() ==
-            static_cast<unsigned>(WIN_MODE_3X3_STAGED_C3) &&
-        cfg.row_reuse_mode.to_uint() ==
-            static_cast<unsigned>(WINDOW_ROW_REUSE_STRIDE2_KEEP1) &&
-        cfg.loader_warmup_new_cols.to_uint() == 5U &&
-        cfg.loader_steady_new_cols.to_uint() == 4U &&
-        warmup_run_count == 5U &&
-        steady_run_count == 4U &&
-        cfg.loader_warmup_phase0_cols.to_uint() == 3U &&
-        cfg.loader_steady_phase0_cols.to_uint() == 2U) {
-        return static_cast<u8_t>(
-            static_cast<unsigned>(NARROW_TRANSFER_C3_S2_REUSE_INCREMENTAL));
     }
     return static_cast<u8_t>(
         static_cast<unsigned>(NARROW_TRANSFER_FULL_WINDOWS));
@@ -466,15 +428,7 @@ static void configure_window_row(const tensor_desc_t& src_desc,
         sched.reserved[WINDOW_LOADER_STEADY_RUN_WORD + 1];
     cfg.loader_steady_run2 =
         sched.reserved[WINDOW_LOADER_STEADY_RUN_WORD + 2];
-    const unsigned row_reuse_word =
-        sched.reserved[WINDOW_LOADER_ROW_REUSE_WORD].to_uint();
-    cfg.row_reuse_mode = static_cast<u8_t>(
-        row_reuse_word & WINDOW_ROW_REUSE_MODE_MASK);
-    cfg.packed_words_per_source_row = static_cast<u8_t>(
-        (row_reuse_word >> WINDOW_ROW_REUSE_WORDS_SHIFT) &
-        WINDOW_ROW_REUSE_WORDS_MASK);
     cfg.narrow_transfer_protocol = select_narrow_transfer_protocol(cfg);
-    cfg.out_row = out_row;
     const unsigned input_channels = sched.in_c.to_uint();
     unsigned narrow_valid_c = input_channels;
     if (narrow_valid_c == 0U ||
@@ -598,202 +552,6 @@ static void narrow_row_bank_write(unsigned bank,
         bank, word_index, static_cast<u64_t>(word.range(255, 192)));
 }
 
-static bool narrow_reuse_identity_matches(const window_row_cfg_t& cfg) {
-#pragma HLS INLINE
-    const unsigned out_row = cfg.out_row.to_uint();
-    const bool contiguous =
-        out_row == s_narrow_reuse_last_out_row.to_uint() + 1U;
-    return s_narrow_reuse_identity_valid &&
-           contiguous &&
-           s_narrow_reuse_bank_id == cfg.src_desc.bank_id &&
-           s_narrow_reuse_base_offset == cfg.src_desc.base_offset &&
-           s_narrow_reuse_width == cfg.src_desc.w &&
-           s_narrow_reuse_phys_c == win_desc_phys_c(cfg.src_desc) &&
-           s_narrow_reuse_c_offset == cfg.src_desc.reserved1 &&
-           s_narrow_reuse_mode == cfg.row_reuse_mode &&
-           s_narrow_reuse_window_mode == cfg.mode;
-}
-
-static void narrow_reuse_update_identity(const window_row_cfg_t& cfg) {
-#pragma HLS INLINE
-    s_narrow_reuse_identity_valid = true;
-    s_narrow_reuse_bank_id = cfg.src_desc.bank_id;
-    s_narrow_reuse_base_offset = cfg.src_desc.base_offset;
-    s_narrow_reuse_width = cfg.src_desc.w;
-    s_narrow_reuse_phys_c = win_desc_phys_c(cfg.src_desc);
-    s_narrow_reuse_c_offset = cfg.src_desc.reserved1;
-    s_narrow_reuse_mode = cfg.row_reuse_mode;
-    s_narrow_reuse_window_mode = cfg.mode;
-    s_narrow_reuse_last_out_row = cfg.out_row;
-}
-
-static void narrow_reuse_load_source_row(const window_row_cfg_t& cfg,
-                                         unsigned bank,
-                                         u32_t row_base) {
-#pragma HLS INLINE off
-    const int packed_words =
-        static_cast<int>(cfg.packed_words_per_source_row.to_uint());
-    for (int word_index = 0;
-         word_index < WINGEN_NARROW_ROW_WORDS;
-         ++word_index) {
-#pragma HLS PIPELINE II=1
-        if (word_index >= packed_words) {
-            break;
-        }
-        act_vec_t word = 0;
-        on_chip_memory_read_aligned_tensor_word(
-            cfg.src_desc,
-            row_base +
-                static_cast<u32_t>(word_index * AXI_WORD_BYTES),
-            word);
-        narrow_row_bank_write(
-            bank, static_cast<unsigned>(word_index), word);
-    }
-}
-
-static void narrow_reuse_prepare_rows(const window_row_cfg_t& cfg,
-                                      u8_t logical_bank[3]) {
-#pragma HLS INLINE off
-#pragma HLS ARRAY_PARTITION variable=logical_bank complete dim=1
-    bool used[3];
-#pragma HLS ARRAY_PARTITION variable=used complete dim=1
-    if (!narrow_reuse_identity_matches(cfg)) {
-        for (int bank = 0; bank < 3; ++bank) {
-#pragma HLS UNROLL
-            s_narrow_reuse_row_valid[bank] = false;
-        }
-    }
-    for (int bank = 0; bank < 3; ++bank) {
-#pragma HLS UNROLL
-        used[bank] = false;
-    }
-    for (int kh = 0; kh < 3; ++kh) {
-#pragma HLS UNROLL
-        logical_bank[kh] = static_cast<u8_t>(3);
-    }
-
-    for (int kh = 0; kh < 3; ++kh) {
-#pragma HLS PIPELINE off
-        if (!window_cfg_row_valid(cfg, kh)) {
-            continue;
-        }
-        const u32_t required_tag = window_cfg_row_base(cfg, kh);
-        for (int bank = 0; bank < 3; ++bank) {
-#pragma HLS UNROLL
-            if (!used[bank] &&
-                s_narrow_reuse_row_valid[bank] &&
-                s_narrow_reuse_row_tag[bank] == required_tag) {
-                logical_bank[kh] = static_cast<u8_t>(bank);
-                used[bank] = true;
-            }
-        }
-    }
-
-    for (int kh = 0; kh < 3; ++kh) {
-#pragma HLS PIPELINE off
-        if (!window_cfg_row_valid(cfg, kh) ||
-            logical_bank[kh].to_uint() < 3U) {
-            continue;
-        }
-        unsigned selected = 3U;
-        for (int bank = 0; bank < 3; ++bank) {
-#pragma HLS UNROLL
-            if (!used[bank] && selected == 3U) {
-                selected = static_cast<unsigned>(bank);
-            }
-        }
-        if (selected >= 3U) {
-            continue;
-        }
-        used[selected] = true;
-        logical_bank[kh] = static_cast<u8_t>(selected);
-        const u32_t required_tag = window_cfg_row_base(cfg, kh);
-        narrow_reuse_load_source_row(cfg, selected, required_tag);
-        s_narrow_reuse_row_tag[selected] = required_tag;
-        s_narrow_reuse_row_valid[selected] = true;
-    }
-    narrow_reuse_update_identity(cfg);
-}
-
-static bool read_packed_tile_from_reuse_row(
-    const window_row_cfg_t& cfg,
-    unsigned bank,
-    bool row_valid,
-    i32_t input_col,
-    act_vec_t& packed) {
-#pragma HLS INLINE
-    packed = 0;
-    if (!row_valid ||
-        bank >= 3U ||
-        input_col < 0 ||
-        input_col >= static_cast<i32_t>(cfg.src_desc.w)) {
-        return true;
-    }
-    const unsigned lane_count = cfg.narrow_valid_c.to_uint();
-    const unsigned byte_offset =
-        static_cast<unsigned>(input_col.to_int()) *
-        win_desc_phys_c(cfg.src_desc).to_uint();
-    const unsigned packed_words =
-        cfg.packed_words_per_source_row.to_uint();
-    const unsigned packed_bytes =
-        packed_words * static_cast<unsigned>(AXI_WORD_BYTES);
-    if (lane_count == 0U ||
-        byte_offset + lane_count > packed_bytes) {
-        return false;
-    }
-
-    const unsigned word_index =
-        byte_offset / static_cast<unsigned>(AXI_WORD_BYTES);
-    const unsigned stripe =
-        (byte_offset / 8U) &
-        static_cast<unsigned>(WINGEN_NARROW_WORD_LANES - 1);
-    const unsigned byte_in_stripe = byte_offset & 7U;
-    const unsigned next_word_index =
-        (word_index + 1U < packed_words) ? word_index + 1U : word_index;
-
-    // Any C3/C12 pixel occupies at most three consecutive 64-bit stripes.
-    // Read each physical stripe once, selecting the next word only after wrap.
-    const u64_t lane0 = narrow_row_bank_lane_read<0>(
-        bank, (stripe > 0U) ? next_word_index : word_index);
-    const u64_t lane1 = narrow_row_bank_lane_read<1>(
-        bank, (stripe > 1U) ? next_word_index : word_index);
-    const u64_t lane2 = narrow_row_bank_lane_read<2>(
-        bank, (stripe > 2U) ? next_word_index : word_index);
-    const u64_t lane3 =
-        narrow_row_bank_lane_read<3>(bank, word_index);
-
-    ap_uint<256> rotated = 0;
-    switch (stripe) {
-        case 0:
-            rotated.range(63, 0) = lane0;
-            rotated.range(127, 64) = lane1;
-            rotated.range(191, 128) = lane2;
-            rotated.range(255, 192) = lane3;
-            break;
-        case 1:
-            rotated.range(63, 0) = lane1;
-            rotated.range(127, 64) = lane2;
-            rotated.range(191, 128) = lane3;
-            rotated.range(255, 192) = lane0;
-            break;
-        case 2:
-            rotated.range(63, 0) = lane2;
-            rotated.range(127, 64) = lane3;
-            rotated.range(191, 128) = lane0;
-            rotated.range(255, 192) = lane1;
-            break;
-        default:
-            rotated.range(63, 0) = lane3;
-            rotated.range(127, 64) = lane0;
-            rotated.range(191, 128) = lane1;
-            rotated.range(255, 192) = lane2;
-            break;
-    }
-    packed = static_cast<act_vec_t>(rotated >> (byte_in_stripe * 8U));
-    packed = win_apply_lane_mask(packed, cfg.narrow_lane_mask);
-    return true;
-}
-
 static bool read_aligned_word_cached(const tensor_desc_t& src_desc,
                                      packed_word_cursor_t& cursor,
                                      u32_t word_offset,
@@ -852,7 +610,7 @@ static bool read_packed_tile_from_row_cached(const tensor_desc_t& src_desc,
 
     const u32_t start_offset =
         row_base + static_cast<u32_t>(input_col) *
-                       static_cast<u32_t>(win_desc_phys_c(src_desc)) +
+                       static_cast<u32_t>(tensor_phys_c(src_desc)) +
         static_cast<u32_t>(c_begin);
     const u32_t word0_offset =
         start_offset & static_cast<u32_t>(~(AXI_WORD_BYTES - 1));
@@ -950,12 +708,6 @@ static bool window_cfg_is_narrow_paired(const window_row_cfg_t& cfg) {
                static_cast<unsigned>(WIN_LOADER_3X3_NARROW) &&
            (cfg.flags.to_uint() &
             static_cast<unsigned>(WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)) != 0U;
-}
-
-static bool window_cfg_uses_row_reuse(const window_row_cfg_t& cfg) {
-#pragma HLS INLINE
-    return cfg.row_reuse_mode.to_uint() !=
-           static_cast<unsigned>(WINDOW_ROW_REUSE_NONE);
 }
 
 static u16_t narrow_fallback_run_word(const narrow_fallback_cfg_t& cfg,
@@ -1094,40 +846,6 @@ static void window_loader_emit_narrow_cached_window(
     }
 }
 
-static void window_loader_emit_narrow_reuse_window(
-    const window_row_cfg_t& cfg,
-    const u8_t logical_bank[3],
-    int pixel,
-    hls::stream<window_load_word_t>& load_word_stream) {
-#pragma HLS INLINE
-#pragma HLS ARRAY_PARTITION variable=logical_bank complete dim=1
-    const int stride = static_cast<int>(cfg.stride.to_uint());
-    const int dilation = static_cast<int>(cfg.dilation.to_uint());
-    const int padding = static_cast<int>(cfg.padding.to_uint());
-    for (int kh = 0; kh < 3; ++kh) {
-#pragma HLS PIPELINE off
-        for (int kw = 0; kw < 3; ++kw) {
-#pragma HLS PIPELINE II=1
-            const i32_t input_col = static_cast<i32_t>(
-                pixel * stride - padding + kw * dilation);
-            act_vec_t word = 0;
-            read_packed_tile_from_reuse_row(
-                cfg,
-                logical_bank[kh].to_uint(),
-                window_cfg_row_valid(cfg, kh),
-                input_col,
-                word);
-            window_load_word_t token;
-            token.word = word;
-            token.slot = 0;
-            token.row = static_cast<u8_t>(kh);
-            token.chunk = static_cast<u8_t>(kw);
-            csim_count_narrow_transfer_word();
-            load_word_stream.write(token);
-        }
-    }
-}
-
 template <int COLUMN_COUNT>
 static void window_loader_emit_narrow_direct_run(
     const window_row_cfg_t& cfg,
@@ -1149,37 +867,6 @@ static void window_loader_emit_narrow_direct_run(
                 static_cast<u16_t>(0),
                 cfg.narrow_valid_c,
                 cfg.narrow_lane_mask,
-                word);
-            window_load_word_t token;
-            token.word = word;
-            token.slot = static_cast<u8_t>(offset);
-            token.row = static_cast<u8_t>(kh);
-            token.chunk = 0;
-            csim_count_narrow_transfer_word();
-            load_word_stream.write(token);
-        }
-    }
-}
-
-template <int COLUMN_COUNT>
-static void window_loader_emit_narrow_reuse_run(
-    const window_row_cfg_t& cfg,
-    const u8_t logical_bank[3],
-    i32_t start_col,
-    hls::stream<window_load_word_t>& load_word_stream) {
-#pragma HLS INLINE
-#pragma HLS ARRAY_PARTITION variable=logical_bank complete dim=1
-    for (int offset = 0; offset < COLUMN_COUNT; ++offset) {
-#pragma HLS PIPELINE off
-        const i32_t input_col = start_col + static_cast<i32_t>(offset);
-        for (int kh = 0; kh < 3; ++kh) {
-#pragma HLS PIPELINE II=1
-            act_vec_t word = 0;
-            read_packed_tile_from_reuse_row(
-                cfg,
-                logical_bank[kh].to_uint(),
-                window_cfg_row_valid(cfg, kh),
-                input_col,
                 word);
             window_load_word_t token;
             token.word = word;
@@ -1216,37 +903,6 @@ static void window_row_loader_narrow_incremental_c12(
         } else {
             window_loader_emit_narrow_direct_run<2>(
                 cfg, start_col, load_word_stream);
-        }
-    }
-}
-
-static void window_row_loader_narrow_incremental_c3_reuse(
-    const window_row_cfg_t& cfg,
-    hls::stream<window_load_word_t>& load_word_stream) {
-#pragma HLS INLINE off
-    u8_t logical_bank[3];
-#pragma HLS ARRAY_PARTITION variable=logical_bank complete dim=1
-    narrow_reuse_prepare_rows(cfg, logical_bank);
-    const int issue_count = window_issue_count(cfg);
-    const int stride = static_cast<int>(cfg.stride.to_uint());
-    const int padding = static_cast<int>(cfg.padding.to_uint());
-    for (int issue = 0; issue < MAX_FM_W; ++issue) {
-#pragma HLS PIPELINE off
-        if (issue >= issue_count) {
-            break;
-        }
-        const bool warmup = issue == 0;
-        const u16_t run_word =
-            warmup ? cfg.loader_warmup_run0 : cfg.loader_steady_run0;
-        const i32_t start_col = static_cast<i32_t>(
-            issue * 2 * stride - padding +
-            window_loader_run_start_delta(run_word));
-        if (warmup) {
-            window_loader_emit_narrow_reuse_run<5>(
-                cfg, logical_bank, start_col, load_word_stream);
-        } else {
-            window_loader_emit_narrow_reuse_run<4>(
-                cfg, logical_bank, start_col, load_word_stream);
         }
     }
 }
@@ -1376,32 +1032,6 @@ static void window_row_loader_narrow_unpaired(
     }
 }
 
-static void window_row_loader_narrow_reuse(
-    const window_row_cfg_t& cfg,
-    hls::stream<window_load_word_t>& load_word_stream) {
-#pragma HLS INLINE off
-    u8_t logical_bank[3];
-#pragma HLS ARRAY_PARTITION variable=logical_bank complete dim=1
-    narrow_reuse_prepare_rows(cfg, logical_bank);
-    const int issue_count = window_issue_count(cfg);
-    const bool odd_tail =
-        (cfg.flags.to_uint() &
-         static_cast<unsigned>(WINDOW_SCHED_FLAG_ODD_TAIL)) != 0U;
-    for (int issue = 0; issue < MAX_FM_W; ++issue) {
-        if (issue >= issue_count) {
-            break;
-        }
-        const bool tail_issue =
-            odd_tail && issue == issue_count - 1;
-        window_loader_emit_narrow_reuse_window(
-            cfg, logical_bank, issue * 2, load_word_stream);
-        if (!tail_issue) {
-            window_loader_emit_narrow_reuse_window(
-                cfg, logical_bank, issue * 2 + 1, load_word_stream);
-        }
-    }
-}
-
 static void window_row_loader(
     hls::stream<window_row_cfg_t>& loader_cfg_stream,
     hls::stream<window_column_meta_t>& column_meta_stream,
@@ -1422,19 +1052,9 @@ static void window_row_loader(
         static_cast<unsigned>(WIN_LOADER_3X3_NARROW)) {
         if (cfg.narrow_transfer_protocol.to_uint() ==
             static_cast<unsigned>(NARROW_TRANSFER_C12_S1_INCREMENTAL)) {
-            s_narrow_reuse_identity_valid = false;
             window_row_loader_narrow_incremental_c12(
                 cfg, load_word_stream);
-        } else if (cfg.narrow_transfer_protocol.to_uint() ==
-                   static_cast<unsigned>(
-                       NARROW_TRANSFER_C3_S2_REUSE_INCREMENTAL)) {
-            window_row_loader_narrow_incremental_c3_reuse(
-                cfg, load_word_stream);
-        } else if (window_cfg_uses_row_reuse(cfg)) {
-            window_row_loader_narrow_reuse(
-                cfg, load_word_stream);
         } else {
-            s_narrow_reuse_identity_valid = false;
             const narrow_fallback_cfg_t fallback_cfg =
                 make_narrow_fallback_cfg(cfg);
             if (window_cfg_is_narrow_paired(cfg)) {
@@ -1518,21 +1138,22 @@ static void copy_staged_cache_chunk_segment(
 }
 
 template <typename CacheT>
-static void build_staged_c3_word(
+static void build_staged_c1_word(
     const CacheT& cache,
     const u8_t slot_for_kw[3],
-    int,
+    int kt,
     act_vec_t& word) {
 #pragma HLS INLINE
-    copy_staged_cache_segment<0, 0, 0, 3>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<1, 0, 3, 3>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<2, 0, 6, 3>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<3, 0, 9, 3>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<4, 0, 12, 3>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<5, 0, 15, 3>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<6, 0, 18, 3>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<7, 0, 21, 3>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<8, 0, 24, 3>(cache, slot_for_kw, word);
+    copy_staged_cache_segment<0, 0, 0, 1>(cache, slot_for_kw, word);
+    copy_staged_cache_segment<1, 0, 1, 1>(cache, slot_for_kw, word);
+    copy_staged_cache_segment<2, 0, 2, 1>(cache, slot_for_kw, word);
+    copy_staged_cache_segment<3, 0, 3, 1>(cache, slot_for_kw, word);
+    copy_staged_cache_segment<4, 0, 4, 1>(cache, slot_for_kw, word);
+    copy_staged_cache_segment<5, 0, 5, 1>(cache, slot_for_kw, word);
+    copy_staged_cache_segment<6, 0, 6, 1>(cache, slot_for_kw, word);
+    copy_staged_cache_segment<7, 0, 7, 1>(cache, slot_for_kw, word);
+    copy_staged_cache_segment<8, 0, 8, 1>(cache, slot_for_kw, word);
+    (void)kt;
 }
 
 template <typename CacheT>
@@ -1568,7 +1189,7 @@ static void build_staged_c12_word(
 }
 
 template <typename CacheT>
-static void build_staged_c19_word(
+static void build_staged_c17_word(
     const CacheT& cache,
     const u8_t slot_for_kw[3],
     int kt,
@@ -1576,30 +1197,27 @@ static void build_staged_c19_word(
 #pragma HLS INLINE
     switch (kt) {
         case 0:
-            copy_staged_cache_segment<0, 0, 0, 19>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<1, 0, 19, 13>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<0, 0, 0, 17>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<1, 0, 17, 15>(cache, slot_for_kw, word);
             break;
         case 1:
-            copy_staged_cache_segment<1, 13, 0, 6>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<2, 0, 6, 19>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<3, 0, 25, 7>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<1, 15, 0, 2>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<2, 0, 2, 17>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<3, 0, 19, 13>(cache, slot_for_kw, word);
             break;
         case 2:
-            copy_staged_cache_segment<3, 7, 0, 12>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<4, 0, 12, 19>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<5, 0, 31, 1>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<3, 13, 0, 4>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<4, 0, 4, 17>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<5, 0, 21, 11>(cache, slot_for_kw, word);
             break;
         case 3:
-            copy_staged_cache_segment<5, 1, 0, 18>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<6, 0, 18, 14>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<5, 11, 0, 6>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<6, 0, 6, 17>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<7, 0, 23, 9>(cache, slot_for_kw, word);
             break;
         case 4:
-            copy_staged_cache_segment<6, 14, 0, 5>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<7, 0, 5, 19>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<8, 0, 24, 8>(cache, slot_for_kw, word);
-            break;
-        case 5:
-            copy_staged_cache_segment<8, 8, 0, 11>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<7, 9, 0, 8>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<8, 0, 8, 17>(cache, slot_for_kw, word);
             break;
         default:
             break;
@@ -1884,7 +1502,7 @@ static void build_staged_c128_word(
 }
 
 template <typename CacheT>
-static void build_staged_c131_word(
+static void build_staged_c129_word(
     const CacheT& cache,
     const u8_t slot_for_kw[3],
     int kt,
@@ -1904,143 +1522,143 @@ static void build_staged_c131_word(
             copy_staged_cache_chunk_segment<0, 3, 0, 0, 32>(cache, slot_for_kw, word);
             break;
         case 4:
-            copy_staged_cache_chunk_segment<0, 4, 0, 0, 3>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<1, 0, 0, 3, 29>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<0, 4, 0, 0, 1>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<1, 0, 0, 1, 31>(cache, slot_for_kw, word);
             break;
         case 5:
-            copy_staged_cache_chunk_segment<1, 0, 29, 0, 3>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<1, 1, 0, 3, 29>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<1, 0, 31, 0, 1>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<1, 1, 0, 1, 31>(cache, slot_for_kw, word);
             break;
         case 6:
-            copy_staged_cache_chunk_segment<1, 1, 29, 0, 3>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<1, 2, 0, 3, 29>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<1, 1, 31, 0, 1>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<1, 2, 0, 1, 31>(cache, slot_for_kw, word);
             break;
         case 7:
-            copy_staged_cache_chunk_segment<1, 2, 29, 0, 3>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<1, 3, 0, 3, 29>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<1, 2, 31, 0, 1>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<1, 3, 0, 1, 31>(cache, slot_for_kw, word);
             break;
         case 8:
-            copy_staged_cache_chunk_segment<1, 3, 29, 0, 3>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<1, 4, 0, 3, 3>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<2, 0, 0, 6, 26>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<1, 3, 31, 0, 1>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<1, 4, 0, 1, 1>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<2, 0, 0, 2, 30>(cache, slot_for_kw, word);
             break;
         case 9:
-            copy_staged_cache_chunk_segment<2, 0, 26, 0, 6>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<2, 1, 0, 6, 26>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<2, 0, 30, 0, 2>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<2, 1, 0, 2, 30>(cache, slot_for_kw, word);
             break;
         case 10:
-            copy_staged_cache_chunk_segment<2, 1, 26, 0, 6>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<2, 2, 0, 6, 26>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<2, 1, 30, 0, 2>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<2, 2, 0, 2, 30>(cache, slot_for_kw, word);
             break;
         case 11:
-            copy_staged_cache_chunk_segment<2, 2, 26, 0, 6>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<2, 3, 0, 6, 26>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<2, 2, 30, 0, 2>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<2, 3, 0, 2, 30>(cache, slot_for_kw, word);
             break;
         case 12:
-            copy_staged_cache_chunk_segment<2, 3, 26, 0, 6>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<2, 4, 0, 6, 3>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<3, 0, 0, 9, 23>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<2, 3, 30, 0, 2>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<2, 4, 0, 2, 1>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<3, 0, 0, 3, 29>(cache, slot_for_kw, word);
             break;
         case 13:
-            copy_staged_cache_chunk_segment<3, 0, 23, 0, 9>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<3, 1, 0, 9, 23>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<3, 0, 29, 0, 3>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<3, 1, 0, 3, 29>(cache, slot_for_kw, word);
             break;
         case 14:
-            copy_staged_cache_chunk_segment<3, 1, 23, 0, 9>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<3, 2, 0, 9, 23>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<3, 1, 29, 0, 3>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<3, 2, 0, 3, 29>(cache, slot_for_kw, word);
             break;
         case 15:
-            copy_staged_cache_chunk_segment<3, 2, 23, 0, 9>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<3, 3, 0, 9, 23>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<3, 2, 29, 0, 3>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<3, 3, 0, 3, 29>(cache, slot_for_kw, word);
             break;
         case 16:
-            copy_staged_cache_chunk_segment<3, 3, 23, 0, 9>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<3, 4, 0, 9, 3>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<4, 0, 0, 12, 20>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<3, 3, 29, 0, 3>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<3, 4, 0, 3, 1>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<4, 0, 0, 4, 28>(cache, slot_for_kw, word);
             break;
         case 17:
-            copy_staged_cache_chunk_segment<4, 0, 20, 0, 12>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<4, 1, 0, 12, 20>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<4, 0, 28, 0, 4>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<4, 1, 0, 4, 28>(cache, slot_for_kw, word);
             break;
         case 18:
-            copy_staged_cache_chunk_segment<4, 1, 20, 0, 12>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<4, 2, 0, 12, 20>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<4, 1, 28, 0, 4>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<4, 2, 0, 4, 28>(cache, slot_for_kw, word);
             break;
         case 19:
-            copy_staged_cache_chunk_segment<4, 2, 20, 0, 12>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<4, 3, 0, 12, 20>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<4, 2, 28, 0, 4>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<4, 3, 0, 4, 28>(cache, slot_for_kw, word);
             break;
         case 20:
-            copy_staged_cache_chunk_segment<4, 3, 20, 0, 12>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<4, 4, 0, 12, 3>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<5, 0, 0, 15, 17>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<4, 3, 28, 0, 4>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<4, 4, 0, 4, 1>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<5, 0, 0, 5, 27>(cache, slot_for_kw, word);
             break;
         case 21:
-            copy_staged_cache_chunk_segment<5, 0, 17, 0, 15>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<5, 1, 0, 15, 17>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<5, 0, 27, 0, 5>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<5, 1, 0, 5, 27>(cache, slot_for_kw, word);
             break;
         case 22:
-            copy_staged_cache_chunk_segment<5, 1, 17, 0, 15>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<5, 2, 0, 15, 17>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<5, 1, 27, 0, 5>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<5, 2, 0, 5, 27>(cache, slot_for_kw, word);
             break;
         case 23:
-            copy_staged_cache_chunk_segment<5, 2, 17, 0, 15>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<5, 3, 0, 15, 17>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<5, 2, 27, 0, 5>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<5, 3, 0, 5, 27>(cache, slot_for_kw, word);
             break;
         case 24:
-            copy_staged_cache_chunk_segment<5, 3, 17, 0, 15>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<5, 4, 0, 15, 3>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<6, 0, 0, 18, 14>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<5, 3, 27, 0, 5>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<5, 4, 0, 5, 1>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<6, 0, 0, 6, 26>(cache, slot_for_kw, word);
             break;
         case 25:
-            copy_staged_cache_chunk_segment<6, 0, 14, 0, 18>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<6, 1, 0, 18, 14>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<6, 0, 26, 0, 6>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<6, 1, 0, 6, 26>(cache, slot_for_kw, word);
             break;
         case 26:
-            copy_staged_cache_chunk_segment<6, 1, 14, 0, 18>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<6, 2, 0, 18, 14>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<6, 1, 26, 0, 6>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<6, 2, 0, 6, 26>(cache, slot_for_kw, word);
             break;
         case 27:
-            copy_staged_cache_chunk_segment<6, 2, 14, 0, 18>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<6, 3, 0, 18, 14>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<6, 2, 26, 0, 6>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<6, 3, 0, 6, 26>(cache, slot_for_kw, word);
             break;
         case 28:
-            copy_staged_cache_chunk_segment<6, 3, 14, 0, 18>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<6, 4, 0, 18, 3>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<7, 0, 0, 21, 11>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<6, 3, 26, 0, 6>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<6, 4, 0, 6, 1>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<7, 0, 0, 7, 25>(cache, slot_for_kw, word);
             break;
         case 29:
-            copy_staged_cache_chunk_segment<7, 0, 11, 0, 21>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<7, 1, 0, 21, 11>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<7, 0, 25, 0, 7>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<7, 1, 0, 7, 25>(cache, slot_for_kw, word);
             break;
         case 30:
-            copy_staged_cache_chunk_segment<7, 1, 11, 0, 21>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<7, 2, 0, 21, 11>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<7, 1, 25, 0, 7>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<7, 2, 0, 7, 25>(cache, slot_for_kw, word);
             break;
         case 31:
-            copy_staged_cache_chunk_segment<7, 2, 11, 0, 21>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<7, 3, 0, 21, 11>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<7, 2, 25, 0, 7>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<7, 3, 0, 7, 25>(cache, slot_for_kw, word);
             break;
         case 32:
-            copy_staged_cache_chunk_segment<7, 3, 11, 0, 21>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<7, 4, 0, 21, 3>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<8, 0, 0, 24, 8>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<7, 3, 25, 0, 7>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<7, 4, 0, 7, 1>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<8, 0, 0, 8, 24>(cache, slot_for_kw, word);
             break;
         case 33:
-            copy_staged_cache_chunk_segment<8, 0, 8, 0, 24>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<8, 1, 0, 24, 8>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<8, 0, 24, 0, 8>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<8, 1, 0, 8, 24>(cache, slot_for_kw, word);
             break;
         case 34:
-            copy_staged_cache_chunk_segment<8, 1, 8, 0, 24>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<8, 2, 0, 24, 8>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<8, 1, 24, 0, 8>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<8, 2, 0, 8, 24>(cache, slot_for_kw, word);
             break;
         case 35:
-            copy_staged_cache_chunk_segment<8, 2, 8, 0, 24>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<8, 3, 0, 24, 8>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<8, 2, 24, 0, 8>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<8, 3, 0, 8, 24>(cache, slot_for_kw, word);
             break;
         case 36:
-            copy_staged_cache_chunk_segment<8, 3, 8, 0, 24>(cache, slot_for_kw, word);
-            copy_staged_cache_chunk_segment<8, 4, 0, 24, 3>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<8, 3, 24, 0, 8>(cache, slot_for_kw, word);
+            copy_staged_cache_chunk_segment<8, 4, 0, 8, 1>(cache, slot_for_kw, word);
             break;
         default:
             break;
@@ -2053,11 +1671,11 @@ static void emit_narrow_words_for_mode(
     const u8_t slot_for_kw[3],
     hls::stream<act_vec_t>& act_stream) {
 #pragma HLS INLINE off
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C3)) {
+    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C1)) {
         for (int kt = 0; kt < 1; ++kt) {
 #pragma HLS PIPELINE II=1
             act_vec_t word = 0;
-            build_staged_c3_word(window, slot_for_kw, kt, word);
+            build_staged_c1_word(window, slot_for_kw, kt, word);
             act_stream.write(word);
         }
         return;
@@ -2071,11 +1689,11 @@ static void emit_narrow_words_for_mode(
         }
         return;
     }
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C19)) {
-        for (int kt = 0; kt < 6; ++kt) {
+    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C17)) {
+        for (int kt = 0; kt < 5; ++kt) {
 #pragma HLS PIPELINE II=1
             act_vec_t word = 0;
-            build_staged_c19_word(window, slot_for_kw, kt, word);
+            build_staged_c17_word(window, slot_for_kw, kt, word);
             act_stream.write(word);
         }
         return;
@@ -2100,11 +1718,11 @@ static void emit_narrow_word_pair_for_mode(
     hls::stream<act_vec_t>& act_stream0,
     hls::stream<act_vec_t>& act_stream1) {
 #pragma HLS INLINE off
-    const int k_tiles = (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C3))
+    const int k_tiles = (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C1))
                             ? 1
                             : (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12))
                                   ? 4
-                                  : (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C19)) ? 6 : 8;
+                                  : (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C17)) ? 5 : 8;
     for (int kt = 0; kt < 8; ++kt) {
 #pragma HLS PIPELINE II=1
         if (kt >= k_tiles) {
@@ -2112,15 +1730,15 @@ static void emit_narrow_word_pair_for_mode(
         }
         act_vec_t word0 = 0;
         act_vec_t word1 = 0;
-        if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C3)) {
-            build_staged_c3_word(window0, slot_for_kw0, kt, word0);
-            build_staged_c3_word(window1, slot_for_kw1, kt, word1);
+        if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C1)) {
+            build_staged_c1_word(window0, slot_for_kw0, kt, word0);
+            build_staged_c1_word(window1, slot_for_kw1, kt, word1);
         } else if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12)) {
             build_staged_c12_word(window0, slot_for_kw0, kt, word0);
             build_staged_c12_word(window1, slot_for_kw1, kt, word1);
-        } else if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C19)) {
-            build_staged_c19_word(window0, slot_for_kw0, kt, word0);
-            build_staged_c19_word(window1, slot_for_kw1, kt, word1);
+        } else if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C17)) {
+            build_staged_c17_word(window0, slot_for_kw0, kt, word0);
+            build_staged_c17_word(window1, slot_for_kw1, kt, word1);
         } else {
             build_staged_c25_word(window0, slot_for_kw0, kt, word0);
             build_staged_c25_word(window1, slot_for_kw1, kt, word1);
@@ -2160,10 +1778,10 @@ static void emit_wide_words_for_mode(
         }
         return;
     }
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C131)) {
+    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C129)) {
         for (int kt = 0; kt < 37; ++kt) {
             act_vec_t word = 0;
-            build_staged_c131_word(cache, slot_for_kw, kt, word);
+            build_staged_c129_word(cache, slot_for_kw, kt, word);
             act_stream.write(word);
         }
         return;
@@ -2196,7 +1814,6 @@ struct narrow_incremental_cache_t {
     narrow_incremental_column_t col1;
     narrow_incremental_column_t col2;
     narrow_incremental_column_t col3;
-    narrow_incremental_column_t col4;
 };
 
 static void window_assembler_read_incremental_column(
@@ -2260,37 +1877,6 @@ static void window_assembler_consume_c12_incremental(
     }
 }
 
-static void window_assembler_consume_c3_reuse_incremental(
-    int issue,
-    bool has_second_window,
-    hls::stream<window_load_word_t>& load_word_stream,
-    narrow_incremental_cache_t& cache,
-    narrow_3x3_window_t& window0,
-    narrow_3x3_window_t& window1) {
-#pragma HLS INLINE
-    if (issue == 0) {
-        window_assembler_read_incremental_column(load_word_stream, cache.col0);
-        window_assembler_read_incremental_column(load_word_stream, cache.col1);
-        window_assembler_read_incremental_column(load_word_stream, cache.col2);
-        window_assembler_read_incremental_column(load_word_stream, cache.col3);
-        window_assembler_read_incremental_column(load_word_stream, cache.col4);
-    } else {
-        cache.col0 = cache.col4;
-        window_assembler_read_incremental_column(load_word_stream, cache.col1);
-        window_assembler_read_incremental_column(load_word_stream, cache.col2);
-        window_assembler_read_incremental_column(load_word_stream, cache.col3);
-        window_assembler_read_incremental_column(load_word_stream, cache.col4);
-    }
-    window_assembler_set_narrow_column<0>(window0, cache.col0);
-    window_assembler_set_narrow_column<1>(window0, cache.col1);
-    window_assembler_set_narrow_column<2>(window0, cache.col2);
-    if (has_second_window) {
-        window_assembler_set_narrow_column<0>(window1, cache.col2);
-        window_assembler_set_narrow_column<1>(window1, cache.col3);
-        window_assembler_set_narrow_column<2>(window1, cache.col4);
-    }
-}
-
 static void window_row_assembler_read_narrow_window(
     hls::stream<window_load_word_t>& load_word_stream,
     narrow_3x3_window_t& window) {
@@ -2347,16 +1933,6 @@ static void window_row_assembler(
                 static_cast<unsigned>(
                     NARROW_TRANSFER_C12_S1_INCREMENTAL)) {
                 window_assembler_consume_c12_incremental(
-                    issue,
-                    has_second_window,
-                    load_word_stream,
-                    incremental_cache,
-                    window0,
-                    window1);
-            } else if (cfg.narrow_transfer_protocol.to_uint() ==
-                       static_cast<unsigned>(
-                           NARROW_TRANSFER_C3_S2_REUSE_INCREMENTAL)) {
-                window_assembler_consume_c3_reuse_incremental(
                     issue,
                     has_second_window,
                     load_word_stream,

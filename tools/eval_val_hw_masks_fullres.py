@@ -24,7 +24,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from eval_hw_constrained_qat import add_espnet, remap_target  # noqa: E402
+from eval_hw_constrained_qat import add_espnet  # noqa: E402
 from geometry_contract import (  # noqa: E402
     DEFAULT_GEOMETRY,
     LEGACY_GEOMETRY,
@@ -63,7 +63,14 @@ def build_fullres_val_dataset(
     espnet_dir: Path,
     cached_data_file: Path,
     geometry: DeploymentGeometry = LEGACY_GEOMETRY,
+    preprocessing: dict | None = None,
+    profile: str = "binary2",
 ):
+    if geometry.input_channels == 1:
+        from export_val_hw_dataset import build_artifact_val_loader
+        return build_artifact_val_loader(
+            espnet_dir, cached_data_file, geometry, preprocessing or {}, 1, 0, profile, 1
+        ).dataset
     add_espnet(espnet_dir)
     import DataSet as myDataLoader
     import Transforms as myTransforms
@@ -162,11 +169,15 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         param_audit = json.loads(Path(args.param_audit).read_text(encoding="utf-8"))
     fallback_geometry = DeploymentGeometry(args.height, args.width, args.target_scale)
     geometry = load_eval_geometry(sd_manifest, param_audit, fallback=fallback_geometry)
+    preprocessing = (sd_manifest or param_audit or {}).get("preprocessing", {})
+    profile = "binary2" if args.classes == 2 else "cityscapes20"
     expected_bytes = geometry.output_mask_bytes
     dataset = build_fullres_val_dataset(
         Path(args.espnet_dir),
         Path(args.cached_data_file),
         geometry,
+        preprocessing,
+        profile,
     )
     metric = iouEval(args.classes)
     missing: list[str] = []
@@ -204,7 +215,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             )
 
         _inputs, target, _name = dataset[index]
-        target = remap_target(target.unsqueeze(0)).squeeze(0)
+        if geometry.input_channels != 1:
+            from export_val_hw_dataset import map_target_for_profile
+            target = map_target_for_profile(target, profile)
         pred = torch.from_numpy(load_mask(out_path, geometry)).long()
         metric.addBatch(pred, target)
         processed += 1

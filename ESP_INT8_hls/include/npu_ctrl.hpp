@@ -151,8 +151,6 @@ error_code_t pool_engine_exec(const npu_issue_t& issue,
 void main_ctrl_set_csim_last_uop(unsigned logical_uop);
 void main_ctrl_set_csim_last_error(error_code_t err);
 bool main_ctrl_csim_stop_before_logical_uop(unsigned logical_uop);
-bool main_ctrl_csim_dump_tensor_set_pre(unsigned logical_uop);
-bool main_ctrl_csim_dump_tensor_set_post(unsigned logical_uop);
 
 } // namespace esp_int8
 

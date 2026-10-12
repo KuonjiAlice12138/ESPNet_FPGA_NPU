@@ -19,7 +19,7 @@ import shutil
 import struct
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -70,6 +70,12 @@ WIN_MODE_3X3_STAGED_C131 = 8
 WIN_MODE_3X3_STAGED_C28 = 9
 WIN_MODE_3X3_STAGED_C64 = 10
 WIN_MODE_3X3_STAGED_C128 = 11
+WIN_MODE_3X3_STAGED_C1 = 12
+WIN_MODE_3X3_STAGED_C17 = 13
+WIN_MODE_3X3_STAGED_C129 = 14
+
+TENSOR_ROW_ALIGN32 = 0x8000
+TENSOR_PHYS_C_MASK = 0x7FFF
 
 WIN_LOADER_DIRECT_1X1 = 0
 WIN_LOADER_3X3_NARROW = 1
@@ -104,6 +110,7 @@ STORE_LAYOUT_C16_INTO_C19 = 6
 STORE_LAYOUT_ALIGNED_TILE_COPY = 7
 STORE_LAYOUT_NARROW_FIXED = 8
 STORE_LAYOUT_COMPACT_C19 = 9
+STORE_LAYOUT_COMPACT_C17 = 11
 STORE_LAYOUT_PREFIX_ZERO_PAD = 10
 STORE_LAYOUT_COLD_RMW_FALLBACK = 15
 
@@ -118,6 +125,7 @@ STORE_LAYOUT_NAMES = {
     STORE_LAYOUT_ALIGNED_TILE_COPY: "ALIGNED_TILE_COPY",
     STORE_LAYOUT_NARROW_FIXED: "NARROW_FIXED",
     STORE_LAYOUT_COMPACT_C19: "COMPACT_C19",
+    STORE_LAYOUT_COMPACT_C17: "COMPACT_C17",
     STORE_LAYOUT_PREFIX_ZERO_PAD: "PREFIX_ZERO_PAD",
     STORE_LAYOUT_COLD_RMW_FALLBACK: "COLD_RMW_FALLBACK",
 }
@@ -129,6 +137,7 @@ def compact_layout_phys_c(layout: int) -> int:
         STORE_LAYOUT_COMPACT_C12: 12,
         STORE_LAYOUT_COMPACT_C16: 16,
         STORE_LAYOUT_COMPACT_C19: 19,
+        STORE_LAYOUT_COMPACT_C17: 17,
         STORE_LAYOUT_COMPACT_C25: 25,
         STORE_LAYOUT_COMPACT_C28: 28,
     }.get(int(layout), 0)
@@ -223,19 +232,22 @@ def build_memory_layout(geometry: DeploymentGeometry = DEFAULT_GEOMETRY) -> Memo
     h2, w2 = geometry.input_height // 4, geometry.input_width // 4
     h3, w3 = geometry.logits_height, geometry.logits_width
 
-    primary_bytes = h2 * w2 * 131
-    residual_bytes = max(h1 * w1 * 19, h2 * w2 * 64, h3 * w3 * 128)
+    channels = geometry.input_channels
+    padded = channels == 1
+    row_bytes = lambda w, c: _align_up(w * c, 32) if padded else w * c
+    primary_bytes = h2 * row_bytes(w2, 128 + channels)
+    residual_bytes = max(h1 * row_bytes(w1, 16 + channels), h2 * w2 * 64, h3 * w3 * 128)
     l2_block5_bytes = h2 * w2 * 64
     l3_block5_bytes = h3 * w3 * 128
     block5_base = h2 * w2 * 64
     residual_base = _align_up(primary_bytes, 0x8000)
     c1_scratch_base = _align_up(residual_base + residual_bytes, 0x8000)
     l2_scratch_slot_bytes = h2 * w2 * 16
-    l3_scratch_slot_bytes = h3 * w3 * 25
+    l3_scratch_slot_bytes = h3 * row_bytes(w3, 25)
     uram_bytes = _align_up(c1_scratch_base + l2_scratch_slot_bytes, 0x8000)
 
-    pool1_bytes = h1 * w1 * 3
-    pool2_bytes = h2 * w2 * 3
+    pool1_bytes = _align_up(h1 * w1 * channels, 32)
+    pool2_bytes = _align_up(h2 * w2 * channels, 32)
     pool1_base = uram_bytes
     pool_tmp_base = pool1_base + pool1_bytes
     fmbuf_bytes = pool_tmp_base + pool1_bytes
@@ -269,6 +281,7 @@ def build_memory_layout(geometry: DeploymentGeometry = DEFAULT_GEOMETRY) -> Memo
 
 
 DEFAULT_MEMORY_LAYOUT = build_memory_layout(DEFAULT_GEOMETRY)
+ACTIVE_GEOMETRY = DEFAULT_GEOMETRY
 FMBUF_BYTES = DEFAULT_MEMORY_LAYOUT.fmbuf_bytes
 FMBUF_URAM_BYTES = DEFAULT_MEMORY_LAYOUT.uram_bytes
 FMBUF_BRAM_BYTES = DEFAULT_MEMORY_LAYOUT.bram_bytes
@@ -337,7 +350,8 @@ def build_block5_feasibility_audit(geometry: DeploymentGeometry = DEFAULT_GEOMET
     l3_channels = block5_source_channels(BLOCK5_PATTERN_L3_C28_4C25)
 
     def stage(name: str, h: int, w: int, channels: Tuple[int, int, int, int, int], available: int) -> dict:
-        sizes = [int(h * w * c) for c in channels]
+        sizes = [int(h * (_align_up(w * c, 32) if geometry.input_channels == 1 else w * c))
+                 for c in channels]
         whole = sum(sizes)
         first4 = sum(sizes[:4])
         return {
@@ -380,6 +394,16 @@ class TensorDesc:
     c: int
     phys_c: int
     c_offset: int
+    row_align32: bool = False
+
+    @property
+    def row_stride_bytes(self) -> int:
+        raw = self.w * (self.phys_c or self.c)
+        return _align_up(raw, 32) if self.row_align32 else raw
+
+    @property
+    def packed_phys_c(self) -> int:
+        return self.phys_c | (TENSOR_ROW_ALIGN32 if self.row_align32 else 0)
 
 
 @dataclass(frozen=True)
@@ -604,26 +628,29 @@ def build_tensor_plan(
     h2, w2 = h0 // 4, w0 // 4
     ho, wo = geometry.logits_height, geometry.logits_width
     layout = build_memory_layout(geometry)
+    input_c = geometry.input_channels
+    b1_c, b2_c = 16 + input_c, 128 + input_c
+    row_pad = input_c == 1
     return [
-        TensorDesc(0, "T_INPUT", BANK_FMEM0, layout.primary_base, h0, w0, 3, 3, 0),
-        TensorDesc(1, "T_POOL1", BANK_FMEM0, layout.pool1_base, h1, w1, 3, 3, 0),
-        TensorDesc(2, "T_B1_CAT", BANK_FMEM1, layout.residual_base, h1, w1, 19, 19, 0),
-        TensorDesc(3, "T_B1_ACT", BANK_FMEM1, layout.residual_base, h1, w1, 19, 19, 0),
+        TensorDesc(0, "T_INPUT", BANK_FMEM0, layout.primary_base, h0, w0, input_c, input_c, 0),
+        TensorDesc(1, "T_POOL1", BANK_FMEM0, layout.pool1_base, h1, w1, input_c, input_c, 0),
+        TensorDesc(2, "T_B1_CAT", BANK_FMEM1, layout.residual_base, h1, w1, b1_c, b1_c, 0, row_pad),
+        TensorDesc(3, "T_B1_ACT", BANK_FMEM1, layout.residual_base, h1, w1, b1_c, b1_c, 0, row_pad),
         TensorDesc(4, "T_L20_CAT", BANK_FMEM0, layout.residual_base, h2, w2, 64, FMBUF_L20_PHYS_C, FMBUF_L20_C_OFFSET),
         TensorDesc(5, "T_L20_ACT", BANK_FMEM0, layout.residual_base, h2, w2, 64, FMBUF_L20_PHYS_C, FMBUF_L20_C_OFFSET),
         TensorDesc(6, "T_L2B0_CAT", BANK_FMEM0, layout.primary_base, h2, w2, 64, 64, 0),
         TensorDesc(7, "T_L2B0_ACT", BANK_FMEM0, layout.primary_base, h2, w2, 64, 64, 0),
-        TensorDesc(8, "T_POOL2", BANK_BRAM_SCR1, 0x000000, h2, w2, 3, 3, 0),
-        TensorDesc(9, "T_B2_CAT", BANK_FMEM0, layout.primary_base, h2, w2, 131, 131, 0),
-        TensorDesc(10, "T_B2_ACT", BANK_FMEM0, layout.primary_base, h2, w2, 131, 131, 0),
+        TensorDesc(8, "T_POOL2", BANK_BRAM_SCR1, 0x000000, h2, w2, input_c, input_c, 0),
+        TensorDesc(9, "T_B2_CAT", BANK_FMEM0, layout.primary_base, h2, w2, b2_c, b2_c, 0, row_pad),
+        TensorDesc(10, "T_B2_ACT", BANK_FMEM0, layout.primary_base, h2, w2, b2_c, b2_c, 0, row_pad),
         TensorDesc(11, "T_L30_CAT", BANK_FMEM1, layout.residual_base, ho, wo, 128, 128, 0),
         TensorDesc(12, "T_L30_ACT", BANK_FMEM1, layout.residual_base, ho, wo, 128, 128, 0),
         TensorDesc(13, "T_L3B0_CAT", BANK_FMEM0, layout.primary_base, ho, wo, 128, 256, 128),
         TensorDesc(14, "T_L3B0_ACT", BANK_FMEM0, layout.primary_base, ho, wo, 128, 256, 128),
         TensorDesc(15, "T_B3_CAT", BANK_FMEM0, layout.primary_base, ho, wo, 256, 256, 0),
         TensorDesc(16, "T_B3_ACT", BANK_FMEM0, layout.primary_base, ho, wo, 256, 256, 0),
-        TensorDesc(17, "T_OUT", BANK_FMEM0, layout.residual_base, ho, wo, classes, classes, 0),
-        TensorDesc(18, "T_POOL_TMP", BANK_BRAM_SCR0, 0x000000, h1, w1, 3, 3, 0),
+        TensorDesc(17, "T_OUT", BANK_FMEM0, layout.residual_base, ho, wo, classes, classes, 0, row_pad),
+        TensorDesc(18, "T_POOL_TMP", BANK_BRAM_SCR0, 0x000000, h1, w1, input_c, input_c, 0),
     ]
 
 
@@ -669,6 +696,8 @@ AFFINES: List[AffineSpec] = [
     AffineSpec(5, "level3_blocks.6", "level3_block_res_ff.0", "level3_blocks.6", 128),
     AffineSpec(6, "b3_bn", "b3_cat_ff", "b3_bn", 256),
 ]
+
+BASE_AFFINES = tuple(AFFINES)
 
 
 ADDS: List[AddSpec] = [
@@ -732,10 +761,44 @@ def activate_deployment_plans(
     geometry: DeploymentGeometry = DEFAULT_GEOMETRY,
 ) -> None:
     """Select one immutable compiler plan before section builders run."""
-    global TENSORS, CONVS, TENSOR_PLAN, CONV_PLAN, TENSOR_DESC_BY_ID
+    global TENSORS, CONVS, AFFINES, TENSOR_PLAN, CONV_PLAN, AFFINE_PLAN, TENSOR_DESC_BY_ID, ACTIVE_GEOMETRY
+    ACTIVE_GEOMETRY = geometry
+    layout = build_memory_layout(geometry)
+    globals().update({
+        "FMBUF_BYTES": layout.fmbuf_bytes,
+        "FMBUF_URAM_BYTES": layout.uram_bytes,
+        "FMBUF_BRAM_BYTES": layout.bram_bytes,
+        "FMBUF_PRIMARY_BASE": layout.primary_base,
+        "FMBUF_BLOCK5_BASE": layout.block5_base,
+        "FMBUF_B1_BASE": layout.residual_base,
+        "FMBUF_L20_BASE": layout.residual_base,
+        "FMBUF_L30_BASE": layout.residual_base,
+        "FMBUF_OUT_BASE": layout.residual_base,
+        "FMBUF_POOL1_BASE": layout.pool1_base,
+        "FMBUF_POOL_TMP_BASE": layout.pool_tmp_base,
+        "FMBUF_POOL2_ALIAS_BASE": layout.pool1_base,
+        "FMBUF_POOL2_ALIAS_BYTES": layout.pool2_bytes,
+        "FMBUF_L2_SCRATCH_BASE": layout.c1_scratch_base,
+        "FMBUF_L2_SCRATCH_SLOT_BYTES": layout.l2_scratch_slot_bytes,
+        "FMBUF_L30_SCRATCH_C1_BASE": layout.c1_scratch_base,
+        "FMBUF_L30_SCRATCH_LOW_BASE": layout.block5_base,
+        "FMBUF_L30_SCRATCH_SLOT_BYTES": layout.l3_scratch_slot_bytes,
+        "FMBUF_L3B0_SCRATCH_BASE": layout.c1_scratch_base,
+        "FMBUF_L3B0_SCRATCH_SLOT_BYTES": layout.l3_scratch_slot_bytes,
+        "FMBUF_L2_BLOCK5_BASE": layout.block5_base,
+        "FMBUF_L30_BLOCK5_BASE": layout.block5_base,
+        "FMBUF_L3B0_BLOCK5_BASE": layout.block5_base,
+        "BRAM_SCR0_BYTES": layout.pool1_bytes,
+        "BRAM_SCR1_BYTES": layout.pool2_bytes,
+    })
     TENSORS, CONVS = build_deployment_plans(classes, geometry=geometry)
+    AFFINES = [AffineSpec(s.param_id, s.name, s.input_scale, s.output_scale,
+                         16 + geometry.input_channels if s.param_id == 0 else
+                         128 + geometry.input_channels if s.param_id == 3 else s.channels)
+               for s in BASE_AFFINES]
     TENSOR_PLAN = TENSORS
     CONV_PLAN = CONVS
+    AFFINE_PLAN = AFFINES
     TENSOR_DESC_BY_ID = {desc.tensor_id: desc for desc in TENSORS}
 
 
@@ -745,6 +808,7 @@ class ArtifactDeploymentContract:
     class_count: int
     geometry: DeploymentGeometry
     ignore_metric_class: int | None
+    preprocessing: Mapping[str, object] | None = None
 
 
 def load_deployment_contract(artifact_dir: Path) -> ArtifactDeploymentContract:
@@ -761,6 +825,15 @@ def load_deployment_contract(artifact_dir: Path) -> ArtifactDeploymentContract:
         )
 
     geometry = geometry_from_manifest(manifest)
+    preprocessing = manifest.get("preprocessing", {})
+    if geometry.input_channels == 1:
+        if (geometry.input_height, geometry.input_width, class_count) != (240, 240, 2):
+            raise ValueError("C1 deployment is restricted to H240W240 binary2")
+        if (preprocessing.get("image_mode") != "gray" or
+                preprocessing.get("center_square_crop") is not True or
+                len(preprocessing.get("mean", [])) != 1 or
+                len(preprocessing.get("std", [])) != 1):
+            raise ValueError("C1 deployment requires the grayscale center-crop normalization contract")
     classifier = manifest.get("classifier", {})
     weight_shape = classifier.get("weight_shape")
     if weight_shape is not None and list(weight_shape) != [class_count, 256, 1, 1]:
@@ -780,6 +853,7 @@ def load_deployment_contract(artifact_dir: Path) -> ArtifactDeploymentContract:
         class_count=class_count,
         geometry=geometry,
         ignore_metric_class=deployment.get("ignore_metric_class"),
+        preprocessing=preprocessing,
     )
 
 
@@ -836,7 +910,7 @@ def pack_tensor_desc(desc: TensorDesc) -> bytes:
         "<BBHIHHHH",
         desc.bank_id,
         1,
-        desc.phys_c,
+        desc.packed_phys_c,
         desc.base_offset,
         desc.h,
         desc.w,
@@ -1262,6 +1336,7 @@ def scratch_desc_for_conv_store(tensor_id: int, producer: Uop, valid_c: int) -> 
         c=valid_c,
         phys_c=phys_c,
         c_offset=c_offset,
+        row_align32=ACTIVE_GEOMETRY.input_channels == 1,
     )
 
 
@@ -1293,6 +1368,10 @@ def store_layout_for(
 
     compact_full_row = c_offset == 0 and desc.c == valid_c and desc.phys_c == desc.c
     if compact_full_row:
+        if desc.row_align32:
+            layout = compact_layout_for_full_tensor(valid_c, out_w, row_align32=True)
+            if layout is not None:
+                return layout
         if valid_c == 2 and out_w % 16 == 0:
             return STORE_LAYOUT_COMPACT_C2
         if valid_c == 12 and out_w % 8 == 0:
@@ -1320,7 +1399,12 @@ def store_layout_for(
     )
 
 
-def compact_layout_for_full_tensor(valid_c: int, out_w: int) -> int | None:
+def compact_layout_for_full_tensor(valid_c: int, out_w: int, *, row_align32: bool = False) -> int | None:
+    if row_align32 and out_w > 0:
+        return {2: STORE_LAYOUT_COMPACT_C2, 12: STORE_LAYOUT_COMPACT_C12,
+                16: STORE_LAYOUT_COMPACT_C16, 17: STORE_LAYOUT_COMPACT_C17,
+                19: STORE_LAYOUT_COMPACT_C19, 25: STORE_LAYOUT_COMPACT_C25,
+                28: STORE_LAYOUT_COMPACT_C28}.get(valid_c)
     if valid_c == 2 and out_w % 16 == 0:
         return STORE_LAYOUT_COMPACT_C2
     if valid_c == 12 and out_w % 8 == 0:
@@ -1376,7 +1460,7 @@ def classify_rmw_store_layout(
                 "slice_is_exactly_one_aligned_32B_tile",
                 "rewrite_to_STORE_LAYOUT_ALIGNED_TILE_COPY",
             )
-        compact_layout = compact_layout_for_full_tensor(valid_c, out_w)
+        compact_layout = compact_layout_for_full_tensor(valid_c, out_w, row_align32=desc.row_align32)
         if (
             compact_layout is not None
             and c_offset == 0
@@ -1510,6 +1594,9 @@ def window_mode_for(in_c: int, kernel: int, aligned_1x1_source: bool = True) -> 
     if kernel != 3:
         raise ValueError(f"unsupported kernel size: {kernel}")
     staged_modes = {
+        1: WIN_MODE_3X3_STAGED_C1,
+        17: WIN_MODE_3X3_STAGED_C17,
+        129: WIN_MODE_3X3_STAGED_C129,
         3: WIN_MODE_3X3_STAGED_C3,
         12: WIN_MODE_3X3_STAGED_C12,
         19: WIN_MODE_3X3_STAGED_C19,
@@ -1541,6 +1628,8 @@ def window_mode_supports_pixel_parallel(mode: int) -> bool:
         WIN_MODE_3X3_STAGED_C12,
         WIN_MODE_3X3_STAGED_C19,
         WIN_MODE_3X3_STAGED_C25,
+        WIN_MODE_3X3_STAGED_C1,
+        WIN_MODE_3X3_STAGED_C17,
     )
 
 
@@ -2509,6 +2598,12 @@ def build_uops(
         stage_last(Uop(UOP_END)),
     ]
 
+    channel_map = {3: geometry.input_channels, 19: 16 + geometry.input_channels,
+                   131: 128 + geometry.input_channels}
+    uops = [replace(u, in_c=channel_map.get(u.in_c, u.in_c),
+                    out_c=channel_map.get(u.out_c, u.out_c),
+                    valid_c=channel_map.get(u.valid_c, u.valid_c)) for u in uops]
+
     if len(uops) != 75:
         raise AssertionError(f"Expected 75 uops, got {len(uops)}")
     return uops
@@ -3073,19 +3168,25 @@ def build_exec_plan_sections(
                 and _uop_is_store_of(uops[idx + 1], uop.dst)
                 and uops[idx + 1].dst == TID_INVALID
             )
+            cat_affine_fused = (
+                idx + 2 < len(uops)
+                and uops[idx + 1].opcode == UOP_STORE
+                and uops[idx + 1].dst == uop.dst
+                and uops[idx + 2].opcode == UOP_AFFINE
+                and uops[idx + 2].src0 == uop.dst
+                and uop.out_c + uops[idx + 1].valid_c == uops[idx + 2].valid_c
+                and uops[idx + 1].c_offset == uop.out_c
+            )
 
             row_consumer = RowConsumerDesc(
                 mode=ROW_CONSUMER_NONE,
                 store_dst_tensor=uop.dst,
                 store_c_offset=uop.c_offset,
                 valid_c=uop.valid_c,
-                # The terminal classifier store has no tensor destination and
-                # is consumed by the upsample output path.  Other default
-                # CONV descriptors retain their scratch/tensor layout until
-                # the adjacent consumer pattern is recognized below.
+                # Fused concat never materializes the partial CONV tensor.
                 reserved0=(
                     STORE_LAYOUT_NONE
-                    if terminal_output_store
+                    if terminal_output_store or cat_affine_fused
                     else store_layout_for(
                         dst_tensor=uop.dst,
                         producer=uop,
@@ -3095,15 +3196,7 @@ def build_exec_plan_sections(
                     )
                 ),
             )
-            if (
-                idx + 2 < len(uops)
-                and uops[idx + 1].opcode == UOP_STORE
-                and uops[idx + 1].dst == uop.dst
-                and uops[idx + 2].opcode == UOP_AFFINE
-                and uops[idx + 2].src0 == uop.dst
-                and uop.out_c + uops[idx + 1].valid_c == uops[idx + 2].valid_c
-                and uops[idx + 1].c_offset == uop.out_c
-            ):
+            if cat_affine_fused:
                 store = uops[idx + 1]
                 affine = uops[idx + 2]
                 layout = store_layout_for(
@@ -3373,7 +3466,7 @@ def build_exec_plan_sections(
             ):
                 affine = uops[idx + 3]
                 flags = affine.flags & ~FIXED_FLAG_CBLOCK_MAJOR
-                if affine.valid_c == 131:
+                if affine.valid_c == 128 + ACTIVE_GEOMETRY.input_channels:
                     flags |= FIXED_FLAG_ROW_CONTIGUOUS_STORE
                 fixed_id = len(fixed_exec_descs)
                 fixed_exec_descs.append(
@@ -3542,7 +3635,7 @@ def build_hw_frame_files(
     input_nchw = require_int8_array(golden_dir / "quant" / "input_int.npy")
     output_nchw = require_int8_array(golden_dir / "classifier" / "output_int.npy")
 
-    expected_input = (1, 3, geometry.input_height, geometry.input_width)
+    expected_input = (1, geometry.input_channels, geometry.input_height, geometry.input_width)
     expected_output = (1, classes, geometry.logits_height, geometry.logits_width)
     if input_nchw.shape != expected_input:
         raise ValueError(f"Unexpected input shape: {input_nchw.shape}")
@@ -3661,6 +3754,10 @@ def build_param_replay_golden(
             f"PARAM replay output shape mismatch: expected={expected_shape} got={output.shape}"
         )
     report = write_hardware_golden_files(out_dir, output)
+    from eval_single_hw_outputs import fullres_mask_from_logits
+    fullres = fullres_mask_from_logits(output, geometry=geometry)
+    np.ascontiguousarray(fullres, dtype=np.uint8).tofile(out_dir / "golden_fullres_mask.bin")
+    report["golden_fullres_mask_bytes"] = int(fullres.nbytes)
     report["replay_stop_logical_uop"] = stop_uop
     report["replay_executed_logical_uops"] = replay.executed
     return report
@@ -3675,8 +3772,7 @@ def sha256_file(path: Path) -> str:
 
 
 def tensor_storage_bytes(desc: TensorDesc) -> int:
-    phys_c = desc.phys_c if desc.phys_c else desc.c
-    return int(desc.h) * int(desc.w) * int(phys_c)
+    return int(desc.h) * desc.row_stride_bytes
 
 
 def build_memory_lifetime_audit(
@@ -3948,6 +4044,9 @@ def build_param_audit(
     warnings: Sequence[str],
 ) -> dict:
     valid_3x3_modes = {
+        WIN_MODE_3X3_STAGED_C1,
+        WIN_MODE_3X3_STAGED_C17,
+        WIN_MODE_3X3_STAGED_C129,
         WIN_MODE_3X3_STAGED_C3,
         WIN_MODE_3X3_STAGED_C12,
         WIN_MODE_3X3_STAGED_C19,
@@ -4071,7 +4170,8 @@ def build_blob_v4(args: argparse.Namespace) -> dict:
     warnings: List[str] = []
 
     contract = load_deployment_contract(artifact_dir)
-    requested_geometry = DeploymentGeometry(args.height, args.width, args.target_scale)
+    requested_geometry = DeploymentGeometry(args.height, args.width, args.target_scale,
+                                            input_channels=contract.geometry.input_channels)
     if requested_geometry != contract.geometry:
         raise ValueError(
             "CLI geometry disagrees with model artifact: "
@@ -4269,6 +4369,8 @@ def build_blob_v4(args: argparse.Namespace) -> dict:
         )
     )
     frame_hashes = {
+        "golden_fullres_mask": {"file": "golden_fullres_mask.bin",
+                               "sha256": sha256_file(out_dir / "golden_fullres_mask.bin")},
         "input": {
             "file": "INPUTQ.BIN",
             "sha256": sha256_file(out_dir / "INPUTQ.BIN"),
@@ -4329,16 +4431,20 @@ def build_blob_v4(args: argparse.Namespace) -> dict:
         "param_blob_bytes": len(blob),
         "param_blob_sha256": audit["param_blob"]["sha256"],
         "param_version": PARAM_BLOB_VERSION_SCHED,
+        "hardware_profile": ("p7_h240w240_gray_c1_v1" if contract.geometry.input_channels == 1
+                             else "p7_rgb_v4"),
+        "preprocessing": contract.preprocessing,
         "artifact_hashes": frame_hashes,
         "hardware_contract": {
-            "memory_layout": "p7_h256_compact_fmbuf_v1_20260909",
+            "memory_layout": ("p7_h240_gray_rowpad_fmbuf_v1" if contract.geometry.input_channels == 1
+                              else "p7_h256_compact_fmbuf_v1_20260909"),
             "schedule": "P7_PARAM_V4_EXEC_PLAN",
             "weight_layout": "SA-ready packed weight words: oc-local TM lane, kt K-tile",
             "window_schedule": "PARAM v4 staged 3x3/1x1 descriptors; pack commands are audit/replay-only",
             "fixed_ops": "PARAM v4 fixed_exec_desc section; no HLS legacy-uop reconstruction",
             "board_input": (
                 f"NHWC signed int8, {contract.geometry.input_height}x"
-                f"{contract.geometry.input_width}x3"
+                f"{contract.geometry.input_width}x{contract.geometry.input_channels}"
             ),
             "board_output": (
                 f"full-res uint8 mask, {contract.geometry.input_height}x"
@@ -4454,15 +4560,17 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
     # Rebuild the expected descriptor plan from the selected artifact
     # contract. Comparing packed bytes catches stale H512/W1024 geometry or
     # a partially updated UOP table before the blob reaches PARAM.BIN.
+    input_fields = struct.unpack_from("<BBHIHHHH", data, offsets["tensor_desc"])
+    output_fields = struct.unpack_from("<BBHIHHHH", data, offsets["tensor_desc"] + 17 * 16)
     expected_geometry = (
         DeploymentGeometry.from_manifest(audit["geometry"])
         if audit is not None and audit.get("geometry") is not None
-        else DeploymentGeometry(TENSOR_PLAN[0].h, TENSOR_PLAN[0].w, 8)
+        else DeploymentGeometry(input_fields[4], input_fields[5], 8, input_channels=input_fields[6])
     )
     expected_classes = (
         int(audit["class_count"])
         if audit is not None and audit.get("class_count") is not None
-        else int(TENSOR_PLAN[17].c)
+        else int(output_fields[6])
     )
     expected_tensors, _expected_convs = build_deployment_plans(
         expected_classes, geometry=expected_geometry
@@ -4508,8 +4616,9 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
                 h=h,
                 w=w,
                 c=c,
-                phys_c=phys_c,
+                phys_c=phys_c & TENSOR_PHYS_C_MASK,
                 c_offset=c_offset,
+                row_align32=bool(phys_c & TENSOR_ROW_ALIGN32),
             )
         )
 
@@ -4606,6 +4715,9 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
             raise ValueError(f"window schedule[{sid}] has invalid stride/out_w: {fields}")
         if kernel == 3:
             valid_3x3_modes = {
+                WIN_MODE_3X3_STAGED_C1,
+                WIN_MODE_3X3_STAGED_C17,
+                WIN_MODE_3X3_STAGED_C129,
                 WIN_MODE_3X3_STAGED_C3,
                 WIN_MODE_3X3_STAGED_C12,
                 WIN_MODE_3X3_STAGED_C19,
@@ -4678,6 +4790,7 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
     row_consumer_modes: List[int] = []
     row_consumer_layouts: List[int] = []
     ppu_allowed_layouts = {
+        STORE_LAYOUT_COMPACT_C17,
         STORE_LAYOUT_NONE,
         STORE_LAYOUT_COMPACT_C12,
         STORE_LAYOUT_COMPACT_C19,

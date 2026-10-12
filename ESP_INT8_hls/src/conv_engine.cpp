@@ -89,10 +89,6 @@ bool ppu_consume_block5_final_row(const block5_sched_desc_t& sched,
                                   u16_t local_row,
                                   u16_t abs_row,
                                   act_vec_t row_buf[MAX_FM_W]);
-bool csim_dump_u40_prestore_row(const conv_exec_desc_t& conv_desc,
-                                u16_t out_row,
-                                const conv_cfg_t& cfg,
-                                const act_vec_t row_buf[MAX_FM_W]);
 
 static act_vec_t s_shared_conv_row_buf[MAX_FM_W];
 static wgt_vec_t s_shared_weight_buf[TM][MAX_K_TILE_COUNT];
@@ -367,148 +363,6 @@ static void shared_conv_row_engine(
                                   prof_conv_post_state);
 }
 
-#ifdef ESP_INT8_R4R_HANDSHAKE_PROBE
-bool on_chip_memory_write_fmbuf_abs_word(u8_t bank_id,
-                                         u32_t byte_offset,
-                                         axi_vec_t packed);
-
-static tensor_desc_t make_round4r_probe_src(bool c12) {
-#pragma HLS INLINE
-  tensor_desc_t src = {};
-  src.bank_id = static_cast<u8_t>(static_cast<unsigned>(BANK_FMEM0));
-  src.elem_bytes = 1;
-  src.reserved0 = c12 ? u16_t(12) : u16_t(3);
-  src.base_offset = 0;
-  src.h = c12 ? u16_t(64) : u16_t(256);
-  src.w = c12 ? u16_t(128) : u16_t(512);
-  src.c = c12 ? u16_t(12) : u16_t(3);
-  src.reserved1 = 0;
-  return src;
-}
-
-static conv_cfg_t make_round4r_probe_cfg(bool c12) {
-#pragma HLS INLINE
-  conv_cfg_t cfg = {};
-  cfg.in_h = c12 ? u16_t(64) : u16_t(256);
-  cfg.in_w = c12 ? u16_t(128) : u16_t(512);
-  cfg.in_c = c12 ? u16_t(12) : u16_t(3);
-  cfg.out_c = 16;
-  cfg.kernel = 3;
-  cfg.stride = c12 ? ap_uint<2>(1) : ap_uint<2>(2);
-  cfg.dilation = 1;
-  cfg.bias_en = 1;
-  return cfg;
-}
-
-static window_sched_desc_t make_round4r_probe_sched(bool c12) {
-#pragma HLS INLINE
-  window_sched_desc_t sched = {};
-  sched.mode = static_cast<u8_t>(
-      c12 ? static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12)
-          : static_cast<unsigned>(WIN_MODE_3X3_STAGED_C3));
-  sched.kernel = 3;
-  sched.stride = c12 ? u8_t(1) : u8_t(2);
-  sched.dilation = 1;
-  sched.padding = 1;
-  sched.cache_chunks = 1;
-  sched.cache_col_slots = 4;
-  sched.flags = static_cast<u8_t>(
-      static_cast<unsigned>(WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2));
-  sched.in_c = c12 ? u16_t(12) : u16_t(3);
-  sched.out_w = c12 ? u16_t(128) : u16_t(256);
-  sched.k_tiles = c12 ? u16_t(4) : u16_t(1);
-  sched.loader_class = static_cast<u8_t>(
-      static_cast<unsigned>(WIN_LOADER_3X3_NARROW));
-  sched.loader_request_cols = 6;
-  sched.loader_warmup_issues = 1;
-  sched.loader_warmup_new_cols = c12 ? u8_t(4) : u8_t(5);
-  sched.loader_steady_new_cols = c12 ? u8_t(2) : u8_t(4);
-  sched.loader_words_per_col = 3;
-  sched.loader_warmup_mask = c12 ? u8_t(39) : u8_t(55);
-  sched.loader_steady_mask = c12 ? u8_t(36) : u8_t(54);
-  sched.reserved[0] = 1;
-  sched.reserved[1] = c12 ? u16_t(1024) : u16_t(1280);
-  sched.reserved[4] = 1;
-  sched.reserved[5] = c12 ? u16_t(514) : u16_t(1025);
-  if (!c12) {
-    sched.reserved[8] = 515;
-    sched.reserved[9] = static_cast<u16_t>(2U | (48U << 2));
-  }
-  return sched;
-}
-
-void round4r_conv_row_handshake_probe_impl(u8_t case_id,
-                                           u8_t seed,
-                                           u32_t& checksum) {
-#pragma HLS INLINE off
-  static wgt_vec_t probe_weight_buf[TM][MAX_K_TILE_COUNT];
-  static act_vec_t probe_row_buf[MAX_FM_W];
-#pragma HLS ARRAY_PARTITION variable=probe_weight_buf cyclic factor=16 dim=1
-#pragma HLS BIND_STORAGE variable=probe_weight_buf type=ram_2p impl=bram
-#pragma HLS BIND_STORAGE variable=probe_row_buf type=ram_2p impl=bram
-
-  const bool c12 = case_id.to_uint() != 0U;
-  const tensor_desc_t src = make_round4r_probe_src(c12);
-  const conv_cfg_t cfg = make_round4r_probe_cfg(c12);
-  const window_sched_desc_t sched = make_round4r_probe_sched(c12);
-  const int k_tiles = c12 ? 4 : 1;
-
-  wgt_vec_t seed_word = 0;
-  for (int lane = 0; lane < TK; ++lane) {
-#pragma HLS UNROLL
-    seed_word.range(lane * 8 + 7, lane * 8) =
-        static_cast<u8_t>(seed.to_uint() + static_cast<unsigned>(lane));
-  }
-  for (int tm = 0; tm < TM; ++tm) {
-    for (int kt = 0; kt < MAX_K_TILE_COUNT; ++kt) {
-#pragma HLS PIPELINE II=1
-      if (kt >= k_tiles) {
-        break;
-      }
-      probe_weight_buf[tm][kt] = seed_word;
-    }
-  }
-
-  conv_q_t qparam = {};
-  for (int lane = 0; lane < TM; ++lane) {
-#pragma HLS UNROLL
-    qparam.bias[lane] = static_cast<i32_t>(seed.to_uint() + static_cast<unsigned>(lane));
-    qparam.mult[lane] = static_cast<i32_t>(seed.to_uint() | 1U);
-    qparam.shift[lane] = 8;
-  }
-
-  // Make the shared feature memory observable to synthesis without adding a
-  // probe-only memory port. Remaining words retain their reset value.
-  (void)on_chip_memory_write_fmbuf_abs_word(
-      src.bank_id, static_cast<u32_t>(0), static_cast<axi_vec_t>(seed_word));
-
-  volatile u8_t win_state = PROF_CONV_WIN_IDLE_OR_DONE;
-  volatile u8_t sa_state = PROF_CONV_SA_IDLE_OR_DONE;
-  volatile u8_t post_state = PROF_CONV_POST_IDLE_OR_DONE;
-  shared_conv_row_engine(src,
-                         cfg,
-                         sched,
-                         static_cast<u8_t>(static_cast<unsigned>(ACT_NONE)),
-                         qparam,
-                         static_cast<u16_t>(1),
-                         probe_row_buf,
-                         probe_weight_buf,
-                         win_state,
-                         sa_state,
-                         post_state);
-
-  u32_t folded = 0;
-  const int out_w = c12 ? 128 : 256;
-  for (int pixel = 0; pixel < MAX_FM_W; ++pixel) {
-#pragma HLS PIPELINE II=1
-    if (pixel >= out_w) {
-      break;
-    }
-    folded ^= static_cast<u32_t>(probe_row_buf[pixel].range(31, 0));
-  }
-  checksum = folded;
-}
-#endif
 
 static void replay_conv_row_to_stream(const act_vec_t row_buf[MAX_FM_W],
                                       const conv_cfg_t& cfg,
@@ -615,9 +469,6 @@ static bool run_conv_rows_task(const conv_rows_task_t& task,
                            prof_conv_win_state,
                            prof_conv_sa_state,
                            prof_conv_post_state);
-    if (!csim_dump_u40_prestore_row(task.conv_desc, conv_row, task.cfg, s_shared_conv_row_buf)) {
-      write_ok = false;
-    }
     if (compact_consumer_enabled) {
       npu_profile_set_stage(prof_stage_id, PROF_STAGE_PPU_ROW_CONSUME);
       u8_t compact_status = 0;
@@ -1019,12 +870,3 @@ error_code_t conv_engine_exec(const npu_issue_t& issue,
 }
 
 } // namespace esp_int8
-
-#ifdef ESP_INT8_R4R_HANDSHAKE_PROBE
-void round4r_conv_row_handshake_probe(esp_int8::u8_t case_id,
-                                      esp_int8::u8_t seed,
-                                      esp_int8::u32_t& checksum) {
-#pragma HLS INLINE off
-  esp_int8::round4r_conv_row_handshake_probe_impl(case_id, seed, checksum);
-}
-#endif

@@ -41,9 +41,9 @@ static void pack_bytes(const std::vector<std::uint8_t>& bytes,
 
 int main() {
   const char* param_path =
-      "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_r2_v4/PARAM.BIN";
+      "D:/ESP_INT8/hw_artifacts/binary2_int8_h240w240_gray_v4/PARAM.BIN";
   const char* input_path =
-      "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_r2_v4/input_q.bin";
+      "D:/ESP_INT8/hw_artifacts/binary2_int8_h240w240_gray_v4/input_q.bin";
 
   std::vector<std::uint8_t> param_bytes;
   std::vector<std::uint8_t> input_bytes;
@@ -92,30 +92,6 @@ int main() {
                                 esp_int8::MODE_RUN,
                                 esp_int8::UOP_COUNT_ENCODER);
 
-#ifdef ESP_INT8_CSIM_DUMP_UPSAMPLE_INPUT
-  {
-    std::vector<std::uint8_t> lowres_logits(esp_int8::ENCODER_LOGITS_BYTES);
-    for (std::size_t i = 0; i < lowres_logits.size(); ++i) {
-      lowres_logits[i] =
-          get_byte(frame_out[i / esp_int8::AXI_WORD_BYTES],
-                   static_cast<int>(i % esp_int8::AXI_WORD_BYTES));
-    }
-
-    std::ofstream out("hls_output_lowres_logits.bin", std::ios::binary);
-    if (!out) {
-      std::printf("[FAIL] failed to write hls_output_lowres_logits.bin\n");
-      return 1;
-    }
-    out.write(reinterpret_cast<const char*>(lowres_logits.data()),
-              static_cast<std::streamsize>(lowres_logits.size()));
-    if (!out) {
-      std::printf("[FAIL] incomplete write hls_output_lowres_logits.bin\n");
-      return 1;
-    }
-    std::printf("[CSIM-DUMP] wrote hls_output_lowres_logits.bin bytes=%zu\n",
-                lowres_logits.size());
-  }
-#endif
 
   unsigned checksum = 0;
   int nonzero = 0;

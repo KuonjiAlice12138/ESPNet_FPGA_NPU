@@ -1,65 +1,82 @@
 # ESP INT8 Tools
 
-本目录只保留当前 `H=256, W=512, logits=32x64, PARAM v4` 硬件版本所需的
-编译、验证和性能分析工具。模型训练与 QAT 工具位于 `D:/ESPNet`，历史 PARAM v3/v5、
-U71、INT4 和一次性调试脚本不再保留在这里。
+Current HLS branch: `feature/h240w240-gray-int8`, binary2 INT8, grayscale
+240x240 input, 30x30 logits, 240x240 output mask, PARAM v4.
+Model training and hardware-constrained QAT tools live in `D:/ESPNet`.
 
-## 硬件产物
+## Artifact Contract
 
-- `export_int8_hw_blob.py`：编译 PARAM v4，并可从冻结 artifact 重编译窗口调度字段。
-- `hw_param_replay.py`：按 HLS 整数语义 replay PARAM v4。
-- `hw_int8_math.py`：导出与 replay 共用的 INT8 算术。
-- `geometry_contract.py`：统一 H256W512 几何约束。
-- `export_exec_prefix_params.py`：生成 P00-P15 EXEC prefix 性能归因文件。
-- `export_val_hw_dataset.py`：导出验证集板级输入。
+Use all files from `hw_artifacts/binary2_int8_h240w240_gray_v4` together.
+`INPUTQ.BIN` and the full-resolution mask are each 57,600 bytes;
+low-resolution HWC INT8 logits are 1,800 bytes. The manifest records grayscale
+normalization, center-square crop, checkpoint/cache hashes and tensor geometry.
+Intermediate compact rows carry an explicit 32-byte row-padding flag; input and
+pool tensors remain tightly packed.
 
-当前冻结输入必须成套使用：
+The Python tools can still inspect the preserved H256W512 binary2/cityscapes20
+releases. Those artifacts are **not compatible with the current H240/C1 HLS IP**,
+despite both using PARAM v4. The App now selects `platform_h240_1012` and runs
+the H240 grayscale single image using `P2G.BIN` / `I2G.BIN` / `O2G.BIN`.
+Rebuild it manually before use. SD boot additionally requires a newly packaged
+`BOOT.BIN`; `ESP_INT8_app/src/boot_h240.bif` fixes the platform/bitstream/ELF paths.
 
-- `hw_artifacts/binary2_int8_h256w512_r2_v4`
-- `hw_artifacts/cityscapes20_int8_h256w512_r2_v4`
+## Compile and Validate
 
-不得混用其他目录的 `PARAM.BIN`、`INPUTQ.BIN`、golden 或 manifest。
+- `export_int8_hw_blob.py`: compile PARAM v4, schedules and memory/fusion audits.
+- `hw_param_replay.py`: execute PARAM using HLS-compatible integer arithmetic.
+- `hw_int8_math.py`: arithmetic shared by compiler and replay.
+- `geometry_contract.py`: manifest-driven input channels and geometry.
+- `export_exec_prefix_params.py`: generate EXEC-prefix profiling PARAM files.
+- `export_val_hw_dataset.py`: export validation inputs using the QAT loader.
 
-## 精度评估
-
-- `eval_single_hw_outputs.py`：单图 low-resolution logits/full-resolution mask 评估。
-- `eval_val_hw_masks_fullres.py`：验证集 full-resolution mask 的 PA/IoU/mIoU。
-- `eval_hw_constrained_qat.py`：上述数据导出与评估工具共用的模型和标签映射辅助函数。
-
-## 综合与性能分析
-
-- `audit_hls_reports.py`：扫描最新 HLS 报告中的 blocker 和高风险项。
-- `check_p6_hls_structure.py`：检查当前 P7 singleton、MainCtrl 和数据流结构约束；文件名因历史兼容保留。
-- `analyze_conv_cycle_profile.py`：解析 EXEC-prefix 与 Conv 内部 WIN/SA/POST counter。
-- `analyze_sa_utilization.py`：计算 SA 工作量、静态填充率和服务周期下界。
-
-WIN、SA、POST counter 是同一 Conv 时间窗口内的并发状态分类，三组周期不能相加。
-HLS `max latency` 也不能替代板级 RTL cycle counter。
-
-## 回归测试
-
-保留的 `test_*.py` 只覆盖当前仍在主路径中的功能：PARAM v4、H256W512、双模型 app、
-C3 row reuse、Post16、SA reduction tree、profiling 接口、20-class 部署和评估工具。
+Run from `D:/ESP_INT8`:
 
 ```powershell
-D:/ESPNet/.venv/Scripts/python.exe tools/test_p7_contracts.py
-D:/ESPNet/.venv/Scripts/python.exe -m unittest `
-  tools.test_analyze_conv_cycle_profile `
-  tools.test_app_dual_profile_h256w512_contract `
-  tools.test_c3_row_reuse_round2 `
-  tools.test_conv_post_round1_contract `
-  tools.test_conv_profiling_contract `
-  tools.test_eval_single_hw_outputs `
-  tools.test_multiclass_deployment_contract `
-  tools.test_sa_reduction_round3 `
-  tools.test_sa_utilization_round0
+& 'D:/ESPNet/.venv/Scripts/python.exe' tools/export_int8_hw_blob.py `
+  --artifact-dir D:/ESPNet/resolution_h240w240_gray/quantized_artifacts_binary2_int8_hw `
+  --out-dir hw_artifacts/binary2_int8_h240w240_gray_v4 `
+  --param-version 4 --height 240 --width 240 --target-scale 8 `
+  --strict-zp --strict-schedule
+
+& 'D:/ESPNet/.venv/Scripts/python.exe' tools/hw_param_replay.py `
+  --param hw_artifacts/binary2_int8_h240w240_gray_v4/PARAM.BIN `
+  --input hw_artifacts/binary2_int8_h240w240_gray_v4/INPUTQ.BIN `
+  --output hw_artifacts/binary2_int8_h240w240_gray_v4/replay_check.bin
 ```
 
-常用报告审查：
+## Accuracy and Reports
+
+- `eval_single_hw_outputs.py`: evaluate low-resolution logits and full-resolution
+  masks against the same sample and center-cropped ground truth.
+- `eval_val_hw_masks_fullres.py`: validation-set PA, per-class accuracy/IoU and mIoU.
+- `eval_hw_constrained_qat.py`: common model and label-mapping support.
+- `audit_hls_reports.py`: inspect synthesis timing, resources and risk messages.
+- `check_p6_hls_structure.py`: current P7 source ownership and singleton checks;
+  its historical filename is retained.
+- `analyze_conv_cycle_profile.py`: analyze EXEC-prefix and WIN/SA/POST counters.
+- `analyze_sa_utilization.py`: calculate MAC work, filling and service lower bounds.
+
+For evaluation, explicitly supply the current artifact, cache, output paths and
+`--out-json`; do not rely on historical CLI path defaults. WIN/SA/POST counters
+classify concurrent activity in the same Conv interval and must not be summed.
+HLS maximum latency is not a replacement for board cycle measurements.
+
+## Checks
 
 ```powershell
-D:/ESPNet/.venv/Scripts/python.exe tools/check_p6_hls_structure.py
-D:/ESPNet/.venv/Scripts/python.exe tools/audit_hls_reports.py --strict
+& 'D:/ESPNet/.venv/Scripts/python.exe' -m unittest `
+  tools.test_h240w240_gray_contract tools.test_eval_single_hw_outputs
+& 'D:/ESPNet/.venv/Scripts/python.exe' tools/test_p7_contracts.py
+& 'D:/ESPNet/.venv/Scripts/python.exe' tools/check_p6_hls_structure.py
+& 'D:/ESPNet/.venv/Scripts/python.exe' -B -m unittest tools.test_app_h240w240_gray_contract
 ```
 
-`tools/testdata/rtl_stage_0910.csv` 是当前利用率模型的冻结板级输入，不是临时输出。
+Other `test_*.py` files cover shared arithmetic/profiling or preserved H256
+compiler contracts. The App contract test follows this branch's H240 single-image
+configuration, not the old dual-model test. They do not imply that old RGB paths remain
+in the new hardware. `testdata/rtl_stage_0910.csv` is a frozen historical board
+measurement, not a performance measurement for the grayscale IP.
+
+Full-resolution CSim is configured by `ESP_INT8_hls/hls_config.cfg` and writes
+`csim_u72_lowres_logits.bin` and `hls_output_mask.bin` under the chosen CSim
+work directory. Synthesis, packaging, implementation and app build remain manual.

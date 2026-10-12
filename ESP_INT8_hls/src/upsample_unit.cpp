@@ -1,11 +1,17 @@
 #include "../include/npu_config.hpp"
 #include "../include/npu_types.hpp"
 #include "../include/npu_uop.hpp"
+#ifndef __SYNTHESIS__
+#include <cassert>
+#endif
 
 namespace esp_int8 {
 
 static act_vec_t s_prev_logits_row[ENCODER_OUT_W];
 static bool s_prev_logits_valid = false;
+static axi_vec_t s_mask_pack_word = 0;
+static unsigned s_mask_pack_fill = 0;
+static u32_t s_mask_word_index = 0;
 
 static i16_t byte_to_i16_signed(u8_t value) {
 #pragma HLS INLINE
@@ -114,24 +120,6 @@ static u8_t interpolate_argmax_label(const act_vec_t curr_row[ENCODER_OUT_W],
   return best_class;
 }
 
-static axi_vec_t pack_mask_word(const act_vec_t curr_row[ENCODER_OUT_W],
-                                bool use_prev_row,
-                                int out_col_base,
-                                int wy0,
-                                int wy1,
-                                u8_t valid_c) {
-#pragma HLS INLINE off
-  axi_vec_t word = 0;
-  for (int lane = 0; lane < AXI_WORD_BYTES; ++lane) {
-#pragma HLS PIPELINE II=1
-    const int out_col = out_col_base + lane;
-    const u8_t label = interpolate_argmax_label(
-        curr_row, use_prev_row, out_col, wy0, wy1, valid_c);
-    word.range(lane * 8 + 7, lane * 8) = label;
-  }
-  return word;
-}
-
 static void emit_fullres_rows(axi_vec_t* gmem_frame_out,
                               const act_vec_t curr_row[ENCODER_OUT_W],
                               bool use_prev_row,
@@ -150,13 +138,19 @@ static void emit_fullres_rows(axi_vec_t* gmem_frame_out,
     int wy1 = 0;
     bilinear_axis_map(out_row, ENCODER_OUT_H, y0, y1, wy0, wy1);
 
-    for (int word_col = 0; word_col < FULLRES_MASK_W / AXI_WORD_BYTES; ++word_col) {
+    for (int col = 0; col < FULLRES_MASK_W; ++col) {
 #pragma HLS PIPELINE off
-      const int out_col_base = word_col * AXI_WORD_BYTES;
-      const u32_t word_idx =
-          static_cast<u32_t>(out_row * (FULLRES_MASK_W / AXI_WORD_BYTES) + word_col);
-      gmem_frame_out[word_idx] =
-          pack_mask_word(curr_row, use_prev_row, out_col_base, wy0, wy1, valid_c);
+      const u8_t label = interpolate_argmax_label(
+          curr_row, use_prev_row, col, wy0, wy1, valid_c);
+      s_mask_pack_word >>= 8;
+      s_mask_pack_word.range(255, 248) = label;
+      ++s_mask_pack_fill;
+      if (s_mask_pack_fill == AXI_WORD_BYTES) {
+        gmem_frame_out[s_mask_word_index] = s_mask_pack_word;
+        ++s_mask_word_index;
+        s_mask_pack_word = 0;
+        s_mask_pack_fill = 0;
+      }
     }
   }
 }
@@ -164,6 +158,9 @@ static void emit_fullres_rows(axi_vec_t* gmem_frame_out,
 void upsample_fused_begin() {
 #pragma HLS INLINE off
   s_prev_logits_valid = false;
+  s_mask_pack_word = 0;
+  s_mask_pack_fill = 0;
+  s_mask_word_index = 0;
 }
 
 void upsample_fused_consume_logits_row(axi_vec_t* gmem_frame_out,
@@ -209,6 +206,12 @@ void upsample_fused_consume_logits_row(axi_vec_t* gmem_frame_out,
     }
   }
 
+#ifndef __SYNTHESIS__
+  if (row == static_cast<unsigned>(ENCODER_OUT_H - 1)) {
+    assert(s_mask_pack_fill == 0U);
+    assert(s_mask_word_index.to_uint() == OUTPUT_FRAME_AXI_WORDS);
+  }
+#endif
   copy_logits_row(row_buf, s_prev_logits_row);
   s_prev_logits_valid = true;
 }

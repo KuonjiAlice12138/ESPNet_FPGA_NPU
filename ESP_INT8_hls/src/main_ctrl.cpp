@@ -289,10 +289,6 @@ static error_code_t prepare_new_entry(ctrl_runtime_t& ctx,
     return ERR_NONE;
   }
 
-  if (!main_ctrl_csim_dump_tensor_set_pre(logical_uop)) {
-    main_ctrl_set_csim_last_error(ERR_BANK_OVERFLOW);
-    return ERR_BANK_OVERFLOW;
-  }
 
   ctx.entry = entry;
   ctx.logical_uop = logical_uop;
@@ -333,10 +329,6 @@ static error_code_t prepare_new_entry(ctrl_runtime_t& ctx,
 
 static error_code_t complete_entry(ctrl_runtime_t& ctx) {
 #pragma HLS INLINE off
-  if (!main_ctrl_csim_dump_tensor_set_post(ctx.logical_uop)) {
-    main_ctrl_set_csim_last_error(ERR_BANK_OVERFLOW);
-    return ERR_BANK_OVERFLOW;
-  }
 
   ctx.entry_active = false;
   ctx.block5_active = false;

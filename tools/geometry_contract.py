@@ -11,8 +11,11 @@ class DeploymentGeometry:
     input_height: int
     input_width: int
     target_scale: int = 8
+    input_channels: int = 3
 
     def __post_init__(self) -> None:
+        if self.input_channels not in (1, 3):
+            raise ValueError("input channels must be 1 (gray) or 3 (RGB)")
         if self.input_height <= 0 or self.input_width <= 0:
             raise ValueError("input height and width must be positive")
         if self.target_scale <= 0:
@@ -30,11 +33,11 @@ class DeploymentGeometry:
 
     @property
     def input_shape_nhwc(self) -> tuple[int, int, int]:
-        return self.input_height, self.input_width, 3
+        return self.input_height, self.input_width, self.input_channels
 
     @property
     def input_bytes(self) -> int:
-        return self.input_height * self.input_width * 3
+        return self.input_height * self.input_width * self.input_channels
 
     @property
     def output_mask_bytes(self) -> int:
@@ -51,6 +54,7 @@ class DeploymentGeometry:
             "logits_height": int(self.logits_height),
             "logits_width": int(self.logits_width),
             "target_scale": int(self.target_scale),
+            "input_channels": int(self.input_channels),
         }
 
     @classmethod
@@ -63,6 +67,7 @@ class DeploymentGeometry:
             input_height=int(value["input_height"]),
             input_width=int(value["input_width"]),
             target_scale=int(value["target_scale"]),
+            input_channels=int(value.get("input_channels", 3)),
         )
         declared_logits = (
             int(value["logits_height"]),

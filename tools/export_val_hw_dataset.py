@@ -69,9 +69,13 @@ def profile_contract(profile: str) -> dict[str, Any]:
         raise ValueError(f"unknown validation profile: {profile}") from exc
 
 
-def map_target_for_profile(target: torch.Tensor, profile: str) -> torch.Tensor:
+def map_target_for_profile(target: torch.Tensor, profile: str, *, already_mapped: bool = False) -> torch.Tensor:
     mapped = target.clone().long()
     if profile == "binary2":
+        if already_mapped:
+            if bool(((mapped != 0) & (mapped != 1) & (mapped != 255)).any()):
+                raise ValueError("mapped binary2 labels must be 0, 1 or 255")
+            return mapped
         mapped[((mapped < 13) | (mapped > 18)) & (mapped != 255)] = 1
         mapped[(mapped >= 13) & (mapped <= 18)] = 0
         return mapped
@@ -96,7 +100,8 @@ def load_exported_fake_quant_model(
         prepare_quantized_model,
     )
 
-    model = net.ESPNet_Encoder(args.classes, p=args.p, q=args.q)
+    model = net.ESPNet_Encoder(args.classes, p=args.p, q=args.q,
+                              input_channels=args.input_channels)
     source_payload = torch.load(
         args.model_path, map_location="cpu", weights_only=False
     )
@@ -172,9 +177,9 @@ def check_param_blob_for_sd(param_path: Path) -> dict[str, Any]:
         )
         return int(h), int(w), int(c)
 
-    input_h, input_w, _input_c = tensor_hw_c(0)
+    input_h, input_w, input_c = tensor_hw_c(0)
     logits_h, logits_w, class_count = tensor_hw_c(17)
-    geometry = DeploymentGeometry(input_h, input_w, 8)
+    geometry = DeploymentGeometry(input_h, input_w, 8, input_channels=input_c)
     if (logits_h, logits_w) != (geometry.logits_height, geometry.logits_width):
         raise ValueError(
             "PARAM input/logits geometry mismatch: "
@@ -343,17 +348,48 @@ def load_artifact_geometry(artifact_dir: Path) -> DeploymentGeometry:
     return geometry_from_manifest(manifest)
 
 
+def build_artifact_val_loader(
+    espnet_dir: Path, cached_data_file: Path, geometry: DeploymentGeometry,
+    preprocessing: dict, batch_size: int, workers: int, profile: str,
+    target_scale: int = 8,
+):
+    add_espnet(espnet_dir)
+    if geometry.input_channels == 3:
+        return build_val_loader(cached_data_file, target_scale, batch_size, workers, geometry)
+    if (preprocessing.get("image_mode") != "gray" or
+            preprocessing.get("center_square_crop") is not True):
+        raise ValueError("C1 export requires explicit gray/center-square-crop preprocessing")
+    import pickle
+    from train_cityscapes20.main import build_loaders
+    from deployment_profiles import get_deployment_profile
+    with cached_data_file.open("rb") as handle:
+        data = pickle.load(handle)
+    expected_hash = preprocessing.get("cache_sha256")
+    if expected_hash is not None and sha256_file(cached_data_file) != expected_hash:
+        raise ValueError("validation cache hash disagrees with QAT/export manifest")
+    loader_args = argparse.Namespace(
+        height=geometry.input_height, width=geometry.input_width, target_scale=8,
+        image_mode="gray", center_square_crop=True, device="cpu", workers=workers,
+        batch_size=batch_size, val_batch_size=batch_size,
+    )
+    _, loader = build_loaders(loader_args, data, get_deployment_profile(profile))
+    return loader
+
+
 def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
     contract = profile_contract(args.profile)
     classes = int(contract["classes"])
     geometry = load_artifact_geometry(Path(args.artifact_dir))
-    requested_geometry = DeploymentGeometry(args.height, args.width, args.target_scale)
+    artifact_manifest = json.loads((Path(args.artifact_dir) / "manifest.json").read_text(encoding="utf-8"))
+    preprocessing = artifact_manifest.get("preprocessing", {})
+    requested_geometry = DeploymentGeometry(args.height, args.width, args.target_scale,
+                                            input_channels=geometry.input_channels)
     if geometry != requested_geometry:
         raise ValueError(
             "CLI geometry disagrees with model artifact: "
             f"requested={requested_geometry.to_manifest()} artifact={geometry.to_manifest()}"
         )
-    input_shape_nchw = (3, geometry.input_height, geometry.input_width)
+    input_shape_nchw = (geometry.input_channels, geometry.input_height, geometry.input_width)
     target_shape = (geometry.logits_height, geometry.logits_width)
     output_shape_nchw = (classes, *target_shape)
     input_bytes = geometry.input_bytes
@@ -391,16 +427,14 @@ def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
     add_espnet(Path(args.espnet_dir))
     use_cuda = bool(args.cuda and torch.cuda.is_available() and not args.cpu)
     device = torch.device("cuda" if use_cuda else "cpu")
-    loader = build_val_loader(
-        Path(args.cached_data_file),
-        args.scale_in,
-        args.batch_size,
-        args.num_workers,
-        geometry,
+    loader = build_artifact_val_loader(
+        Path(args.espnet_dir), Path(args.cached_data_file), geometry, preprocessing,
+        args.batch_size, args.num_workers, args.profile, args.scale_in,
     )
     # The shared loader reconstructs the same fake-quant graph for either
     # deployment profile; only the classifier width and target mapping differ.
     args.classes = classes
+    args.input_channels = geometry.input_channels
     model = load_exported_fake_quant_model(args, loader, device)
     model.eval()
 
@@ -454,8 +488,10 @@ def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
             q_inputs = quantize_activation_tensor(inputs, input_observer).numpy()
             q_outputs = quantize_activation_tensor(captured["classifier"], classifier_observer).numpy()
             mapped_targets = map_target_for_profile(
-                targets, args.profile
+                targets, args.profile, already_mapped=geometry.input_channels == 1
             ).cpu().numpy().astype(np.uint8, copy=False)
+            if geometry.input_channels == 1:
+                mapped_targets = mapped_targets[:, ::geometry.target_scale, ::geometry.target_scale]
 
             for b in range(batch):
                 if exported >= max_items:
@@ -551,6 +587,7 @@ def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": args.batch_size,
         "device": str(device),
         "geometry": geometry.to_manifest(),
+        "preprocessing": preprocessing,
         "param_blob": (
             {
                 **param_info,
@@ -562,7 +599,7 @@ def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
         "board_contract": {
             "profile": args.profile,
             "input": (
-                f"NHWC int8 signed, {geometry.input_height}x{geometry.input_width}x3, "
+                f"NHWC int8 signed, {geometry.input_height}x{geometry.input_width}x{geometry.input_channels}, "
                 f"{contract['input_prefix']}%04d.BIN"
             ),
             "output": (

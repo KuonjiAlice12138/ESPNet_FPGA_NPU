@@ -132,6 +132,9 @@ WIN_MODE_3X3_STAGED_C131 = 8
 WIN_MODE_3X3_STAGED_C28 = 9
 WIN_MODE_3X3_STAGED_C64 = 10
 WIN_MODE_3X3_STAGED_C128 = 11
+WIN_MODE_3X3_STAGED_C1 = 12
+WIN_MODE_3X3_STAGED_C17 = 13
+WIN_MODE_3X3_STAGED_C129 = 14
 
 WIN_LOADER_3X3_NARROW = 1
 WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2 = 1 << 0
@@ -226,12 +229,16 @@ class TensorDesc:
     elem_bytes: int = 1
     @property
     def phys_c(self) -> int:
-        return self.reserved0 if self.reserved0 else self.c
+        return (self.reserved0 & 0x7FFF) or self.c
+    @property
+    def row_stride_bytes(self) -> int:
+        raw = self.w * self.phys_c
+        return (raw + 31) & ~31 if self.reserved0 & 0x8000 else raw
     @property
     def c_offset(self) -> int:
         return self.reserved1
     def elem_offset(self, h: int, w: int, c: int) -> int:
-        return (h * self.w + w) * self.phys_c + self.c_offset + c
+        return h * self.row_stride_bytes + w * self.phys_c + self.c_offset + c
 
 
 @dataclass
@@ -481,7 +488,7 @@ class ParamBlob:
         if len(self.tensor_desc) < 18:
             raise ValueError("PARAM v4 tensor descriptor table is incomplete")
         input_desc = self.tensor_desc[0]
-        self.geometry = DeploymentGeometry(input_desc.h, input_desc.w, 8)
+        self.geometry = DeploymentGeometry(input_desc.h, input_desc.w, 8, input_channels=input_desc.c)
         logits_desc = self.tensor_desc[17]
         if (logits_desc.h, logits_desc.w) != (
             self.geometry.logits_height,
@@ -809,7 +816,7 @@ def compare_i8_arrays(a: np.ndarray, b: np.ndarray) -> dict:
 def _write_array_to_fmem(fmem: FeatureMemory, desc: TensorDesc, arr: np.ndarray) -> None:
     if arr.shape != (int(desc.h), int(desc.w), int(desc.c)):
         raise ValueError(f"shape mismatch for fmem write: {arr.shape} vs {desc.h}x{desc.w}x{desc.c}")
-    if desc.c_offset == 0 and desc.phys_c == desc.c:
+    if desc.c_offset == 0 and desc.phys_c == desc.c and desc.row_stride_bytes == desc.w * desc.c:
         flat = np.ascontiguousarray(arr.reshape(-1)).astype(np.uint8)
         start = fmem.physical_base(desc)
         fmem.buf[start:start + flat.size] = flat
@@ -1017,7 +1024,7 @@ def replay_pool_array(blob: ParamBlob, param_id: int, src: np.ndarray) -> np.nda
     q = blob.pool_qparam[param_id]
     kernel = int(q.kernel) if q.kernel else 3
     stride = int(q.stride) if q.stride else 2
-    if kernel != 3 or stride != 2 or src.shape[2] != 3:
+    if kernel != 3 or stride != 2 or src.shape[2] not in (1, 3):
         raise ValueError(f"unsupported pool shape: param={param_id}, kernel={kernel}, stride={stride}, src={src.shape}")
     out_h = math.ceil(src.shape[0] / stride)
     out_w = math.ceil(src.shape[1] / stride)

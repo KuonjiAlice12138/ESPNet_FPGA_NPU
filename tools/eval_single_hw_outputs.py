@@ -27,6 +27,7 @@ class DeploymentContract:
     class_count: int
     ignore_metric_class: int | None
     geometry: DeploymentGeometry = LEGACY_GEOMETRY
+    center_square_crop: bool = False
 
     @property
     def lowres_shape(self) -> tuple[int, int]:
@@ -62,6 +63,7 @@ def load_deployment_contract(artifact_dir: Path) -> DeploymentContract:
         class_count=class_count,
         ignore_metric_class=None if ignore is None else int(ignore),
         geometry=geometry_from_manifest(manifest),
+        center_square_crop=bool(manifest.get("preprocessing", {}).get("center_square_crop", False)),
     )
 
 
@@ -89,6 +91,9 @@ def load_i8_logits(
 def load_lowres_target(path: Path, contract: DeploymentContract) -> np.ndarray:
     target = np.load(path)
     expected = (1, *contract.lowres_shape)
+    if tuple(target.shape) == (1, *contract.fullres_shape):
+        scale = contract.geometry.target_scale
+        target = target[:, ::scale, ::scale]
     if tuple(target.shape) != expected:
         raise ValueError(f"{path} shape={target.shape}, expected {expected}")
     return remap_target_np(target[0], contract)
@@ -276,6 +281,11 @@ def load_fullres_target(
     target = cv2.imread(str(target_path), cv2.IMREAD_UNCHANGED)
     if target is None:
         raise FileNotFoundError(target_path)
+    if contract.center_square_crop:
+        height, width = target.shape[:2]
+        side = min(height, width)
+        top, left = (height - side) // 2, (width - side) // 2
+        target = target[top:top + side, left:left + side]
     if tuple(target.shape[:2]) != contract.fullres_shape:
         target = cv2.resize(
             target,
@@ -293,9 +303,13 @@ def check_single_vs_val_smoke(
     checks: dict[str, Any] = {"val_smoke_dir": str(val_smoke_dir), "available": val_smoke_dir.exists()}
     if not val_smoke_dir.exists():
         return checks
+    smoke_manifest_path = val_smoke_dir / "manifest.json"
+    files = {}
+    if smoke_manifest_path.is_file():
+        files = json.loads(smoke_manifest_path.read_text(encoding="utf-8")).get("files", {})
     pairs = {
-        "input_vs_I0000": (artifact_dir / "input_q.bin", val_smoke_dir / "I0000.BIN"),
-        "golden_vs_R0000": (artifact_dir / "golden_output_q.bin", val_smoke_dir / "R0000.BIN"),
+        "input_vs_I0000": (artifact_dir / "input_q.bin", val_smoke_dir / (files.get("input_pattern", "I%04d.BIN") % 0)),
+        "golden_vs_R0000": (artifact_dir / "golden_output_q.bin", val_smoke_dir / (files.get("reference_logit_pattern", "R%04d.BIN") % 0)),
     }
     for name, (left, right) in pairs.items():
         if left.exists() and right.exists():

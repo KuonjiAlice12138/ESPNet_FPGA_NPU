@@ -747,11 +747,10 @@ static int load_param_and_init(Int8NpuContext *npu, const char *param_file,
         return XST_FAILURE;
     }
 
-#if INT8_APP_ENABLE_DUAL_SINGLE_TEST
     /* Do not accidentally time an old ABI or an early-END prefix blob. */
     if (header->version != INT8_PARAM_BLOB_VERSION_CURRENT ||
         header->exec_plan_count != INT8_EXPECTED_EXEC_PLAN_COUNT) {
-        xil_printf("APP: dual single requires full PARAM v4: %s\r\n", param_file);
+        xil_printf("APP: full inference requires full PARAM v4: %s\r\n", param_file);
         return XST_FAILURE;
     }
     for (u32 i = 0U; i < header->exec_plan_count; ++i) {
@@ -765,7 +764,6 @@ static int load_param_and_init(Int8NpuContext *npu, const char *param_file,
             return XST_FAILURE;
         }
     }
-#endif
 
     Xil_DCacheFlushRange((UINTPTR)g_param, param_size);
     Xil_DCacheFlushRange((UINTPTR)g_input, INT8_INPUT_BYTES);
@@ -874,7 +872,6 @@ int main(void)
 #if !INT8_APP_ENABLE_EXEC_PREFIX_PROFILE && !INT8_APP_ENABLE_DUAL_VAL_SET_TEST && \
     !INT8_APP_ENABLE_DUAL_SINGLE_TEST
     Int8ParamBlobHeader header;
-    u32 param_size = 0U;
 #endif
 
     xil_printf("\r\nESP INT8 app %s\r\n", INT8_APP_BUILD_TAG);
@@ -899,33 +896,9 @@ int main(void)
 #elif INT8_APP_ENABLE_DUAL_SINGLE_TEST
     return run_dual_single_image(&npu);
 #else
-    if (SD_LoadFileToMemory(INT8_PARAM_FILE, (UINTPTR)g_param,
-                            INT8_PARAM_HW_MAX_BYTES,
-                            &param_size) != XST_SUCCESS) {
-        xil_printf("APP: load param failed\r\n");
+    if (load_param_and_init(&npu, INT8_PARAM_FILE, &header) != XST_SUCCESS) {
         return XST_FAILURE;
     }
-    if (int8_npu_read_param_header(g_param, param_size, &header) !=
-        XST_SUCCESS) {
-        xil_printf("APP: read param header failed\r\n");
-        return XST_FAILURE;
-    }
-    if (int8_npu_validate_param_header(&header, param_size) != XST_SUCCESS) {
-        return XST_FAILURE;
-    }
-
-    memset(g_output, 0, sizeof(g_output));
-
-    Xil_DCacheFlushRange((UINTPTR)g_param, param_size);
-    Xil_DCacheFlushRange((UINTPTR)g_input, INT8_INPUT_BYTES);
-    Xil_DCacheFlushRange((UINTPTR)g_output, INT8_OUTPUT_BYTES);
-
-    if (int8_npu_run_init(&npu, (UINTPTR)g_param, header.uop_count,
-                          INT8_NPU_TIMEOUT_POLLS) != XST_SUCCESS) {
-        xil_printf("APP: MODE_INIT failed\r\n");
-        return XST_FAILURE;
-    }
-    xil_printf("APP: MODE_INIT done\r\n");
 
 #if INT8_APP_ENABLE_VAL_SET_TEST
 #if INT8_APP_ENABLE_SINGLE_PERF_BEFORE_VAL

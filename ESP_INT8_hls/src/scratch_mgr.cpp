@@ -152,7 +152,9 @@ static bool make_contiguous_scratch_desc(unsigned idx,
                                          u16_t c,
                                          tensor_desc_t& desc) {
 #pragma HLS INLINE
-  const u32_t bytes = static_cast<u32_t>(h) * static_cast<u32_t>(w) * static_cast<u32_t>(c);
+  const u32_t row_bytes =
+      (static_cast<u32_t>(w) * static_cast<u32_t>(c) + 31U) & static_cast<u32_t>(~31U);
+  const u32_t bytes = static_cast<u32_t>(h) * row_bytes;
   if (slot_bytes.to_uint() == 0U || bytes > slot_bytes) {
     desc = tensor_desc_t();
     return false;
@@ -163,7 +165,7 @@ static bool make_contiguous_scratch_desc(unsigned idx,
   desc.h = h;
   desc.w = w;
   desc.c = c;
-  desc.reserved0 = c;
+  desc.reserved0 = c | static_cast<u16_t>(TENSOR_ROW_ALIGN32);
   desc.base_offset = base + static_cast<u32_t>(idx) * slot_bytes;
   desc.reserved1 = 0;
   return true;
@@ -228,7 +230,7 @@ static tensor_desc_t make_block5_scratch_desc(u32_t base_offset,
   tensor_desc_t desc;
   desc.bank_id = static_cast<u8_t>(static_cast<unsigned>(BANK_FMEM0));
   desc.elem_bytes = static_cast<u8_t>(1);
-  desc.reserved0 = static_cast<u16_t>(channels.to_uint());
+  desc.reserved0 = static_cast<u16_t>(channels.to_uint() | TENSOR_ROW_ALIGN32);
   desc.base_offset = base_offset;
   desc.h = rows;
   desc.w = out_w;
@@ -256,16 +258,15 @@ bool resolve_block5_scratch_descs(u16_t pattern,
       c3.to_uint() == 0U || c4.to_uint() == 0U) {
     return false;
   }
-  const u32_t row_pixels = static_cast<u32_t>(rows.to_uint() * out_w.to_uint());
   u32_t cursor = block5_scratch_base(pattern, first_branch_param);
   s0 = make_block5_scratch_desc(cursor, rows, out_w, c0);
-  cursor += row_pixels * static_cast<u32_t>(c0);
+  cursor += static_cast<u32_t>(rows) * tensor_row_stride_bytes(s0);
   s1 = make_block5_scratch_desc(cursor, rows, out_w, c1);
-  cursor += row_pixels * static_cast<u32_t>(c1);
+  cursor += static_cast<u32_t>(rows) * tensor_row_stride_bytes(s1);
   s2 = make_block5_scratch_desc(cursor, rows, out_w, c2);
-  cursor += row_pixels * static_cast<u32_t>(c2);
+  cursor += static_cast<u32_t>(rows) * tensor_row_stride_bytes(s2);
   s3 = make_block5_scratch_desc(cursor, rows, out_w, c3);
-  cursor += row_pixels * static_cast<u32_t>(c3);
+  cursor += static_cast<u32_t>(rows) * tensor_row_stride_bytes(s3);
   s4 = make_block5_scratch_desc(cursor, rows, out_w, c4);
   return true;
 }
@@ -493,7 +494,7 @@ static bool make_slice_alias_desc(const tensor_desc_t& base_desc,
                                   u16_t c,
                                   tensor_desc_t& alias) {
 #pragma HLS INLINE
-  const u16_t phys_c = (base_desc.reserved0.to_uint() == 0U) ? base_desc.c : base_desc.reserved0;
+  const u16_t phys_c = tensor_phys_c(base_desc);
   const u16_t abs_c_offset = static_cast<u16_t>(base_desc.reserved1 + c_offset);
   if (static_cast<unsigned>(abs_c_offset.to_uint() + c.to_uint()) > phys_c.to_uint()) {
     alias = tensor_desc_t();
@@ -502,7 +503,7 @@ static bool make_slice_alias_desc(const tensor_desc_t& base_desc,
 
   alias = base_desc;
   alias.c = c;
-  alias.reserved0 = phys_c;
+  alias.reserved0 = phys_c | (base_desc.reserved0 & static_cast<u16_t>(TENSOR_ROW_ALIGN32));
   alias.reserved1 = abs_c_offset;
   return true;
 }

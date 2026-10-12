@@ -26,24 +26,26 @@ def macro(name: str) -> str:
     return match.group(1)
 
 
-class DualProfileAppContract(unittest.TestCase):
-    def test_fixed_h256w512_geometry(self):
-        self.assertEqual(macro("INT8_APP_INPUT_H"), "256U")
-        self.assertEqual(macro("INT8_APP_INPUT_W"), "512U")
-        self.assertEqual(macro("INT8_APP_INPUT_C"), "3U")
-        self.assertEqual(macro("INT8_APP_OUTPUT_H"), "256U")
-        self.assertEqual(macro("INT8_APP_OUTPUT_W"), "512U")
+class GraySingleAppContract(unittest.TestCase):
+    def test_fixed_h240w240_c1_geometry(self):
+        self.assertEqual(macro("INT8_APP_INPUT_H"), "240U")
+        self.assertEqual(macro("INT8_APP_INPUT_W"), "240U")
+        self.assertEqual(macro("INT8_APP_INPUT_C"), "1U")
+        self.assertEqual(macro("INT8_APP_OUTPUT_H"), "240U")
+        self.assertEqual(macro("INT8_APP_OUTPUT_W"), "240U")
         self.assertIn("INT8_APP_INPUT_H * INT8_APP_INPUT_W * INT8_APP_INPUT_C",
                       macro("INT8_INPUT_BYTES"))
         self.assertIn("INT8_APP_OUTPUT_H * INT8_APP_OUTPUT_W",
                       macro("INT8_OUTPUT_BYTES"))
 
-    def test_dual_single_full_network_mode_is_exclusive(self):
-        self.assertEqual(macro("INT8_APP_ENABLE_DUAL_SINGLE_TEST"), "1U")
+    def test_binary_single_full_network_mode_is_exclusive(self):
+        self.assertEqual(macro("INT8_APP_ENABLE_DUAL_SINGLE_TEST"), "0U")
         self.assertEqual(macro("INT8_APP_ENABLE_EXEC_PREFIX_PROFILE"), "0U")
         self.assertEqual(macro("INT8_APP_ENABLE_VAL_SET_TEST"), "0U")
         self.assertEqual(macro("INT8_APP_ENABLE_DUAL_VAL_SET_TEST"), "0U")
-        self.assertIn("return run_dual_single_image(&npu);", MAIN)
+        self.assertEqual(macro("INT8_APP_DEPLOYMENT_NAME"), '"binary2"')
+        self.assertEqual(macro("INT8_APP_EXPECTED_CLASS_COUNT"), "2U")
+        self.assertIn("return run_single_image(&npu, header.uop_count", MAIN)
 
     def test_new_platform_requires_conv_internal_profile(self):
         self.assertEqual(macro("INT8_APP_REQUIRE_CONV_PROFILE"), "1U")
@@ -61,27 +63,28 @@ class DualProfileAppContract(unittest.TestCase):
         self.assertIn("POST bins classify psum words", HAL)
         self.assertIn("not phase times", HAL)
 
-    def test_build_identifies_round4r_platform_and_retains_timer_units(self):
-        self.assertIn("-H256W512-R4R-DUAL-PROF",
-                      macro("INT8_APP_BUILD_TAG"))
-        self.assertIn(r"platform_r4_0922\export\platform_r4_0922", APP_YAML)
-        self.assertIn("Platform: platform_r4_0922", README)
-        self.assertIn("Round 4R", README)
-        self.assertIn("WNS=+0.293 ns", README)
+    def test_build_identifies_h240_platform_and_retains_timer_units(self):
+        self.assertEqual(macro("INT8_APP_BUILD_TAG"),
+                         '"INT8-BOARD-20261011-P7-H240W240-GRAY-B2"')
+        self.assertIn(r"platform_h240_1012\export\platform_h240_1012", APP_YAML)
+        self.assertIn("Platform: platform_h240_1012", README)
+        self.assertIn("WNS=+0.252 ns", README)
         self.assertIn("routing errors=0", README)
         self.assertEqual(macro("INT8_APP_PL_TARGET_HZ"), "100000000ULL")
         self.assertEqual(macro("INT8_APP_PL_TARGET_PERIOD_NS"), "10U")
         self.assertIn("CNTPCT_EL0", MAIN)
         self.assertIn("CNTFRQ_EL0", MAIN)
+        launch = (ROOT / "ESP_INT8_app" / "_ide" / "launch.json").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("platform_h240_1012", launch)
+        self.assertNotIn("platform_r5a_0928", launch)
 
     def test_model_files_are_short_and_resolution_specific(self):
         expected = {
-            "INT8_APP_BINARY_PARAM_FILE": '"P2H.BIN"',
-            "INT8_APP_BINARY_SINGLE_INPUT_FILE": '"I2H.BIN"',
-            "INT8_APP_BINARY_SINGLE_OUTPUT_FILE": '"O2H.BIN"',
-            "INT8_APP_CLASS20_PARAM_FILE": '"P20H.BIN"',
-            "INT8_APP_CLASS20_SINGLE_INPUT_FILE": '"I20H.BIN"',
-            "INT8_APP_CLASS20_SINGLE_OUTPUT_FILE": '"O20H.BIN"',
+            "INT8_PARAM_FILE": '"P2G.BIN"',
+            "INT8_INPUT_FILE": '"I2G.BIN"',
+            "INT8_OUTPUT_FILE": '"O2G.BIN"',
         }
         for name, value in expected.items():
             self.assertEqual(macro(name), value)
@@ -92,31 +95,40 @@ class DualProfileAppContract(unittest.TestCase):
         self.assertEqual(macro("INT8_EXPECTED_UOP_COUNT"), "75U")
         self.assertEqual(macro("INT8_EXPECTED_EXEC_PLAN_COUNT"), "16U")
         self.assertIn("incomplete exec plan", MAIN)
+        init_start = MAIN.index("static int load_param_and_init(")
+        init_end = MAIN.index("\nstatic int ", init_start + 1)
+        init_body = MAIN[init_start:init_end]
+        self.assertNotIn("#if INT8_APP_ENABLE_DUAL_SINGLE_TEST", init_body)
+        main_body = MAIN[MAIN.index("int main(void)"):]
+        self.assertIn("load_param_and_init(&npu, INT8_PARAM_FILE, &header)", main_body)
+        self.assertNotIn("SD_LoadFileToMemory(INT8_PARAM_FILE", main_body)
 
-    def test_each_model_gets_full_stage_dump_and_error_check(self):
+    def test_single_model_gets_full_stage_dump_and_error_check(self):
         self.assertIn("run_full_infer_once(npu, uop_count, &cycles, 1U)", MAIN)
         self.assertIn("stage_counter_read_stage(12U) != 0ULL", MAIN)
-        self.assertRegex(
-            MAIN, r'run_single_image\(\s*npu, header\.uop_count, "binary2"'
-        )
-        self.assertRegex(
-            MAIN, r'run_single_image\(\s*npu, header\.uop_count, "cityscapes20"'
-        )
 
-    def test_one_model_failure_does_not_skip_the_other_profile(self):
-        start = MAIN.index("static int run_dual_single_image(")
+    def test_timing_excludes_cache_sd_and_counter_printing(self):
+        start = MAIN.index("static int run_infer_once(")
         end = MAIN.index("\nstatic int ", start + 1)
         body = MAIN[start:end]
-        self.assertIn("binary_status", body)
-        self.assertIn("class20_status", body)
-        self.assertIn("profile,classes,result,arm_ticks", body)
-        self.assertEqual(body.count("return "), 1)
-
+        self.assertLess(body.index("Xil_DCacheFlushRange"),
+                        body.index("start = read_timer_counter()"))
+        self.assertLess(body.index("end = read_timer_counter()"),
+                        body.index("Xil_DCacheInvalidateRange"))
+        self.assertNotIn("SD_LoadFileToMemory", body)
+        self.assertNotIn("SD_SaveMemoryToFile", body)
+        self.assertIn("INT8_NPU_TIMEOUT_POLLS", body)
         single_start = MAIN.index("static int run_single_image(")
         single_end = MAIN.index("\nstatic int ", single_start + 1)
         single_body = MAIN[single_start:single_end]
         self.assertLess(single_body.index("*arm_ticks = cycles"),
                         single_body.index("validate_output_classes("))
+
+    def test_all_ddr_buffers_are_cache_line_aligned(self):
+        for name in ("g_input", "g_output", "g_param"):
+            self.assertRegex(MAIN, rf"{name}\[.*?\].*?aligned\(64\)")
+        self.assertEqual(macro("INT8_PARAM_HW_WORDS"), "8192U")
+        self.assertEqual(macro("INT8_PARAM_HW_WORD_BYTES"), "32U")
 
 
 if __name__ == "__main__":

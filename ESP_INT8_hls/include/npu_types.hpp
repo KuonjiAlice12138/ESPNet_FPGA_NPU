@@ -59,13 +59,29 @@ enum error_code_t : std::uint16_t {
 struct tensor_desc_t {
   u8_t bank_id;
   u8_t elem_bytes;
-  u16_t reserved0;     // physical channel stride when non-zero
+  u16_t reserved0;     // bit15: align rows to 32B; low15: physical C (0 means c)
   u32_t base_offset;
   u16_t h;
   u16_t w;
   u16_t c;
   u16_t reserved1;     // channel offset inside physical row
 };
+
+constexpr unsigned TENSOR_ROW_ALIGN32 = 0x8000U;
+constexpr unsigned TENSOR_PHYS_C_MASK = 0x7fffU;
+
+static inline u16_t tensor_phys_c(const tensor_desc_t& desc) {
+#pragma HLS INLINE
+  const u16_t channels = desc.reserved0 & static_cast<u16_t>(TENSOR_PHYS_C_MASK);
+  return channels.to_uint() == 0U ? desc.c : channels;
+}
+
+static inline u32_t tensor_row_stride_bytes(const tensor_desc_t& desc) {
+#pragma HLS INLINE
+  const u32_t bytes = static_cast<u32_t>(desc.w) * static_cast<u32_t>(tensor_phys_c(desc));
+  return (desc.reserved0.to_uint() & TENSOR_ROW_ALIGN32) != 0U
+             ? static_cast<u32_t>((bytes + 31U) & static_cast<u32_t>(~31U)) : bytes;
+}
 
 struct conv_qparam_t {
   i32_t bias[32];

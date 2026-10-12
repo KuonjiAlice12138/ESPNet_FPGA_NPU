@@ -58,7 +58,7 @@ static bool validate_v4_schedule_contract() {
 
     tensor_desc_t input_desc;
     ok &= expect(param_dma_get_tensor_desc(TID_INPUT, input_desc), "input tensor desc loaded");
-    ok &= expect(input_desc.h == 256 && input_desc.w == 512 && input_desc.c == 3,
+    ok &= expect(input_desc.h == 240 && input_desc.w == 240 && input_desc.c == 1,
                  "input tensor shape matches PARAM v4 contract");
 
     conv_exec_desc_t conv0;
@@ -66,38 +66,39 @@ static bool validate_v4_schedule_contract() {
     ok &= expect(conv0.param_id == 0 && conv0.qparam_id == 0, "conv0 ids");
     ok &= expect(conv0.window_sched_id == 0, "conv0 window schedule id");
     ok &= expect(conv0.src_tensor == TID_INPUT && conv0.dst_tensor == TID_B1_CAT, "conv0 tensors");
-    ok &= expect(conv0.in_h == 256 && conv0.in_w == 512 && conv0.in_c == 3, "conv0 input shape");
+    ok &= expect(conv0.in_h == 240 && conv0.in_w == 240 && conv0.in_c == 1, "conv0 input shape");
     ok &= expect(conv0.out_c == 16 && conv0.kernel == 3 && conv0.k_tiles == 1, "conv0 geometry");
     ok &= expect(conv0.weight_words == 16, "conv0 active-OC packed weight words");
 
     window_sched_desc_t sched0;
     ok &= expect(param_dma_get_window_sched(conv0.window_sched_id, sched0), "conv0 schedule loaded");
-    ok &= expect(sched0.mode == WIN_MODE_3X3_STAGED_C3, "first layer staged C3 schedule mode");
-    ok &= expect(sched0.in_c == 3 && sched0.k_tiles == 1, "first layer schedule shape");
+    ok &= expect(sched0.mode == WIN_MODE_3X3_STAGED_C1, "first layer staged C1 schedule mode");
+    ok &= expect(sched0.in_c == 1 && sched0.k_tiles == 1, "first layer schedule shape");
     ok &= expect(sched0.stride == 2 && sched0.dilation == 1 && sched0.padding == 1, "first layer window geometry");
-    ok &= expect(sched0.out_w == 256 && sched0.cache_chunks == 1, "first layer staged window descriptor");
-    ok &= expect(sched0.cmd_count == 9, "first layer has 9 spatial pack commands");
-    ok &= expect(sched0.kt_cmd_base[0] == 0 && sched0.kt_cmd_base[1] == 9, "first layer kt command range");
+    ok &= expect(sched0.out_w == 120 && sched0.cache_chunks == 1, "first layer staged window descriptor");
+    ok &= expect(sched0.cmd_count == 0 && sched0.cmd_base == 0, "staged C1 uses a static composer, not a runtime pack program");
+    ok &= expect(sched0.kt_cmd_base[0] == 0 && sched0.kt_cmd_base[1] == 0, "retired kt command range is empty");
+    ok &= expect(sched0.reserved[WINDOW_LOADER_ROW_REUSE_WORD] == 0, "gray schedule disables retired RGB row reuse");
 
     window_sched_desc_t c12_sched;
     ok &= expect(param_dma_get_window_sched(2, c12_sched), "C12 schedule loaded");
     ok &= expect(c12_sched.mode == WIN_MODE_3X3_STAGED_C12, "C12 staged schedule mode");
     ok &= expect(c12_sched.in_c == 12 && c12_sched.k_tiles == 4, "C12 schedule shape");
-    ok &= expect(c12_sched.cache_chunks == 1 && c12_sched.cache_col_slots == 3, "C12 cache descriptor");
-    ok &= expect(c12_sched.cmd_count == 11, "C12 schedule is segment-level, not lane-level");
+    ok &= expect(c12_sched.cache_chunks == 1 && c12_sched.cache_col_slots == 4, "C12 cache descriptor");
+    ok &= expect(c12_sched.cmd_count == 0, "C12 uses a static composer without runtime pack commands");
 
     window_sched_desc_t c25_sched;
-    ok &= expect(param_dma_get_window_sched(5, c25_sched), "C25 schedule loaded");
+    ok &= expect(param_dma_get_window_sched(9, c25_sched), "C25 schedule loaded");
     ok &= expect(c25_sched.mode == WIN_MODE_3X3_STAGED_C25, "C25 staged schedule mode");
     ok &= expect(c25_sched.in_c == 25 && c25_sched.k_tiles == 8, "C25 schedule shape");
-    ok &= expect(c25_sched.cache_chunks == 1 && c25_sched.cache_col_slots == 3, "C25 cache descriptor");
-    ok &= expect(c25_sched.cmd_count == 16, "C25 schedule is segment-level, not lane-level");
+    ok &= expect(c25_sched.cache_chunks == 1 && c25_sched.cache_col_slots == 4, "C25 cache descriptor");
+    ok &= expect(c25_sched.cmd_count == 0, "C25 uses a static composer without runtime pack commands");
 
     row_consumer_desc_t row3;
     ok &= expect(param_dma_get_row_consumer(3, row3), "row consumer 3 loaded");
-    ok &= expect(row3.mode == ROW_CONSUMER_STORE && row3.store_dst_tensor == TID_L20_CAT,
-                 "row consumer 3 is level2 store slice");
-    ok &= expect(row3.store_c_offset == 16 && row3.valid_c == 12, "row consumer 3 slice");
+    ok &= expect(row3.mode == ROW_CONSUMER_NONE && row3.store_dst_tensor == 255,
+                 "BLOCK5 branch is scratch-owned, not an old concat store slice");
+    ok &= expect(row3.store_c_offset == 0 && row3.valid_c == 12, "BLOCK5 branch has twelve valid scratch channels");
 
     exec_plan_entry_t entry0;
     ok &= expect(param_dma_get_exec_entry(0, entry0), "exec entry 0 loaded");
@@ -121,7 +122,7 @@ static bool validate_v4_schedule_contract() {
 }
 
 int main() {
-    const char* blob_path = "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_r2_v4/PARAM.BIN";
+    const char* blob_path = "D:/ESP_INT8/hw_artifacts/binary2_int8_h240w240_gray_v4/PARAM.BIN";
     std::vector<esp_int8::axi_vec_t> param;
     std::size_t byte_count = 0;
     if (!load_blob(blob_path, param, byte_count)) {

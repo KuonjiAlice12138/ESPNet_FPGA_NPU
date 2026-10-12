@@ -15,10 +15,6 @@ bool on_chip_memory_write_aligned_full_tile(const tensor_desc_t& desc,
                                             u16_t c_begin,
                                             axi_vec_t packed);
 
-static u16_t store_tensor_phys_c(const tensor_desc_t& desc) {
-#pragma HLS INLINE
-  return (desc.reserved0.to_uint() == 0U) ? desc.c : desc.reserved0;
-}
 
 static bool row_contiguous_write_plan_ok(const tensor_desc_t& dst,
                                          u16_t width,
@@ -31,11 +27,11 @@ static bool row_contiguous_write_plan_ok(const tensor_desc_t& dst,
     return false;
   }
   if (dst.w.to_uint() != w_u || dst.c.to_uint() != c_u ||
-      store_tensor_phys_c(dst).to_uint() != c_u ||
+      tensor_phys_c(dst).to_uint() != c_u ||
       dst.reserved1.to_uint() != 0U) {
     return false;
   }
-  const unsigned row_bytes = w_u * c_u;
+  const unsigned row_bytes = tensor_row_stride_bytes(dst).to_uint();
   if ((row_bytes & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U) {
     return false;
   }

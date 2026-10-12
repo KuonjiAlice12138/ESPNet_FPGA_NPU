@@ -6,9 +6,6 @@
 #include "../include/npu_schedule.hpp"
 #include "../include/npu_uop.hpp"
 
-#ifndef __SYNTHESIS__
-#include <fstream>
-#endif
 
 namespace esp_int8 {
 
@@ -22,12 +19,6 @@ bool avgpool_unit_checked(const tensor_desc_t& src,
                           const tensor_desc_t& dst,
                           const pool_q_t& qparam,
                           i8_t* fmbuf_base);
-bool on_chip_memory_read_packed_tile(const tensor_desc_t& desc,
-                                     i32_t h,
-                                     i32_t w,
-                                     u16_t c_begin,
-                                     u8_t valid_c,
-                                     act_vec_t& packed);
 void reset_scratch_state();
 void select_scratch_region_for_fields(u8_t opcode,
                                       u8_t param_id,
@@ -52,7 +43,6 @@ static bool s_param_ready = false;
 #ifndef __SYNTHESIS__
 static unsigned s_csim_last_uop = 0;
 static error_code_t s_csim_last_error = ERR_NONE;
-static bool s_csim_tensor_dumped = false;
 
 unsigned csim_last_uop() {
   return s_csim_last_uop;
@@ -84,8 +74,6 @@ static u32_t runtime_expected_uop_count(std::uint32_t raw_uop_count) {
 }
 
 static bool csim_stop_before_logical_uop(unsigned uop_id);
-static bool csim_dump_tensor_set_pre(unsigned logical_uop);
-static bool csim_dump_tensor_set_post(unsigned logical_uop);
 
 static u16_t ceil_div_u16(u16_t a, u16_t b) {
 #pragma HLS INLINE
@@ -111,10 +99,6 @@ bool alias_tensor_to_slice(u8_t tensor_id,
   return false;
 }
 
-static u16_t conv_effective_stride(const conv_cfg_t& cfg) {
-#pragma HLS INLINE
-  return (cfg.stride == 0) ? static_cast<u16_t>(1) : static_cast<u16_t>(cfg.stride);
-}
 
 void main_ctrl_set_csim_last_uop(unsigned logical_uop) {
 #pragma HLS INLINE
@@ -139,15 +123,6 @@ bool main_ctrl_csim_stop_before_logical_uop(unsigned logical_uop) {
   return csim_stop_before_logical_uop(logical_uop);
 }
 
-bool main_ctrl_csim_dump_tensor_set_pre(unsigned logical_uop) {
-#pragma HLS INLINE
-  return csim_dump_tensor_set_pre(logical_uop);
-}
-
-bool main_ctrl_csim_dump_tensor_set_post(unsigned logical_uop) {
-#pragma HLS INLINE
-  return csim_dump_tensor_set_post(logical_uop);
-}
 
 static error_code_t run_scheduled_pool_op(const fixed_exec_desc_t& desc) {
 #pragma HLS INLINE off
@@ -283,9 +258,6 @@ static void core_mode_init(const axi_vec_t* gmem_param) {
 #pragma HLS INLINE off
   reset_scratch_state();
   s_param_ready = false;
-#ifndef __SYNTHESIS__
-  s_csim_tensor_dumped = false;
-#endif
 
   load_param_header(gmem_param, s_param_header);
   const error_code_t err = validate_param_header(s_param_header);
@@ -361,350 +333,12 @@ static error_code_t core_mode_run(const axi_vec_t* gmem_frame_in,
   return ERR_NONE;
 }
 
-#if !defined(__SYNTHESIS__) && \
-    (defined(ESP_INT8_CSIM_DUMP_DEBUG_SET) || \
-     defined(ESP_INT8_CSIM_DUMP_L2_SET) || \
-     (defined(ESP_INT8_CSIM_DUMP_AFTER_UOP) && defined(ESP_INT8_CSIM_DUMP_TENSOR_ID)))
-
-static std::uint8_t csim_act_byte(const act_vec_t& word, int lane) {
-  return static_cast<std::uint8_t>(word.range(lane * 8 + 7, lane * 8).to_uint());
-}
-
-static bool csim_dump_tensor_named(u8_t tensor_id,
-                                   const char* filename,
-                                   unsigned logical_uop) {
-  tensor_desc_t desc;
-  if (!resolve_tensor_read(tensor_id, desc)) {
-    std::printf("[CSIM-DUMP] failed to resolve tensor=%u at logical_uop=%u file=%s\n",
-                static_cast<unsigned>(tensor_id.to_uint()),
-                logical_uop,
-                filename);
-    return false;
-  }
-
-  std::ofstream out(filename, std::ios::binary);
-  if (!out) {
-    std::printf("[CSIM-DUMP] failed to open %s\n", filename);
-    return false;
-  }
-
-  const unsigned h_count = desc.h.to_uint();
-  const unsigned w_count = desc.w.to_uint();
-  const unsigned c_count = desc.c.to_uint();
-
-  std::uint8_t bytes[TM];
-  for (unsigned h = 0; h < h_count; ++h) {
-    for (unsigned w = 0; w < w_count; ++w) {
-      for (unsigned c = 0; c < c_count; c += static_cast<unsigned>(TM)) {
-        const unsigned remaining = c_count - c;
-        const unsigned lanes =
-            (remaining < static_cast<unsigned>(TM))
-                ? remaining
-                : static_cast<unsigned>(TM);
-
-        act_vec_t packed = 0;
-        if (!on_chip_memory_read_packed_tile(desc,
-                                             static_cast<i32_t>(h),
-                                             static_cast<i32_t>(w),
-                                             static_cast<u16_t>(c),
-                                             static_cast<u8_t>(lanes),
-                                             packed)) {
-          std::printf("[CSIM-DUMP] read failed tensor=%u h=%u w=%u c=%u file=%s\n",
-                      static_cast<unsigned>(tensor_id.to_uint()),
-                      h,
-                      w,
-                      c,
-                      filename);
-          return false;
-        }
-
-        for (unsigned lane = 0; lane < lanes; ++lane) {
-          bytes[lane] = csim_act_byte(packed, static_cast<int>(lane));
-        }
-        out.write(reinterpret_cast<const char*>(bytes),
-                  static_cast<std::streamsize>(lanes));
-      }
-    }
-  }
-
-  std::printf("[CSIM-DUMP] wrote %s tensor=%u after/pre uop=%u shape=%ux%ux%u bytes=%u\n",
-              filename,
-              static_cast<unsigned>(tensor_id.to_uint()),
-              logical_uop,
-              h_count,
-              w_count,
-              c_count,
-              h_count * w_count * c_count);
-  return true;
-}
-
-static bool s_dump_u40 = false;
-static bool s_dump_u53 = false;
-static bool s_dump_pre_u68 = false;
-static bool s_dump_u68 = false;
-static bool s_dump_u70 = false;
-static bool s_dump_u71 = false;
-static bool s_dump_u38 = false;
-static bool s_dump_u39 = false;
-static bool s_dump_l2_u19 = false;
-static bool s_dump_l2_u20 = false;
-static bool s_dump_l2_u21 = false;
-static bool s_dump_l2_u22 = false;
-static bool s_dump_l2_u25 = false;
-static bool s_dump_l2_u28 = false;
-static bool s_dump_l2_u31 = false;
-static bool s_dump_l2_u35 = false;
-
-static bool csim_dump_tensor_set_pre(unsigned logical_uop) {
-#ifdef ESP_INT8_CSIM_DUMP_DEBUG_SET
-  // U67 ADD + U68 AFFINE are fused into the final conv row consumer.
-  // Dump U67 inputs before executing the logical U68 entry.
-  if (logical_uop == 68U && !s_dump_pre_u68) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L3B0_CAT)),
-                                "csim_pre_u68_l3b0_cat.bin",
-                                logical_uop)) {
-      return false;
-    }
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L30_ACT)),
-                                "csim_pre_u68_l30_act.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_pre_u68 = true;
-  }
-#else
-  (void)logical_uop;
-#endif
-  return true;
-}
-
-static bool csim_dump_tensor_set_post(unsigned logical_uop) {
-#if defined(ESP_INT8_CSIM_DUMP_AFTER_UOP) && defined(ESP_INT8_CSIM_DUMP_TENSOR_ID)
-  static bool s_dump_generic = false;
-  if (!s_dump_generic &&
-      logical_uop == static_cast<unsigned>(ESP_INT8_CSIM_DUMP_AFTER_UOP)) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(ESP_INT8_CSIM_DUMP_TENSOR_ID),
-                                "csim_tensor_dump.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_generic = true;
-  }
-#endif
-
-#ifdef ESP_INT8_CSIM_DUMP_DEBUG_SET
-  if (logical_uop == 40U && !s_dump_u40) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(LS_C1)),
-                                "csim_u40_level3_0_c1.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_u40 = true;
-  }
-
-  if (logical_uop == 38U && !s_dump_u38) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_B2_CAT)),
-                                "csim_u38_b2_cat.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_u38 = true;
-  }
-
-  if (logical_uop == 39U && !s_dump_u39) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_B2_ACT)),
-                                "csim_u39_b2_bn.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_u39 = true;
-  }
-
-  if (logical_uop == 53U && !s_dump_u53) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L30_ACT)),
-                                "csim_u53_level3_0_bn.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_u53 = true;
-  }
-
-  if (logical_uop == 68U && !s_dump_u68) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L3B0_ACT)),
-                                "csim_u68_l3b0_act.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_u68 = true;
-  }
-
-  if (logical_uop == 70U && !s_dump_u70) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_B3_CAT)),
-                                "csim_u70_b3_cat.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_u70 = true;
-  }
-
-  if (logical_uop == 71U && !s_dump_u71) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_B3_ACT)),
-                                "csim_u71_b3_bn.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_u71 = true;
-  }
-#endif
-
-#ifdef ESP_INT8_CSIM_DUMP_L2_SET
-  if (logical_uop == 19U && !s_dump_l2_u19) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L20_CAT)),
-                                "csim_l2_u19_l20_cat.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_l2_u19 = true;
-  }
-  if (logical_uop == 20U && !s_dump_l2_u20) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L20_ACT)),
-                                "csim_l2_u20_l20_act.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_l2_u20 = true;
-  }
-  if (logical_uop == 21U && !s_dump_l2_u21) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(LS_C1)),
-                                "csim_l2_u21_l2b0_c1.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_l2_u21 = true;
-  }
-  if (logical_uop == 22U && !s_dump_l2_u22) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L2B0_CAT)),
-                                "csim_l2_u22_l2b0_cat.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_l2_u22 = true;
-  }
-  if (logical_uop == 25U && !s_dump_l2_u25) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L2B0_CAT)),
-                                "csim_l2_u25_l2b0_cat.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_l2_u25 = true;
-  }
-  if (logical_uop == 28U && !s_dump_l2_u28) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L2B0_CAT)),
-                                "csim_l2_u28_l2b0_cat.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_l2_u28 = true;
-  }
-  if (logical_uop == 31U && !s_dump_l2_u31) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L2B0_CAT)),
-                                "csim_l2_u31_l2b0_cat.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_l2_u31 = true;
-  }
-  if (logical_uop == 35U && !s_dump_l2_u35) {
-    if (!csim_dump_tensor_named(static_cast<u8_t>(static_cast<unsigned>(TID_L2B0_ACT)),
-                                "csim_l2_u35_l2b0_act.bin",
-                                logical_uop)) {
-      return false;
-    }
-    s_dump_l2_u35 = true;
-  }
-#endif
-
-  return true;
-}
-
-#else
-
-static bool csim_dump_tensor_set_pre(unsigned) {
-#pragma HLS INLINE
-  return true;
-}
-
-static bool csim_dump_tensor_set_post(unsigned) {
-#pragma HLS INLINE
-  return true;
-}
-
-#endif
-
-#if !defined(__SYNTHESIS__) && defined(ESP_INT8_CSIM_DUMP_U40_PRESTORE)
-static unsigned s_csim_u40_prestore_rows = 0;
-
-static std::uint8_t csim_rowbuf_byte(const act_vec_t& word, int lane) {
-  return static_cast<std::uint8_t>(word.range(lane * 8 + 7, lane * 8).to_uint());
-}
-
-bool csim_dump_u40_prestore_row(const conv_exec_desc_t& conv_desc,
-                                u16_t out_row,
-                                const conv_cfg_t& cfg,
-                                const act_vec_t row_buf[MAX_FM_W]) {
-  const bool is_u40 =
-      conv_desc.param_id.to_uint() == 13U &&
-      conv_desc.dst_tensor.to_uint() == static_cast<unsigned>(LS_C1);
-  if (!is_u40) {
-    return true;
-  }
-
-  const unsigned row = out_row.to_uint();
-  const bool first_row = row == 0U || s_csim_u40_prestore_rows == 0U;
-  std::ofstream out("csim_u40_prestore_rowbuf.bin",
-                    std::ios::binary | (first_row ? std::ios::trunc : std::ios::app));
-  if (!out) {
-    std::printf("[CSIM-DUMP] failed to open csim_u40_prestore_rowbuf.bin\n");
-    return false;
-  }
-
-  const unsigned out_w = conv_out_dim(cfg.in_w, conv_effective_stride(cfg)).to_uint();
-  const unsigned out_c = cfg.out_c.to_uint();
-  std::uint8_t bytes[TM];
-  for (unsigned ow = 0; ow < out_w; ++ow) {
-    for (unsigned lane = 0; lane < out_c; ++lane) {
-      bytes[lane] = csim_rowbuf_byte(row_buf[ow], static_cast<int>(lane));
-    }
-    out.write(reinterpret_cast<const char*>(bytes),
-              static_cast<std::streamsize>(out_c));
-  }
-
-  ++s_csim_u40_prestore_rows;
-  if (row == conv_out_dim(cfg.in_h, conv_effective_stride(cfg)).to_uint() - 1U) {
-    std::printf("[CSIM-DUMP] wrote csim_u40_prestore_rowbuf.bin rows=%u shape=%ux%ux%u bytes=%u\n",
-                s_csim_u40_prestore_rows,
-                conv_out_dim(cfg.in_h, conv_effective_stride(cfg)).to_uint(),
-                out_w,
-                out_c,
-                conv_out_dim(cfg.in_h, conv_effective_stride(cfg)).to_uint() * out_w * out_c);
-  }
-  return true;
-}
-#else
-bool csim_dump_u40_prestore_row(const conv_exec_desc_t&,
-                                u16_t,
-                                const conv_cfg_t&,
-                                const act_vec_t[MAX_FM_W]) {
-#pragma HLS INLINE
-  return true;
-}
-#endif
 
 }  // namespace esp_int8
 
-static_assert(esp_int8::INPUT_FRAME_AXI_WORDS == 12288,
+static_assert(esp_int8::INPUT_FRAME_AXI_WORDS == 1800,
               "Update gmem_frame_in m_axi depth when INPUT_FRAME_AXI_WORDS changes.");
-static_assert(esp_int8::OUTPUT_FRAME_AXI_WORDS == 4096,
+static_assert(esp_int8::OUTPUT_FRAME_AXI_WORDS == 1800,
               "Update gmem_frame_out m_axi depth when OUTPUT_FRAME_AXI_WORDS changes.");
 
 void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
@@ -720,8 +354,8 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
                               volatile esp_int8::u8_t& prof_conv_sa_state,
                               volatile esp_int8::u8_t& prof_conv_post_state) {
 #ifdef ESP_INT8_COSIM_LITE
-#pragma HLS INTERFACE ap_memory port=gmem_frame_in depth=12288
-#pragma HLS INTERFACE ap_memory port=gmem_frame_out depth=4096
+#pragma HLS INTERFACE ap_memory port=gmem_frame_in depth=1800
+#pragma HLS INTERFACE ap_memory port=gmem_frame_out depth=1800
 #pragma HLS INTERFACE ap_memory port=gmem_param depth=8192
 #pragma HLS INTERFACE ap_none port=mode
 #pragma HLS INTERFACE ap_none port=uop_count
@@ -734,8 +368,8 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
 #pragma HLS INTERFACE ap_none port=prof_conv_post_state register
 #pragma HLS INTERFACE ap_ctrl_hs port=return
 #else
-#pragma HLS INTERFACE m_axi port=gmem_frame_in offset=slave bundle=gmem0 depth=12288 max_read_burst_length=64 num_read_outstanding=4
-#pragma HLS INTERFACE m_axi port=gmem_frame_out offset=slave bundle=gmem1 depth=4096 max_write_burst_length=64 num_write_outstanding=4
+#pragma HLS INTERFACE m_axi port=gmem_frame_in offset=slave bundle=gmem0 depth=1800 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS INTERFACE m_axi port=gmem_frame_out offset=slave bundle=gmem1 depth=1800 max_write_burst_length=64 num_write_outstanding=4
 #pragma HLS INTERFACE m_axi port=gmem_param offset=slave bundle=gmem2 depth=8192 max_read_burst_length=64 num_read_outstanding=4
 #pragma HLS INTERFACE ap_vld port=prof_stage_id register
 #pragma HLS INTERFACE ap_none port=prof_active register

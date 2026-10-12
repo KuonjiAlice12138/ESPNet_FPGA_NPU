@@ -525,25 +525,21 @@ def test_serial_row_wingen_source_contract() -> None:
         "window_load_word_t",
         "narrow_paired_issue_plan_t",
         "window_row_loader_narrow_paired",
-        "window_row_loader_narrow_reuse",
         "window_loader_emit_narrow_cached_window",
-        "window_loader_emit_narrow_reuse_window",
         "window_row_assembler_read_narrow_window",
         "select_narrow_transfer_protocol",
         "window_row_loader_narrow_incremental_c12",
-        "window_row_loader_narrow_incremental_c3_reuse",
         "window_loader_emit_narrow_direct_run<4>",
         "window_loader_emit_narrow_direct_run<2>",
-        "window_loader_emit_narrow_reuse_run<5>",
-        "window_loader_emit_narrow_reuse_run<4>",
         "window_assembler_consume_c12_incremental",
-        "window_assembler_consume_c3_reuse_incremental",
         "narrow_incremental_cache_t incremental_cache",
         "s_narrow_row_bank0",
         "s_narrow_row_bank1",
         "s_narrow_row_bank2",
     ):
         assert required in win_source
+    assert "s_narrow_reuse_" not in win_source
+    assert "c3_reuse_incremental" not in win_source
     assert "static narrow_incremental_cache_t" not in win_source
     assert "narrow_issue_stream" not in win_source
     assert "ESP_INT8_CSIM_VALIDATE_INCREMENTAL_TRANSFER" in win_source
@@ -728,14 +724,17 @@ def test_avgpool_single_pixel_schedule_contract() -> None:
     )
 
     for required in (
-        "quantize_c3_avg_pixel(",
-        "sum_c3_cached_pixel(",
-        "store_c3_pixel_to_group_words(",
-        "for (int pix = 0; pix < AVGPOOL_C3_GROUP_PIXELS; ++pix)",
+        "avgpool_unit_c1(",
+        "read_c1_group_cache_row(",
+        "cached_c1_col(",
+        "for (int pix = 0; pix < AVGPOOL_C1_GROUP_PIXELS; ++pix)",
+        "out_word >>= 8",
+        "fill == AXI_WORD_BYTES",
     ):
         assert required in source
 
     for obsolete in (
+        "AVGPOOL_C3_",
         "quantize_c3_avg_pixel_pair",
         "sum_c3_cached_pixel_pair",
         "avgpool_group_buffer_t",

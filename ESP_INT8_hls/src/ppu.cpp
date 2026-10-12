@@ -56,14 +56,10 @@ static u16_t ppu_effective_stride(const conv_cfg_t& cfg) {
   return (cfg.stride == 0) ? static_cast<u16_t>(1) : static_cast<u16_t>(cfg.stride);
 }
 
-static u16_t ppu_tensor_phys_c(const tensor_desc_t& desc) {
-#pragma HLS INLINE
-  return (desc.reserved0.to_uint() == 0U) ? desc.c : desc.reserved0;
-}
 
 static bool ppu_can_use_aligned_full_tile(const tensor_desc_t& desc, u16_t c_begin) {
 #pragma HLS INLINE
-  const unsigned phys_c = ppu_tensor_phys_c(desc).to_uint();
+  const unsigned phys_c = tensor_phys_c(desc).to_uint();
   const unsigned start_c = desc.reserved1.to_uint() + c_begin.to_uint();
   const unsigned base_start = desc.base_offset.to_uint() + start_c;
   return phys_c >= static_cast<unsigned>(AXI_WORD_BYTES) &&
@@ -96,8 +92,7 @@ static bool ppu_full_aligned_tile_write_plan_ok(const tensor_desc_t& desc, u16_t
 static u32_t ppu_compact_row_base(const tensor_desc_t& dst, u16_t out_row) {
 #pragma HLS INLINE
   return dst.base_offset +
-         static_cast<u32_t>(out_row) * static_cast<u32_t>(dst.w) *
-             static_cast<u32_t>(ppu_tensor_phys_c(dst)) +
+         static_cast<u32_t>(out_row) * tensor_row_stride_bytes(dst) +
          static_cast<u32_t>(dst.reserved1);
 }
 
@@ -155,7 +150,7 @@ static void ppu_apply_add_word(const act_vec_t& lhs_word,
   ppu_pack_lanes(out_lanes, out_word);
 }
 
-static void ppu_apply_c19_affine_word(const act_vec_t& in_word,
+static void ppu_apply_compact_affine_word(const act_vec_t& in_word,
                                       u8_t valid_c,
                                       const aff_q_t& qparam0,
                                       const aff_q_t& qparam1,
@@ -334,9 +329,9 @@ static bool ppu_layout_to_compact_shape(u16_t store_layout, u8_t& valid_c, u8_t&
       valid_c = static_cast<u8_t>(16);
       phys_c = static_cast<u8_t>(16);
       return true;
-    case static_cast<unsigned>(STORE_LAYOUT_COMPACT_C19):
-      valid_c = static_cast<u8_t>(19);
-      phys_c = static_cast<u8_t>(19);
+    case static_cast<unsigned>(STORE_LAYOUT_COMPACT_C17):
+      valid_c = static_cast<u8_t>(17);
+      phys_c = static_cast<u8_t>(17);
       return true;
     case static_cast<unsigned>(STORE_LAYOUT_COMPACT_C25):
       valid_c = static_cast<u8_t>(25);
@@ -496,7 +491,7 @@ static bool ppu_transform_conv_word(const row_consumer_desc_t& consumer,
   }
   act_vec_t merged_word = 0;
   ppu_cat_tail_word(conv_word, tail_word, prefix_c, tail_c, merged_word);
-  ppu_apply_c19_affine_word(merged_word,
+  ppu_apply_compact_affine_word(merged_word,
                             valid_c,
                             affine0,
                             affine1,
@@ -669,13 +664,12 @@ static bool ppu_init_block5_compact_cursor(const tensor_desc_t& src,
                                            ppu_block5_compact_cursor_t& cursor) {
 #pragma HLS INLINE off
   if (src.bank_id.to_uint() != static_cast<unsigned>(BANK_FMEM0) ||
-      ppu_tensor_phys_c(src).to_uint() != bytes_per_pixel) {
+      tensor_phys_c(src).to_uint() != bytes_per_pixel) {
     return false;
   }
   const u32_t start_offset =
       src.base_offset +
-      static_cast<u32_t>(local_row) * static_cast<u32_t>(src.w) *
-          static_cast<u32_t>(bytes_per_pixel) +
+      static_cast<u32_t>(local_row) * tensor_row_stride_bytes(src) +
       static_cast<u32_t>(src.reserved1);
   cursor.word_offset =
       start_offset & static_cast<u32_t>(~(AXI_WORD_BYTES - 1));
@@ -1090,33 +1084,6 @@ static bool ppu_finalize_block5_static_row(const block5_sched_desc_t& sched,
   return true;
 }
 
-#ifdef ESP_INT8_CSIM_DUMP_UPSAMPLE_INPUT
-static void csim_dump_upsample_input_row(axi_vec_t* gmem_frame_out,
-                                         u16_t out_row,
-                                         u8_t valid_c,
-                                         const act_vec_t row_buf[MAX_FM_W]) {
-  const unsigned class_count = valid_c.to_uint();
-  for (int ow_i = 0; ow_i < ENCODER_OUT_W; ++ow_i) {
-    const act_vec_t packed = row_buf[ow_i];
-    const unsigned base_byte =
-        (out_row.to_uint() * static_cast<unsigned>(ENCODER_OUT_W) +
-         static_cast<unsigned>(ow_i)) *
-        class_count;
-    for (int lane = 0; lane < MAX_CLASS_C; ++lane) {
-      if (static_cast<unsigned>(lane) >= class_count) {
-        break;
-      }
-      const unsigned byte_idx = base_byte + static_cast<unsigned>(lane);
-      const unsigned word_idx = byte_idx / static_cast<unsigned>(AXI_WORD_BYTES);
-      const unsigned byte_lane = byte_idx % static_cast<unsigned>(AXI_WORD_BYTES);
-      axi_vec_t word = gmem_frame_out[word_idx];
-      word.range(byte_lane * 8 + 7, byte_lane * 8) =
-          packed.range(lane * 8 + 7, lane * 8);
-      gmem_frame_out[word_idx] = word;
-    }
-  }
-}
-#endif
 
 #if !defined(__SYNTHESIS__) && defined(ESP_INT8_CSIM_DUMP_LOWRES_LOGITS_SIDE)
 static unsigned s_csim_lowres_logits_rows = 0;
@@ -1167,11 +1134,7 @@ bool ppu_consume_upsample_row(axi_vec_t* gmem_frame_out,
     return false;
   }
 #endif
-#ifdef ESP_INT8_CSIM_DUMP_UPSAMPLE_INPUT
-  csim_dump_upsample_input_row(gmem_frame_out, out_row, valid_c, row_buf);
-#else
   upsample_fused_consume_logits_row(gmem_frame_out, out_row, valid_c, row_buf);
-#endif
   return true;
 }
 

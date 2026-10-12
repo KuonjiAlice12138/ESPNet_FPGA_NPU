@@ -7,10 +7,6 @@ namespace esp_int8 {
 static axi_vec_t s_fmbuf_uram[FMBUF_URAM_AXI_WORDS];
 static axi_vec_t s_fmbuf_bram[FMBUF_BRAM_AXI_WORDS];
 
-static u16_t desc_phys_c(const tensor_desc_t& desc) {
-#pragma HLS INLINE
-    return (desc.reserved0.to_uint() == 0U) ? desc.c : desc.reserved0;
-}
 
 static u16_t desc_c_offset(const tensor_desc_t& desc) {
 #pragma HLS INLINE
@@ -281,8 +277,8 @@ static bool read_tile_packed_word(u8_t bank_id,
 
 static u32_t tensor_elem_offset(const tensor_desc_t& desc, u16_t h, u16_t w, u16_t c) {
 #pragma HLS INLINE
-    return (static_cast<u32_t>(h) * static_cast<u32_t>(desc.w) + static_cast<u32_t>(w)) *
-               static_cast<u32_t>(desc_phys_c(desc)) +
+    return static_cast<u32_t>(h) * tensor_row_stride_bytes(desc) +
+           static_cast<u32_t>(w) * static_cast<u32_t>(tensor_phys_c(desc)) +
            static_cast<u32_t>(desc_c_offset(desc)) +
            static_cast<u32_t>(c);
 }
@@ -298,8 +294,7 @@ bool on_chip_memory_prepare_row_base(const tensor_desc_t& desc,
         return true;
     }
     row_base = desc.base_offset +
-               static_cast<u32_t>(h) * static_cast<u32_t>(desc.w) *
-                   static_cast<u32_t>(desc_phys_c(desc)) +
+               static_cast<u32_t>(h) * tensor_row_stride_bytes(desc) +
                static_cast<u32_t>(desc_c_offset(desc));
     return true;
 }

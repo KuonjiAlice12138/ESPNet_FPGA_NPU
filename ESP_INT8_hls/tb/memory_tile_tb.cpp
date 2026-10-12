@@ -1,195 +1,87 @@
 #include "../include/npu_config.hpp"
 #include "../include/npu_uop.hpp"
-
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
+#include <vector>
 
 namespace esp_int8 {
-bool on_chip_memory_get_tensor_desc(u8_t tensor_id, tensor_desc_t& desc);
-bool on_chip_memory_read_tile(u8_t tensor_id, i32_t h, i32_t w, u16_t c_begin, u8_t valid_c, i8_t tile[TM]);
-bool on_chip_memory_write_tile(u8_t tensor_id, u16_t h, u16_t w, u16_t c_begin, u8_t valid_c, const i8_t tile[TM]);
-}  // namespace esp_int8
-
-static int g_failures = 0;
-
-static std::int8_t to_i8(esp_int8::i8_t x) {
-    return static_cast<std::int8_t>(x.to_int());
+void param_dma_init(const axi_vec_t*);
+bool param_dma_ready();
+bool param_dma_get_tensor_desc(u8_t, tensor_desc_t&);
+bool on_chip_memory_write_fmbuf_abs_word(u8_t, u32_t, axi_vec_t);
+bool on_chip_memory_read_packed_tile(const tensor_desc_t&, i32_t, i32_t, u16_t, u8_t, act_vec_t&);
+bool on_chip_memory_prepare_row_base(const tensor_desc_t&, i32_t, u32_t&, bool&);
 }
 
-static void expect(bool cond, const char* msg) {
-    if (!cond) {
-        std::printf("[FAIL] %s\n", msg);
-        ++g_failures;
+static unsigned pattern(unsigned offset) {
+    return (offset * 37U + 19U) & 255U;
+}
+
+static bool test_padded_tensor(unsigned tensor_id, unsigned channels, unsigned expected_stride) {
+    using namespace esp_int8;
+    tensor_desc_t desc = {};
+    if (!param_dma_get_tensor_desc(tensor_id, desc) ||
+        tensor_phys_c(desc).to_uint() != channels ||
+        tensor_row_stride_bytes(desc).to_uint() != expected_stride ||
+        (desc.reserved0.to_uint() & TENSOR_ROW_ALIGN32) == 0U) {
+        return false;
     }
-}
-
-static void expect_lane(const char* tag, int lane, esp_int8::i8_t got, std::int8_t expected) {
-    const std::int8_t got_i8 = to_i8(got);
-    if (got_i8 != expected) {
-        std::printf("[FAIL] %s lane=%d got=%d expected=%d\n",
-                    tag,
-                    lane,
-                    static_cast<int>(got_i8),
-                    static_cast<int>(expected));
-        ++g_failures;
-    }
-}
-
-static void clear_tile(esp_int8::i8_t tile[esp_int8::TM]) {
-    for (int i = 0; i < esp_int8::TM; ++i) {
-        tile[i] = 0;
-    }
-}
-
-static void fill_seq(esp_int8::i8_t tile[esp_int8::TM], int base) {
-    for (int i = 0; i < esp_int8::TM; ++i) {
-        tile[i] = static_cast<esp_int8::i8_t>(base + i);
-    }
-}
-
-static bool write_channel_range(std::uint8_t tensor_id,
-                                std::uint16_t h,
-                                std::uint16_t w,
-                                std::uint16_t c_begin,
-                                std::uint16_t count,
-                                int base) {
-    esp_int8::i8_t tile[esp_int8::TM];
-    std::uint16_t done = 0;
-    while (done < count) {
-        clear_tile(tile);
-        const std::uint16_t n = (count - done > esp_int8::TM) ? esp_int8::TM : static_cast<std::uint16_t>(count - done);
-        for (std::uint16_t i = 0; i < n; ++i) {
-            tile[i] = static_cast<esp_int8::i8_t>(base + done + i);
+    for (unsigned i = 0; i < 2U * expected_stride; i += AXI_WORD_BYTES) {
+        axi_vec_t word = 0;
+        for (unsigned lane = 0; lane < AXI_WORD_BYTES; ++lane) {
+            word.range(lane * 8 + 7, lane * 8) = pattern(i + lane);
         }
-        if (!esp_int8::on_chip_memory_write_tile(tensor_id, h, w, c_begin + done, static_cast<esp_int8::u8_t>(n), tile)) {
+        if (!on_chip_memory_write_fmbuf_abs_word(desc.bank_id, desc.base_offset + i, word)) {
             return false;
         }
-        done += n;
     }
-    return true;
-}
-
-static void test_static_descs() {
-    esp_int8::tensor_desc_t desc;
-    expect(esp_int8::on_chip_memory_get_tensor_desc(esp_int8::TID_B2_CAT, desc), "B2 desc available");
-    expect(desc.bank_id == esp_int8::BANK_FMEM0 && desc.h == 128 && desc.w == 256 && desc.c == 131,
-           "B2 desc matches frozen tensor table");
-    expect(esp_int8::on_chip_memory_get_tensor_desc(esp_int8::TID_POOL_TMP, desc), "POOL_TMP desc available");
-    expect(desc.bank_id == esp_int8::BANK_BRAM_SCR0 && desc.h == 256 && desc.w == 512 && desc.c == 3,
-           "POOL_TMP desc matches frozen tensor table");
-    expect(esp_int8::on_chip_memory_get_tensor_desc(esp_int8::TID_POOL2, desc), "POOL2 desc available");
-    expect(desc.bank_id == esp_int8::BANK_BRAM_SCR1 && desc.h == 128 && desc.w == 256 && desc.c == 3,
-           "POOL2 desc matches frozen tensor table");
-}
-
-static void test_b1_concat_offsets() {
-    esp_int8::i8_t tile[esp_int8::TM];
-    esp_int8::i8_t rd[esp_int8::TM];
-    fill_seq(tile, 10);
-    expect(esp_int8::on_chip_memory_write_tile(esp_int8::TID_B1_CAT, 2, 3, 0, 16, tile),
-           "B1 level1 slice write c[0:15]");
-
-    clear_tile(tile);
-    tile[0] = -3;
-    tile[1] = -2;
-    tile[2] = -1;
-    expect(esp_int8::on_chip_memory_write_tile(esp_int8::TID_B1_CAT, 2, 3, 16, 3, tile),
-           "B1 pool slice write c[16:18]");
-
-    expect(esp_int8::on_chip_memory_read_tile(esp_int8::TID_B1_CAT, 2, 3, 0, 19, rd),
-           "B1 concat read c[0:18]");
-    for (int i = 0; i < 16; ++i) {
-        expect_lane("B1_CONV_SLICE", i, rd[i], static_cast<std::int8_t>(10 + i));
+    const unsigned cols[] = {0, desc.w.to_uint() - 1U};
+    for (unsigned row = 0; row < 2; ++row) {
+        u32_t row_base = 0;
+        bool valid = false;
+        if (!on_chip_memory_prepare_row_base(desc, row, row_base, valid) || !valid ||
+            row_base != desc.base_offset + row * expected_stride) {
+            return false;
+        }
+        for (unsigned col : cols) {
+            act_vec_t word = 0;
+            const unsigned begin = channels > 32 ? channels - 1U : 0U;
+            if (!on_chip_memory_read_packed_tile(desc, row, col, begin, 32, word)) {
+                return false;
+            }
+            for (unsigned lane = 0; lane < 32; ++lane) {
+                const unsigned expected = begin + lane < channels
+                    ? pattern(row * expected_stride + col * channels + begin + lane) : 0U;
+                if (word.range(lane * 8 + 7, lane * 8).to_uint() != expected) {
+                    return false;
+                }
+            }
+        }
     }
-    expect_lane("B1_POOL_SLICE", 16, rd[16], -3);
-    expect_lane("B1_POOL_SLICE", 17, rd[17], -2);
-    expect_lane("B1_POOL_SLICE", 18, rd[18], -1);
-    expect_lane("B1_TAIL_ZERO", 19, rd[19], 0);
-}
-
-static void test_b2_concat_and_cin_tail() {
-    esp_int8::i8_t rd[esp_int8::TM];
-    expect(write_channel_range(esp_int8::TID_B2_CAT, 5, 7, 0, 64, -64), "B2 block slice write c[0:63]");
-    expect(write_channel_range(esp_int8::TID_B2_CAT, 5, 7, 64, 64, 1), "B2 level2 slice write c[64:127]");
-    expect(write_channel_range(esp_int8::TID_B2_CAT, 5, 7, 128, 3, 90), "B2 pool slice write c[128:130]");
-
-    expect(esp_int8::on_chip_memory_read_tile(esp_int8::TID_B2_CAT, 5, 7, 0, 32, rd), "B2 read c[0:31]");
-    expect_lane("B2_C0", 0, rd[0], -64);
-    expect_lane("B2_C31", 31, rd[31], -33);
-
-    expect(esp_int8::on_chip_memory_read_tile(esp_int8::TID_B2_CAT, 5, 7, 64, 32, rd), "B2 read c[64:95]");
-    expect_lane("B2_C64", 0, rd[0], 1);
-    expect_lane("B2_C95", 31, rd[31], 32);
-
-    expect(esp_int8::on_chip_memory_read_tile(esp_int8::TID_B2_CAT, 5, 7, 128, 32, rd), "B2 Cin=131 tail read");
-    expect_lane("B2_C128", 0, rd[0], 90);
-    expect_lane("B2_C129", 1, rd[1], 91);
-    expect_lane("B2_C130", 2, rd[2], 92);
-    for (int i = 3; i < esp_int8::TM; ++i) {
-        expect_lane("B2_CIN_TAIL_ZERO", i, rd[i], 0);
-    }
-}
-
-static void test_padding_and_oob() {
-    esp_int8::i8_t tile[esp_int8::TM];
-    fill_seq(tile, 1);
-    expect(esp_int8::on_chip_memory_read_tile(esp_int8::TID_INPUT, -1, 0, 0, 3, tile),
-           "padding read top row succeeds");
-    for (int i = 0; i < 3; ++i) {
-        expect_lane("PAD_TOP_ZERO", i, tile[i], 0);
-    }
-
-    expect(esp_int8::on_chip_memory_read_tile(esp_int8::TID_INPUT, 512, 0, 0, 3, tile),
-           "padding read bottom row succeeds");
-    for (int i = 0; i < 3; ++i) {
-        expect_lane("PAD_BOTTOM_ZERO", i, tile[i], 0);
-    }
-
-    clear_tile(tile);
-    expect(!esp_int8::on_chip_memory_write_tile(esp_int8::TID_B1_CAT, 256, 0, 0, 1, tile),
-           "write rejects h out of range");
-    expect(!esp_int8::on_chip_memory_write_tile(esp_int8::TID_B1_CAT, 0, 0, 18, 2, tile),
-           "write rejects channel overrun");
-}
-
-static void test_scratch_banks() {
-    esp_int8::i8_t tile[esp_int8::TM];
-    esp_int8::i8_t rd[esp_int8::TM];
-    clear_tile(tile);
-    tile[0] = 11;
-    tile[1] = 12;
-    tile[2] = 13;
-    expect(esp_int8::on_chip_memory_write_tile(esp_int8::TID_POOL_TMP, 255, 511, 0, 3, tile),
-           "POOL_TMP scratch write last pixel");
-    expect(esp_int8::on_chip_memory_read_tile(esp_int8::TID_POOL_TMP, 255, 511, 0, 3, rd),
-           "POOL_TMP scratch read last pixel");
-    expect_lane("POOL_TMP_C0", 0, rd[0], 11);
-    expect_lane("POOL_TMP_C1", 1, rd[1], 12);
-    expect_lane("POOL_TMP_C2", 2, rd[2], 13);
-
-    tile[0] = -11;
-    tile[1] = -12;
-    tile[2] = -13;
-    expect(esp_int8::on_chip_memory_write_tile(esp_int8::TID_POOL2, 127, 255, 0, 3, tile),
-           "POOL2 scratch write last pixel");
-    expect(esp_int8::on_chip_memory_read_tile(esp_int8::TID_POOL2, 127, 255, 0, 3, rd),
-           "POOL2 scratch read last pixel");
-    expect_lane("POOL2_C0", 0, rd[0], -11);
-    expect_lane("POOL2_C1", 1, rd[1], -12);
-    expect_lane("POOL2_C2", 2, rd[2], -13);
+    act_vec_t padding = ~act_vec_t(0);
+    return on_chip_memory_read_packed_tile(desc, -1, 0, 0, 32, padding) && padding == 0;
 }
 
 int main() {
-    test_static_descs();
-    test_b1_concat_offsets();
-    test_b2_concat_and_cin_tail();
-    test_padding_and_oob();
-    test_scratch_banks();
-    if (g_failures != 0) {
-        std::printf("memory_tile_tb failed: %d failure(s)\n", g_failures);
+    using namespace esp_int8;
+    std::ifstream in("D:/ESP_INT8/hw_artifacts/binary2_int8_h240w240_gray_v4/PARAM.BIN",
+                     std::ios::binary);
+    const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), {});
+    if (!in || bytes.empty()) {
         return 1;
     }
-
-    std::printf("memory_tile_tb passed\n");
+    std::vector<axi_vec_t> param((bytes.size() + 31U) / 32U, 0);
+    for (unsigned i = 0; i < bytes.size(); ++i) {
+        param[i / 32].range((i % 32) * 8 + 7, (i % 32) * 8) = bytes[i];
+    }
+    param_dma_init(param.data());
+    if (!param_dma_ready() ||
+        !test_padded_tensor(TID_B1_CAT, 17, 2048) ||
+        !test_padded_tensor(TID_B2_CAT, 129, 7744)) {
+        std::printf("[FAIL] C17/C129 padded-row addressing\n");
+        return 1;
+    }
+    std::printf("memory_tile_tb passed: C17/C129 row padding, tails and boundary reads\n");
     return 0;
 }

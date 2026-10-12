@@ -653,7 +653,7 @@ def check_executor_gateways(
         "ppu_consume_conv_stream",
         "ppu_transform_conv_word",
         "ppu_write_compact_word",
-        "ppu_apply_c19_affine_word",
+        "ppu_apply_compact_affine_word",
         "ppu_apply_block_affine_word",
         "ppu_apply_block_add_affine_word",
         "ppu_init_block5_source_cursors",
@@ -979,7 +979,7 @@ def check_p7_bans(sources: dict[str, str]) -> int:
         (param_dma, "param_dma_get_row_consumer", "missing row-consumer getter"),
         (param_dma, "param_dma_get_block5_sched", "missing BLOCK5 schedule getter"),
         (win_gen, "scheduled_window_generator_row", "missing scheduled full-row WinGen entry"),
-        (win_gen, "WIN_MODE_3X3_STAGED_C131", "missing staged C131 WinGen coverage"),
+        (win_gen, "WIN_MODE_3X3_STAGED_C129", "missing staged C131 WinGen coverage"),
         (ppu, "STORE_LAYOUT_", "PPU does not use scheduled store layout"),
         (core, "param_dma_is_schedule_blob", "top path does not require schedule blob"),
         (conv_engine, "shared_conv_row_engine", "missing shared whole-row Conv datapath owner"),
@@ -1070,14 +1070,14 @@ def check_p7_bans(sources: dict[str, str]) -> int:
             return fail("scheduled_window_generator_row still dispatches by runtime shape")
 
     for token in (
-        "WIN_MODE_3X3_STAGED_C3",
+        "WIN_MODE_3X3_STAGED_C1",
         "WIN_MODE_3X3_STAGED_C12",
-        "WIN_MODE_3X3_STAGED_C19",
+        "WIN_MODE_3X3_STAGED_C17",
         "WIN_MODE_3X3_STAGED_C25",
         "WIN_MODE_3X3_STAGED_C28",
         "WIN_MODE_3X3_STAGED_C64",
         "WIN_MODE_3X3_STAGED_C128",
-        "WIN_MODE_3X3_STAGED_C131",
+        "WIN_MODE_3X3_STAGED_C129",
     ):
         if token not in schedule or token not in win_gen:
             return fail(f"staged WinGen mode missing from ABI/dispatch: {token}")
@@ -1099,8 +1099,11 @@ def check_p7_bans(sources: dict[str, str]) -> int:
     ):
         if token in avgpool:
             return fail(f"avgpool reintroduced duplicated C3 pack/write path: {token}")
-    if count_call_sites(avgpool, "avgpool_c3_group32_pack_write") != 2:
-        return fail("avgpool must have exactly one C3 group32 pack/write call site plus its definition")
+    if count_call_sites(avgpool, "avgpool_unit_c1") != 2:
+        return fail("AvgPool must have one C1 engine definition and one call site")
+    for token in ("AVGPOOL_C3_", "avgpool_unit_c3_fast", "pool_desc_phys_c"):
+        if token in avgpool:
+            return fail(f"retired RGB AvgPool logic remains: {token}")
     for gateway in (
         "on_chip_memory_read_main_uram_word",
         "on_chip_memory_read_pool_bram_word",
@@ -1239,7 +1242,6 @@ def check_round2_wingen_structure(win_gen: str, exporter: str) -> int:
         "s_narrow_row_bank0",
         "s_narrow_row_bank1",
         "s_narrow_row_bank2",
-        "window_row_loader_narrow_reuse",
         "window_row_assembler_read_narrow_window",
     )
     for token in required:
@@ -1283,7 +1285,6 @@ def check_round2_wingen_structure(win_gen: str, exporter: str) -> int:
         return fail("exporter does not compile dilation-aware cache_col_slots")
     for token in (
         "compile_window_loader_contract",
-        "compile_window_row_reuse_word",
         "loader_warmup_mask",
         "loader_steady_mask",
     ):
@@ -1299,145 +1300,48 @@ def check_round0727_supply_structure(
     memory: str,
     conv_engine: str,
 ) -> int:
-    """Gate the bounded reader and Round4B single-owner narrow row reuse."""
-    pipeline_body = (
-        function_body(win_gen, "scheduled_3x3_window_row_pipeline") or ""
-    )
-    for token in (
-        "packed_word_cursor_t",
-        "s_packed_word_cursor",
-        "reset_packed_word_cursors",
-        "read_packed_tile_from_row_cached",
-        "s_narrow_row_bank0",
-        "s_narrow_row_bank1",
-        "s_narrow_row_bank2",
-        "narrow_reuse_prepare_rows",
-        "read_packed_tile_from_reuse_row",
-        "window_row_loader_narrow_reuse",
-        "window_loader_emit_narrow_reuse_window",
-        "window_row_assembler_read_narrow_window",
-    ):
-        if token not in win_gen:
-            return fail(f"Round0727/Round4B supply structure missing: {token}")
-
+    """Gate H240 single-owner column rings and the bounded packed reader."""
     for legacy in (
-        "on_chip_memory_read_packed_tile_from_row",
-        "update_narrow_direct_cache",
-        "stage_narrow_3x3_window_select",
-        "s_narrow_cache_row",
-        "window_loader_emit_narrow_run",
-        "window_loader_emit_narrow_run_row",
+        "s_narrow_reuse_", "narrow_reuse_prepare_rows",
+        "read_packed_tile_from_reuse_row", "window_row_loader_narrow_reuse",
+        "c3_reuse_incremental", "stage_narrow_3x3_window_pair",
+        "s_narrow_cache_row", "on_chip_memory_read_packed_tile_from_row",
+        "build_staged_c3_word(", "build_staged_c19_word(", "build_staged_c131_word(",
     ):
-        if legacy in win_gen or legacy in memory:
-            return fail(f"Round0727/Round4B obsolete helper remains: {legacy}")
-    if re.search(r"\bstage_narrow_3x3_window\s*\(", win_gen):
-        return fail("Round0727 obsolete single-window stager remains")
-    if "stage_narrow_3x3_window_pair" in win_gen:
-        return fail("Round0727 dual-read paired stager would replicate narrow cache BRAM")
-
-    narrow_loader = (
-        function_body(win_gen, "window_row_loader_narrow_paired") or ""
-    )
-    reuse_loader = (
-        function_body(win_gen, "window_row_loader_narrow_reuse") or ""
-    )
-    narrow_update = (
-        function_body(win_gen, "window_loader_update_narrow_run") or ""
-    )
-    narrow_emit = (
-        function_body(win_gen, "window_loader_emit_narrow_cached_window") or ""
-    )
-    reuse_prepare = function_body(win_gen, "narrow_reuse_prepare_rows") or ""
-    reuse_load = (
-        function_body(win_gen, "narrow_reuse_load_source_row") or ""
-    )
-    reuse_read = (
-        function_body(win_gen, "read_packed_tile_from_reuse_row") or ""
-    )
-    bank_read = function_body(win_gen, "narrow_row_bank_read") or ""
-    bank_lane_read = (
-        function_body(win_gen, "narrow_row_bank_lane_read") or ""
-    )
-    reuse_emit = (
-        function_body(win_gen, "window_loader_emit_narrow_reuse_window") or ""
-    )
-    assembler = function_body(win_gen, "window_row_assembler") or ""
-    if not all(
-        (
-            narrow_loader,
-            reuse_loader,
-            narrow_update,
-            narrow_emit,
-            reuse_prepare,
-            reuse_load,
-            reuse_read,
-            bank_read,
-            bank_lane_read,
-            reuse_emit,
-            assembler,
-        )
-    ):
-        return fail("Round0727/Round4B narrow loader hierarchy is incomplete")
-
-    for forbidden in (
-        "window_loader_emit_column",
-        "MAX_3X3_CACHE_CHUNKS",
-        "column_meta_stream",
-    ):
-        if forbidden in narrow_loader or forbidden in reuse_loader:
-            return fail(f"Round0727/Round4B narrow loader retains generic logic: {forbidden}")
-    if "window_loader_update_narrow_run" not in narrow_loader:
-        return fail("Round0727 narrow loader does not update its compact horizontal ring")
-    if "window_loader_emit_narrow_cached_window" not in narrow_loader:
-        return fail("Round0727 narrow loader does not emit from its compact horizontal ring")
-    if "narrow_reuse_prepare_rows" not in reuse_loader:
-        return fail("Round4B reuse loader does not prepare the compiled three-row window")
-    if "window_loader_emit_narrow_reuse_window" not in reuse_loader:
-        return fail("Round4B reuse loader does not emit from the packed-row cache")
-    if "read_packed_tile_from_reuse_row" not in reuse_emit:
-        return fail("Round4B reuse emitter bypasses the packed-row cache reader")
-    if "narrow_row_bank_lane_read" not in reuse_read:
-        return fail("Round4B packed-row reader bypasses the striped row-bank gateway")
-    for token in (
-        "s_narrow_row_bank0",
-        "s_narrow_row_bank1",
-        "s_narrow_row_bank2",
-    ):
-        if token not in bank_lane_read:
-            return fail(f"Round4B row-bank gateway is missing: {token}")
-    if "on_chip_memory_read" in reuse_read or "read_packed_tile_from_row_cached" in reuse_read:
-        return fail("Round4B hot reuse reader still accesses global feature memory")
-    if "narrow_reuse_load_source_row" not in reuse_prepare:
-        return fail("Round4B row preparation bypasses its single preload gateway")
-    if "on_chip_memory_read_aligned_tensor_word" not in reuse_load:
-        return fail("Round4B row preload bypasses the aligned feature-memory gateway")
-    if "s_narrow_row_bank" in assembler:
-        return fail("Round4B assembler illegally shares ownership of the narrow row banks")
-
+        if legacy in win_gen:
+            return fail(f"H240 retired WinGen path remains: {legacy}")
+    for channels in (1, 17, 129):
+        if function_body(win_gen, f"build_staged_c{channels}_word") is None:
+            return fail(f"H240 static C{channels} composer missing")
+    pipeline_body = function_body(win_gen, "scheduled_3x3_window_row_pipeline") or ""
+    top_loader = function_body(win_gen, "window_row_loader") or ""
+    narrow_loader = function_body(win_gen, "window_row_loader_narrow_paired") or ""
+    narrow_update = function_body(win_gen, "window_loader_update_narrow_run") or ""
+    narrow_emit = function_body(win_gen, "window_loader_emit_narrow_cached_window") or ""
+    bank_lane_read = function_body(win_gen, "narrow_row_bank_lane_read") or ""
+    if not all((pipeline_body, top_loader, narrow_loader, narrow_update, narrow_emit, bank_lane_read)):
+        return fail("H240 narrow column-ring hierarchy is incomplete")
+    for forbidden in ("window_loader_emit_column", "MAX_3X3_CACHE_CHUNKS", "column_meta_stream"):
+        if forbidden in narrow_loader:
+            return fail(f"H240 narrow loader carries wide/generic logic: {forbidden}")
+    for name in ("window_loader_update_narrow_run", "window_loader_emit_narrow_cached_window"):
+        if name not in narrow_loader:
+            return fail(f"H240 column-ring loader bypasses {name}")
+    if "s_narrow_row_bank" in (function_body(win_gen, "window_row_assembler") or ""):
+        return fail("H240 assembler illegally owns narrow BRAM")
+    for bank in ("s_narrow_row_bank0", "s_narrow_row_bank1", "s_narrow_row_bank2"):
+        if bank not in bank_lane_read:
+            return fail(f"H240 striped bank gateway missing: {bank}")
     cached_read = function_body(win_gen, "read_packed_tile_from_row_cached") or ""
     aligned_cache = function_body(win_gen, "read_aligned_word_cached") or ""
     if "read_aligned_word_cached" not in cached_read:
-        return fail("Round0727 packed reader bypasses the bounded aligned-word cache")
+        return fail("H240 packed reader bypasses the bounded word cursor")
     if "on_chip_memory_read_aligned_tensor_word" not in aligned_cache:
-        return fail("Round0727 aligned-word cache bypasses the single memory owner")
-    loader_body = function_body(win_gen, "window_loader_emit_column") or ""
-    if "on_chip_memory_read_packed_tile_from_row" in loader_body:
-        return fail("Round0727 loader still performs uncached packed-tile reads")
-    if "read_packed_tile_from_row_cached" not in loader_body:
-        return fail("Round0727 loader does not use the bounded packed-word cursor")
-
-    top_loader = function_body(win_gen, "window_row_loader") or ""
-    for token in (
-        "window_row_loader_narrow_reuse",
-        "window_row_loader_narrow_paired",
-        "window_row_loader_narrow_unpaired",
-        "BIND_STORAGE variable=s_narrow_row_bank0",
-        "BIND_STORAGE variable=s_narrow_row_bank1",
-        "BIND_STORAGE variable=s_narrow_row_bank2",
-    ):
-        if token not in top_loader:
-            return fail(f"Round4B single narrow-bank owner is missing: {token}")
-
+        return fail("H240 word cursor bypasses the memory owner")
+    for name in ("window_row_loader_narrow_paired", "window_row_loader_narrow_unpaired",
+                 "window_row_loader_narrow_incremental_c12"):
+        if name not in top_loader:
+            return fail(f"H240 compiled narrow dispatch missing: {name}")
     for bank in (
         "s_narrow_row_bank0",
         "s_narrow_row_bank1",
@@ -1546,7 +1450,7 @@ def check_round4a_ppu_structure(ppu: str, conv_engine: str) -> int:
     ):
         if function_body(ppu, legacy) is not None:
             return fail(f"legacy multi-pass compact consumer remains: {legacy}")
-    for token in ("ppu_apply_add_word", "ppu_cat_tail_word", "ppu_apply_c19_affine_word"):
+    for token in ("ppu_apply_add_word", "ppu_cat_tail_word", "ppu_apply_compact_affine_word"):
         if token not in transform:
             return fail(f"single-pass segment transform missing {token}")
     for token in ("carry_bytes", "packed_groups", "ppu_transform_conv_word"):

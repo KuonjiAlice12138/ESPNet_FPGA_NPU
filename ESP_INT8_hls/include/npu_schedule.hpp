@@ -10,14 +10,17 @@ enum window_mode_t : std::uint8_t {
   WIN_MODE_3X3_RESERVED = 1,
   WIN_MODE_1X1_ALIGNED = 2,
   WIN_MODE_1X1_PACKED = 3,
-  WIN_MODE_3X3_STAGED_C3 = 4,
+  WIN_MODE_3X3_STAGED_C3 = 4,  // Retired RGB ABI value; rejected by this build.
   WIN_MODE_3X3_STAGED_C12 = 5,
-  WIN_MODE_3X3_STAGED_C19 = 6,
+  WIN_MODE_3X3_STAGED_C19 = 6,  // Retired RGB ABI value; no hardware handler.
   WIN_MODE_3X3_STAGED_C25 = 7,
-  WIN_MODE_3X3_STAGED_C131 = 8,
+  WIN_MODE_3X3_STAGED_C131 = 8,  // Retired RGB ABI value; no hardware handler.
   WIN_MODE_3X3_STAGED_C28 = 9,
   WIN_MODE_3X3_STAGED_C64 = 10,
   WIN_MODE_3X3_STAGED_C128 = 11,
+  WIN_MODE_3X3_STAGED_C1 = 12,
+  WIN_MODE_3X3_STAGED_C17 = 13,
+  WIN_MODE_3X3_STAGED_C129 = 14,
 };
 
 enum pack_cmd_flags_t : std::uint8_t {
@@ -47,6 +50,7 @@ constexpr int WINDOW_LOADER_PHASE_SPLIT_WORD = 8;
 constexpr int WINDOW_LOADER_ROW_REUSE_WORD = 9;
 constexpr int WINDOW_LOADER_RESERVED_WORDS = 10;
 
+// Historical ABI values only. H240 schedules require the entire reuse word = 0.
 enum window_row_reuse_mode_t : std::uint8_t {
   WINDOW_ROW_REUSE_NONE = 0,
   WINDOW_ROW_REUSE_STRIDE1_KEEP2 = 1,
@@ -76,11 +80,12 @@ enum store_layout_mode_t : std::uint8_t {
   STORE_LAYOUT_COMPACT_C16 = 3,
   STORE_LAYOUT_COMPACT_C25 = 4,
   STORE_LAYOUT_COMPACT_C28 = 5,
-  STORE_LAYOUT_C16_INTO_C19 = 6,
+  STORE_LAYOUT_C16_INTO_C19 = 6,  // Retired RGB layout; no hardware handler.
   STORE_LAYOUT_ALIGNED_TILE_COPY = 7,
   STORE_LAYOUT_NARROW_FIXED = 8,
-  STORE_LAYOUT_COMPACT_C19 = 9,
+  STORE_LAYOUT_COMPACT_C19 = 9,  // Retired RGB layout; no hardware handler.
   STORE_LAYOUT_PREFIX_ZERO_PAD = 10,
+  STORE_LAYOUT_COMPACT_C17 = 11,
 };
 
 enum exec_kind_t : std::uint8_t {

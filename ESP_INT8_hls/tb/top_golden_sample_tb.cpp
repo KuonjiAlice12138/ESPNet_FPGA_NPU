@@ -1,5 +1,6 @@
 #include "../include/npu_config.hpp"
 #include "../include/npu_uop.hpp"
+#include "../include/npu_schedule.hpp"
 #include "top_call.hpp"
 
 #include <cstdint>
@@ -169,11 +170,8 @@ static void count_labels(const std::vector<std::uint8_t>& bytes,
 
 int main() {
   static constexpr int MAX_ALLOWED_MASK_MISMATCHES = 0;
-#if ESP_INT8_CSIM_CLASS_COUNT == 20
-  const char* artifact_dir = "D:/ESP_INT8/hw_artifacts/cityscapes20_int8_h256w512_r2_v4";
-#else
-  const char* artifact_dir = "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_r2_v4";
-#endif
+  static_assert(ESP_INT8_CSIM_CLASS_COUNT == 2, "H240 grayscale release is binary2");
+  const char* artifact_dir = "D:/ESP_INT8/hw_artifacts/binary2_int8_h240w240_gray_v4";
   if (const char* selected = std::getenv("ESP_INT8_CSIM_ARTIFACT_DIR")) {
     artifact_dir = selected;
   }
@@ -204,6 +202,12 @@ int main() {
   }
   const std::vector<std::uint8_t> golden_mask =
       make_fullres_mask_golden(golden_logits, ESP_INT8_CSIM_CLASS_COUNT);
+  std::vector<std::uint8_t> published_mask;
+  if (!read_binary((std::string(artifact_dir) + "/golden_fullres_mask.bin").c_str(),
+                   published_mask) || published_mask != golden_mask) {
+    std::printf("[FAIL] published mask is not the independent bilinear reference\n");
+    return 1;
+  }
 
   const std::size_t param_words =
       (param_bytes.size() + esp_int8::AXI_WORD_BYTES - 1U) / esp_int8::AXI_WORD_BYTES;
@@ -339,7 +343,6 @@ int main() {
   }
 
   std::vector<std::uint8_t> old_param_bytes;
-#ifdef ESP_INT8_CSIM_VALIDATE_ROW_REUSE
   const auto read_u16 = [&](unsigned offset) {
     return unsigned(param_bytes.at(offset)) | (unsigned(param_bytes.at(offset + 1)) << 8);
   };
@@ -348,26 +351,12 @@ int main() {
   };
   const unsigned conv_offset = read_u32(88);
   const unsigned schedule_offset = read_u32(92) + unsigned(param_bytes.at(conv_offset + 2)) * 128;
-  const unsigned source_offset = read_u32(40) + unsigned(param_bytes.at(conv_offset + 16)) * 16;
-  const unsigned reuse_offset = schedule_offset + 126;
-  if (read_u16(reuse_offset) != (2U | (48U << 2))) {
-    std::printf("[FAIL] Round2 PARAM is not C3 KEEP1/48\n");
-    return 1;
-  }
   struct BadField { unsigned offset; unsigned value; const char* name; };
   const BadField corruptions[] = {
-    {reuse_offset, 2U, "zero length"},
-    {reuse_offset, 2U | (49U << 2), "wrong length"},
-    {reuse_offset, 2U | (97U << 2), "capacity overflow"},
-    {reuse_offset, 48U << 2, "NONE with length"},
-    {reuse_offset, 1U | (48U << 2), "C12 mode"},
-    {reuse_offset, 3U | (48U << 2), "unknown mode"},
-    {reuse_offset, 2U | (48U << 2) | 512U, "reserved bits"},
-    {source_offset + 2, 4U, "physical channel padding"},
-    {source_offset + 14, 1U, "channel offset"},
-    {source_offset + 4, 1U, "unaligned base"},
-    {schedule_offset, 5U | (3U << 8), "wrong window mode"},
-    {schedule_offset + 2, 1U | (1U << 8), "wrong stride"},
+    {schedule_offset, 4U | (3U << 8), "retired C3 mode"},
+    {schedule_offset + 126, 2U | (48U << 2), "retired row reuse"},
+    {schedule_offset + 8, 3U, "wrong schedule channels"},
+    {schedule_offset + 12, 2U, "wrong K tiles"},
   };
   for (const auto& fault : corruptions) {
     auto corrupted = param_bytes;
@@ -377,24 +366,14 @@ int main() {
     call_espnet_encoder_int8_core(frame_in, frame_out, param,
                                   esp_int8::MODE_INIT, esp_int8::UOP_COUNT_ENCODER);
     if (esp_int8::param_dma_ready()) {
-      std::printf("[FAIL] INIT accepted row-reuse corruption: %s\n", fault.name);
+      std::printf("[FAIL] INIT accepted invalid schedule: %s\n", fault.name);
       return 1;
     }
   }
-  std::printf("[PASS] INIT rejected %zu malformed reuse/layout descriptors\n",
+  std::printf("[PASS] INIT rejected %zu malformed/retired schedules\n",
               sizeof(corruptions) / sizeof(corruptions[0]));
-  // The previous no-reuse H256 descriptor remains a legal numerical baseline.
-  auto no_reuse = param_bytes;
-  no_reuse.at(reuse_offset) = no_reuse.at(reuse_offset + 1) = 0;
-  pack_bytes(no_reuse, param, 8192U);
-  call_espnet_encoder_int8_core(frame_in, frame_out, param,
-                                esp_int8::MODE_INIT, esp_int8::UOP_COUNT_ENCODER);
-  if (!esp_int8::param_dma_ready()) {
-    std::printf("[FAIL] no-reuse H256 baseline is no longer legal\n");
-    return 1;
-  }
-#endif
-  if (!read_binary("D:/ESP_INT8/hw_artifacts/binary2_int8_0809/PARAM.BIN",
+
+  if (!read_binary("D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_r2_v4/PARAM.BIN",
                    old_param_bytes)) {
     return 1;
   }
@@ -403,11 +382,18 @@ int main() {
                                 esp_int8::MODE_INIT,
                                 esp_int8::UOP_COUNT_ENCODER);
   if (esp_int8::param_dma_ready()) {
-    std::printf("[FAIL] legacy H512W1024 PARAM passed H256W512 geometry gate\n");
+    std::printf("[FAIL] legacy H256W512 PARAM passed H240W240/C1 geometry gate\n");
     return 1;
   }
 
-  std::printf("[PASS] replay logits/mask are bit-exact and legacy geometry is rejected\n");
+  pack_bytes(param_bytes, param, 8192U);
+  call_espnet_encoder_int8_core(frame_in, frame_out, param,
+                                esp_int8::MODE_INIT, esp_int8::UOP_COUNT_ENCODER);
+  if (!esp_int8::param_dma_ready()) {
+    std::printf("[FAIL] valid INIT did not recover after rejection\n");
+    return 1;
+  }
+  std::printf("[PASS] replay logits/mask are bit-exact, final AXI word covered, old geometry rejected\n");
 
   std::printf("top_golden_sample_tb finished: mismatches=%d\n", mismatches);
   return 0;
