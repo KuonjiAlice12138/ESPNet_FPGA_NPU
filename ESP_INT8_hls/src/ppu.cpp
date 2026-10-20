@@ -11,12 +11,15 @@
 
 namespace esp_int8 {
 
+constexpr int PPU_BLOCK_LANES = 4;
+constexpr int PPU_BLOCK_GROUPS = TM / PPU_BLOCK_LANES;
+
 bool param_dma_get_affine_qparam(u8_t param_id, u8_t block_id, aff_q_t& qparam);
-bool on_chip_memory_read_aligned_full_tile(const tensor_desc_t& desc,
-                                           i32_t h,
-                                           i32_t w,
-                                           u16_t c_begin,
-                                           act_vec_t& packed);
+u32_t param_dma_generation();
+bool on_chip_memory_read_packed_span(u8_t bank_id,
+                                      u32_t byte_offset,
+                                      u8_t byte_count,
+                                      act_vec_t& packed);
 bool on_chip_memory_read_packed_tile(const tensor_desc_t& desc,
                                      i32_t h,
                                      i32_t w,
@@ -31,11 +34,9 @@ bool on_chip_memory_write_fmbuf_abs_word(u8_t bank_id,
                                          act_vec_t packed);
 bool on_chip_memory_write_pool2_abs_word(u32_t byte_offset,
                                          act_vec_t packed);
-bool conv_store_write_aligned_tile(const tensor_desc_t& dst,
-                                   u16_t h,
-                                   u16_t w,
-                                   u16_t c,
-                                   const act_vec_t& word);
+bool conv_store_write_row_contiguous_word(const tensor_desc_t& dst,
+                                          u32_t byte_offset,
+                                          const act_vec_t& word);
 void upsample_fused_consume_logits_row(axi_vec_t* gmem_frame_out,
                                        u16_t encoder_row,
                                        u8_t valid_c,
@@ -57,36 +58,16 @@ static u16_t ppu_effective_stride(const conv_cfg_t& cfg) {
 }
 
 
-static bool ppu_can_use_aligned_full_tile(const tensor_desc_t& desc, u16_t c_begin) {
-#pragma HLS INLINE
-  const unsigned phys_c = tensor_phys_c(desc).to_uint();
-  const unsigned start_c = desc.reserved1.to_uint() + c_begin.to_uint();
-  const unsigned base_start = desc.base_offset.to_uint() + start_c;
-  return phys_c >= static_cast<unsigned>(AXI_WORD_BYTES) &&
-         ((phys_c & static_cast<unsigned>(AXI_WORD_BYTES - 1)) == 0U) &&
-         c_begin.to_uint() + static_cast<unsigned>(AXI_WORD_BYTES) <= desc.c.to_uint() &&
-         ((base_start & static_cast<unsigned>(AXI_WORD_BYTES - 1)) == 0U);
-}
-
 static bool ppu_full_aligned_tile_write_plan_ok(const tensor_desc_t& desc, u16_t total_c) {
 #pragma HLS INLINE off
   const unsigned total = total_c.to_uint();
-  if (total == 0U || (total & static_cast<unsigned>(TM - 1)) != 0U) {
-    return false;
-  }
-
-  const int c_blocks = static_cast<int>(total / static_cast<unsigned>(TM));
-  for (int c_blk = 0; c_blk < MAX_C_TILE_COUNT; ++c_blk) {
-#pragma HLS PIPELINE off
-    if (c_blk >= c_blocks) {
-      break;
-    }
-    const u16_t c = static_cast<u16_t>(c_blk * TM);
-    if (!ppu_can_use_aligned_full_tile(desc, c)) {
-      return false;
-    }
-  }
-  return true;
+  const unsigned phys = tensor_phys_c(desc).to_uint();
+  return total != 0U && total <= desc.c.to_uint() &&
+         (total & static_cast<unsigned>(TM - 1)) == 0U &&
+         phys >= static_cast<unsigned>(TM) &&
+         (phys & static_cast<unsigned>(TM - 1)) == 0U &&
+         ((desc.base_offset.to_uint() + desc.reserved1.to_uint()) &
+          static_cast<unsigned>(AXI_WORD_BYTES - 1)) == 0U;
 }
 
 static u32_t ppu_compact_row_base(const tensor_desc_t& dst, u16_t out_row) {
@@ -128,8 +109,8 @@ static void ppu_pack_lanes(const i8_t lanes[TM], act_vec_t& word) {
   }
 }
 
-static void ppu_apply_add_word(const act_vec_t& lhs_word,
-                               const act_vec_t& rhs_word,
+static void ppu_apply_add_word(act_vec_t lhs_word,
+                               act_vec_t rhs_word,
                                u8_t valid_c,
                                const add_q_t& add_qparam,
                                act_vec_t& out_word) {
@@ -193,54 +174,6 @@ static void ppu_apply_compact_affine_word(const act_vec_t& in_word,
   ppu_pack_lanes(out_lanes, out_word);
 }
 
-static void ppu_apply_block_affine_word(const act_vec_t& in_word,
-                                        const aff_q_t& qparam,
-                                        u8_t act_type,
-                                        act_vec_t& out_word) {
-#pragma HLS INLINE off
-#pragma HLS ARRAY_PARTITION variable=qparam.mul complete dim=1
-#pragma HLS ARRAY_PARTITION variable=qparam.bias complete dim=1
-#pragma HLS ARRAY_PARTITION variable=qparam.shift complete dim=1
-  i8_t out_lanes[TM];
-#pragma HLS ARRAY_PARTITION variable=out_lanes complete dim=1
-  for (int lane = 0; lane < TM; ++lane) {
-#pragma HLS UNROLL factor=4
-    const i8_t in_value = ppu_get_act_i8_dynamic(in_word, lane);
-    out_lanes[lane] = affine_i8_to_i8(in_value,
-                                      qparam.mul[lane],
-                                      qparam.bias[lane],
-                                      qparam.shift[lane],
-                                      act_type);
-  }
-  ppu_pack_lanes(out_lanes, out_word);
-}
-
-static void ppu_apply_block_add_affine_word(const act_vec_t& lhs_word,
-                                            const act_vec_t& rhs_word,
-                                            const add_q_t& add_qparam,
-                                            const aff_q_t& aff_qparam,
-                                            u8_t act_type,
-                                            act_vec_t& out_word) {
-#pragma HLS INLINE off
-#pragma HLS ARRAY_PARTITION variable=aff_qparam.mul complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_qparam.bias complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_qparam.shift complete dim=1
-  i8_t out_lanes[TM];
-#pragma HLS ARRAY_PARTITION variable=out_lanes complete dim=1
-  for (int lane = 0; lane < TM; ++lane) {
-#pragma HLS UNROLL factor=4
-    const i8_t lhs_value = ppu_get_act_i8_dynamic(lhs_word, lane);
-    const i8_t rhs_value = ppu_get_act_i8_dynamic(rhs_word, lane);
-    const i8_t added_value = add_i8(lhs_value, rhs_value, add_qparam);
-    out_lanes[lane] = affine_i8_to_i8(added_value,
-                                      aff_qparam.mul[lane],
-                                      aff_qparam.bias[lane],
-                                      aff_qparam.shift[lane],
-                                      act_type);
-  }
-  ppu_pack_lanes(out_lanes, out_word);
-}
-
 static void ppu_cat_tail_word(const act_vec_t& prefix_word,
                               const act_vec_t& tail_word,
                               u8_t prefix_c,
@@ -280,23 +213,28 @@ bool ppu_preadd_segment(const tensor_desc_t& other,
 #pragma HLS INLINE off
   const int ow_begin_i = static_cast<int>(ow_begin.to_uint());
   const int ow_count_i = static_cast<int>(ow_count.to_uint());
+  const unsigned lane_count = valid_c == 0 || valid_c > TM ? TM : valid_c.to_uint();
+  const u8_t read_count = static_cast<u8_t>(
+      other.c.to_uint() < lane_count ? other.c.to_uint() : lane_count);
+  const bool row_valid = out_row < other.h;
+  const u32_t source_step = static_cast<u32_t>(tensor_phys_c(other));
+  u32_t source_offset = ppu_compact_row_base(other, out_row) +
+                         static_cast<u32_t>(ow_begin) * source_step;
   for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
 #pragma HLS PIPELINE off
     if (ow_i >= ow_count_i) {
       break;
     }
     act_vec_t other_word = 0;
-    if (!on_chip_memory_read_packed_tile(other,
-                                         static_cast<i32_t>(out_row),
-                                         static_cast<i32_t>(ow_begin_i + ow_i),
-                                         static_cast<u16_t>(0),
-                                         valid_c,
-                                         other_word)) {
+    if (row_valid && ow_begin_i + ow_i < static_cast<int>(other.w.to_uint()) &&
+        read_count != 0 &&
+        !on_chip_memory_read_packed_span(other.bank_id, source_offset, read_count, other_word)) {
       return false;
     }
     act_vec_t out_word = 0;
     ppu_apply_add_word(row_buf[ow_i], other_word, valid_c, qparam, out_word);
     row_buf[ow_i] = out_word;
+    source_offset += source_step;
   }
   return true;
 }
@@ -366,40 +304,6 @@ static bool ppu_read_abs_word(u32_t byte_offset, axi_vec_t& word) {
       word);
 }
 
-static ap_uint<32> ppu_mask_compact_group(ap_uint<32> source_group,
-                                          unsigned group_bytes) {
-#pragma HLS INLINE
-  switch (group_bytes) {
-    case 1:
-      return source_group & static_cast<ap_uint<32>>(0x000000FFU);
-    case 2:
-      return source_group & static_cast<ap_uint<32>>(0x0000FFFFU);
-    case 3:
-      return source_group & static_cast<ap_uint<32>>(0x00FFFFFFU);
-    default:
-      return source_group;
-  }
-}
-
-static ap_uint<64> ppu_merge_compact_group(ap_uint<32> carry,
-                                           u8_t carry_bytes,
-                                           ap_uint<32> source_group) {
-#pragma HLS INLINE
-  switch (carry_bytes.to_uint()) {
-    case 1:
-      return static_cast<ap_uint<64>>(carry.range(7, 0)) |
-             (static_cast<ap_uint<64>>(source_group) << 8);
-    case 2:
-      return static_cast<ap_uint<64>>(carry.range(15, 0)) |
-             (static_cast<ap_uint<64>>(source_group) << 16);
-    case 3:
-      return static_cast<ap_uint<64>>(carry.range(23, 0)) |
-             (static_cast<ap_uint<64>>(source_group) << 24);
-    default:
-      return static_cast<ap_uint<64>>(source_group);
-  }
-}
-
 static void ppu_clear_compact_groups(ap_uint<32> groups[8]) {
 #pragma HLS INLINE
 #pragma HLS ARRAY_PARTITION variable=groups complete dim=1
@@ -410,7 +314,7 @@ static void ppu_clear_compact_groups(ap_uint<32> groups[8]) {
 }
 
 static void ppu_set_compact_group(ap_uint<32> groups[8],
-                                  u8_t group_index,
+                                  ap_uint<3> group_index,
                                   ap_uint<32> value) {
 #pragma HLS INLINE
 #pragma HLS ARRAY_PARTITION variable=groups complete dim=1
@@ -435,6 +339,55 @@ static act_vec_t ppu_pack_compact_groups(const ap_uint<32> groups[8]) {
     packed.range(group * 32 + 31, group * 32) = groups[group];
   }
   return packed;
+}
+
+static bool ppu_append_compact_pair(ap_uint<64> input, ap_uint<4> bytes,
+                                      ap_uint<32>& carry, ap_uint<2>& carry_bytes,
+                                      ap_uint<32> groups[8], ap_uint<3>& group_count,
+                                      act_vec_t& completed_word) {
+#pragma HLS INLINE
+#pragma HLS ARRAY_PARTITION variable=groups complete dim=1
+  if (bytes == 1U) { input &= static_cast<ap_uint<64>>(0xFFU); }
+  else if (bytes == 4U) { input &= static_cast<ap_uint<64>>(0xFFFFFFFFULL); }
+  ap_uint<96> incoming = static_cast<ap_uint<96>>(input);
+  switch (carry_bytes.to_uint()) {
+    case 1: incoming <<= 8; break;
+    case 2: incoming <<= 16; break;
+    case 3: incoming <<= 24; break;
+    default: break;
+  }
+  const ap_uint<96> merged = incoming | static_cast<ap_uint<96>>(carry);
+  // Layout tails are 1 or 4 bytes; all other inputs are complete 8-byte pairs.
+  const ap_uint<2> count = bytes == 8U ? static_cast<ap_uint<2>>(2)
+      : ((bytes == 4U || carry_bytes == 3U) ? static_cast<ap_uint<2>>(1)
+                                             : static_cast<ap_uint<2>>(0));
+  const ap_uint<3> second_group = group_count + static_cast<ap_uint<3>>(1);
+  const ap_uint<4> next_group = static_cast<ap_uint<4>>(group_count) +
+                                  static_cast<ap_uint<4>>(count);
+  const bool completed = next_group[3] != 0;
+  const bool second_wraps = group_count == 7U;
+  const ap_uint<32> first_value = merged.range(31, 0);
+  const ap_uint<32> second_value = merged.range(63, 32);
+  for (int group = 0; group < 8; ++group) {
+#pragma HLS UNROLL
+    const bool first_here = count != 0U && group_count.to_uint() == static_cast<unsigned>(group);
+    const bool second_here = count == 2U && second_group.to_uint() == static_cast<unsigned>(group);
+    const ap_uint<32> old_value = groups[group];
+    const ap_uint<32> updated = first_here ? first_value : (second_here ? second_value : old_value);
+    const ap_uint<32> committed = first_here ? first_value
+        : ((second_here && !second_wraps) ? second_value : old_value);
+    completed_word.range(group * 32 + 31, group * 32) = committed;
+    // If the first group completes a word, only the second group belongs to the next word.
+    groups[group] = completed
+        ? ((second_wraps && second_here) ? second_value : static_cast<ap_uint<32>>(0))
+        : updated;
+  }
+  group_count = static_cast<ap_uint<3>>(next_group);
+  carry = count == 2U ? static_cast<ap_uint<32>>(merged.range(95, 64))
+                       : (count == 1U ? static_cast<ap_uint<32>>(merged.range(63, 32))
+                                      : static_cast<ap_uint<32>>(merged.range(31, 0)));
+  if (bytes == 1U) { carry_bytes += static_cast<ap_uint<2>>(1); }
+  return completed;
 }
 
 static bool ppu_transform_conv_word(const row_consumer_desc_t& consumer,
@@ -557,6 +510,9 @@ void ppu_consume_conv_stream(const row_consumer_desc_t& consumer,
   }
 
   const unsigned phys_c = layout_phys_c.to_uint();
+  const unsigned pair_count = (phys_c + 7U) / 8U;
+  const ap_uint<4> tail_bytes = static_cast<ap_uint<4>>(
+      (phys_c & 7U) == 0U ? 8U : (phys_c & 7U));
   u32_t write_offset = ppu_compact_row_base(dst, out_row);
   if ((write_offset.to_uint() & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U) {
     ok = false;
@@ -566,20 +522,30 @@ void ppu_consume_conv_stream(const row_consumer_desc_t& consumer,
 #pragma HLS ARRAY_PARTITION variable=packed_groups complete dim=1
   ppu_clear_compact_groups(packed_groups);
   ap_uint<32> carry = 0;
-  u8_t carry_bytes = 0;
-  u8_t packed_group_count = 0;
+  ap_uint<2> carry_bytes = 0;
+  ap_uint<3> packed_group_count = 0;
   const u16_t out_w = ppu_out_dim(cfg.in_w, ppu_effective_stride(cfg));
   const int out_w_i = static_cast<int>(out_w.to_uint());
-  for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
-    if (ow_i >= out_w_i) {
+  for (int ow_i = 0; ow_i <= MAX_FM_W; ++ow_i) {
+#pragma HLS PIPELINE off
+    if (ow_i > out_w_i) {
       break;
     }
-    const act_vec_t conv_word = conv_stream.read();
-    if (!ok) {
-      continue;
-    }
-    act_vec_t transformed = 0;
-    if (!ppu_transform_conv_word(consumer,
+    act_vec_t pending_word = 0;
+    bool pending_valid = false;
+    if (ow_i == out_w_i) {
+      if (carry_bytes != 0U) {
+        ppu_set_compact_group(packed_groups, packed_group_count, carry);
+      }
+      pending_word = ppu_pack_compact_groups(packed_groups);
+      pending_valid = packed_group_count != 0U || carry_bytes != 0U;
+    } else {
+      const act_vec_t conv_word = conv_stream.read();
+      if (!ok) {
+        continue;
+      }
+      act_vec_t transformed = 0;
+      if (!ppu_transform_conv_word(consumer,
                                  add_other,
                                  has_add_other,
                                  add_qparam,
@@ -592,60 +558,33 @@ void ppu_consume_conv_stream(const row_consumer_desc_t& consumer,
                                  affine1,
                                  conv_word,
                                  transformed)) {
-      ok = false;
-      continue;
-    }
-
-    act_vec_t source_cursor = transformed;
-    for (int group = 0; group < AXI_WORD_BYTES / 4; ++group) {
-#pragma HLS PIPELINE II=1
-      const unsigned byte_base = static_cast<unsigned>(group * 4);
-      if (byte_base >= phys_c) {
-        break;
-      }
-      const unsigned remaining = phys_c - byte_base;
-      const unsigned group_bytes = remaining < 4U ? remaining : 4U;
-      const ap_uint<32> source_group = source_cursor.range(31, 0);
-      source_cursor >>= 32;
-      const ap_uint<32> masked_group =
-          ppu_mask_compact_group(source_group, group_bytes);
-      const ap_uint<64> merged = ppu_merge_compact_group(
-          carry, carry_bytes, masked_group);
-      const unsigned merged_bytes = carry_bytes.to_uint() + group_bytes;
-      if (merged_bytes < 4U) {
-        carry = static_cast<ap_uint<32>>(merged);
-        carry_bytes = static_cast<u8_t>(merged_bytes);
+        ok = false;
         continue;
       }
 
-      const ap_uint<32> emitted_group = merged.range(31, 0);
-      ppu_set_compact_group(packed_groups, packed_group_count, emitted_group);
-      carry = static_cast<ap_uint<32>>(merged >> 32);
-      carry_bytes = static_cast<u8_t>(merged_bytes - 4U);
-      const bool word_full = packed_group_count.to_uint() == 7U;
-      packed_group_count =
-          word_full ? static_cast<u8_t>(0)
-                    : static_cast<u8_t>(packed_group_count.to_uint() + 1U);
-      if (word_full) {
-        const act_vec_t packed_word = ppu_pack_compact_groups(packed_groups);
-        if (!ppu_write_compact_word(dst, write_offset, packed_word)) {
-          ok = false;
-          continue;
+      act_vec_t source_cursor = transformed;
+      for (int pair = 0; pair < AXI_WORD_BYTES / 8; ++pair) {
+#pragma HLS PIPELINE II=1
+        if (static_cast<unsigned>(pair) >= pair_count) { break; }
+        const ap_uint<4> pair_bytes = static_cast<unsigned>(pair + 1) == pair_count
+            ? tail_bytes : static_cast<ap_uint<4>>(8);
+        const ap_uint<64> source_pair = source_cursor.range(63, 0);
+        source_cursor >>= 64;
+        act_vec_t packed_word = 0;
+        if (ppu_append_compact_pair(source_pair, pair_bytes, carry, carry_bytes,
+                                      packed_groups, packed_group_count, packed_word)) {
+          pending_word = packed_word;
+          pending_valid = true;
         }
-        write_offset += static_cast<u32_t>(AXI_WORD_BYTES);
-        ppu_clear_compact_groups(packed_groups);
       }
     }
-  }
-
-  if (carry_bytes.to_uint() != 0U) {
-    ppu_set_compact_group(packed_groups, packed_group_count, carry);
-    packed_group_count = static_cast<u8_t>(packed_group_count.to_uint() + 1U);
-  }
-  if (packed_group_count.to_uint() != 0U) {
-    const act_vec_t packed_word = ppu_pack_compact_groups(packed_groups);
-    if (ok && !ppu_write_compact_word(dst, write_offset, packed_word)) {
+    // At most 28 input bytes per pixel: one pending word covers every layout and the row tail.
+    if (ok && pending_valid) {
+      if (!ppu_write_compact_word(dst, write_offset, pending_word)) {
         ok = false;
+      } else {
+        write_offset += static_cast<u32_t>(AXI_WORD_BYTES);
+      }
     }
   }
   status = ok ? static_cast<u8_t>(1) : static_cast<u8_t>(0);
@@ -698,7 +637,7 @@ static bool ppu_init_block5_source_cursors(
     ppu_block5_compact_cursor_t& cursor1,
     ppu_block5_compact_cursor_t& cursor2,
     ppu_block5_compact_cursor_t& cursor3) {
-#pragma HLS INLINE off
+#pragma HLS INLINE
   const bool ok0 =
       ppu_init_block5_compact_cursor(s0, local_row, source0_bytes, cursor0);
   const bool ok1 =
@@ -786,7 +725,7 @@ static bool ppu_read_block5_source_words(unsigned source0_bytes,
                                          act_vec_t& source1,
                                          act_vec_t& source2,
                                          act_vec_t& source3) {
-#pragma HLS INLINE off
+#pragma HLS INLINE
   const bool ok0 =
       ppu_read_block5_compact_cursor(source0_bytes, cursor0, source0);
   const bool ok1 =
@@ -844,93 +783,94 @@ static void ppu_compose_block5_l3_words(const act_vec_t& source0,
   tile3_word.range(255, 56) = row_word.range(199, 0);
 }
 
+static bool ppu_load_block5_affine_bank(
+    u8_t param_id, int tile_count,
+    i32_t qmul[PPU_BLOCK_LANES][TM],
+    i32_t qbias[PPU_BLOCK_LANES][TM],
+    u8_t qshift[PPU_BLOCK_LANES][TM]) {
+#pragma HLS INLINE
+  for (int tile = 0; tile < 4; ++tile) {
+#pragma HLS PIPELINE off
+    if (tile >= tile_count) { break; }
+    aff_q_t loaded;
+#pragma HLS ARRAY_PARTITION variable=loaded.mul complete dim=1
+#pragma HLS ARRAY_PARTITION variable=loaded.bias complete dim=1
+#pragma HLS ARRAY_PARTITION variable=loaded.shift complete dim=1
+    if (!param_dma_get_affine_qparam(param_id, static_cast<u8_t>(tile), loaded)) {
+      return false;
+    }
+    for (int group = 0; group < PPU_BLOCK_GROUPS; ++group) {
+      for (int lane = 0; lane < PPU_BLOCK_LANES; ++lane) {
+#pragma HLS UNROLL factor=4
+        const int index = tile * PPU_BLOCK_GROUPS + group;
+        const int source_lane = group * PPU_BLOCK_LANES + lane;
+        qmul[lane][index] = loaded.mul[source_lane];
+        qbias[lane][index] = loaded.bias[source_lane];
+        qshift[lane][index] = loaded.shift[source_lane];
+      }
+    }
+  }
+  return true;
+}
+
+static void ppu_apply_block_word(
+    const act_vec_t& lhs_word, const act_vec_t& rhs_word,
+    bool has_residual, const add_q_t& add_qparam,
+    const i32_t qmul[PPU_BLOCK_LANES][TM],
+    const i32_t qbias[PPU_BLOCK_LANES][TM],
+    const u8_t qshift[PPU_BLOCK_LANES][TM],
+    int tile, u8_t act_type, act_vec_t& out_word) {
+#pragma HLS INLINE
+  ap_uint<32> groups[8];
+#pragma HLS ARRAY_PARTITION variable=groups complete dim=1
+  act_vec_t lhs_cursor = lhs_word;
+  act_vec_t rhs_cursor = rhs_word;
+  for (int group = 0; group < PPU_BLOCK_GROUPS; ++group) {
+#pragma HLS PIPELINE II=1
+    ap_uint<32> result = 0;
+    const int index = tile * PPU_BLOCK_GROUPS + group;
+    for (int lane = 0; lane < PPU_BLOCK_LANES; ++lane) {
+#pragma HLS UNROLL factor=4
+      i8_t lhs = 0;
+      i8_t rhs = 0;
+      lhs.range(7, 0) = lhs_cursor.range(lane * 8 + 7, lane * 8);
+      rhs.range(7, 0) = rhs_cursor.range(lane * 8 + 7, lane * 8);
+      // Saturation at the add boundary is part of the exported INT8 contract.
+      const i8_t value = has_residual ? add_i8(lhs, rhs, add_qparam) : lhs;
+      const i8_t transformed = affine_i8_to_i8(
+          value, qmul[lane][index], qbias[lane][index], qshift[lane][index], act_type);
+      result.range(lane * 8 + 7, lane * 8) = transformed.range(7, 0);
+    }
+    ppu_set_compact_group(groups, static_cast<u8_t>(group), result);
+    lhs_cursor >>= 32;
+    rhs_cursor >>= 32;
+  }
+  out_word = ppu_pack_compact_groups(groups);
+}
+
 static bool ppu_finalize_block5_emit_word(const tensor_desc_t& residual,
                                           const tensor_desc_t& final_dst,
                                           bool has_residual,
                                           const add_q_t& residual_add_qparam,
-                                          const aff_q_t& aff_qparam,
+                                          const i32_t qmul[PPU_BLOCK_LANES][TM],
+                                          const i32_t qbias[PPU_BLOCK_LANES][TM],
+                                          const u8_t qshift[PPU_BLOCK_LANES][TM],
                                           u8_t act_type,
-                                          u16_t abs_row,
-                                          u16_t ow,
-                                          u16_t c,
+                                          u32_t residual_offset,
+                                          u32_t dst_offset,
+                                          int tile,
                                           const act_vec_t& cat_word) {
-#pragma HLS INLINE off
+#pragma HLS INLINE
   act_vec_t residual_word = 0;
   act_vec_t out_word = 0;
   if (has_residual &&
-      !on_chip_memory_read_aligned_full_tile(residual,
-                                             static_cast<i32_t>(abs_row),
-                                             static_cast<i32_t>(ow),
-                                             c,
-                                             residual_word)) {
+      !on_chip_memory_read_packed_span(residual.bank_id, residual_offset,
+                                       static_cast<u8_t>(TM), residual_word)) {
     return false;
   }
-  if (has_residual) {
-    ppu_apply_block_add_affine_word(cat_word,
-                                    residual_word,
-                                    residual_add_qparam,
-                                    aff_qparam,
-                                    act_type,
-                                    out_word);
-  } else {
-    ppu_apply_block_affine_word(cat_word, aff_qparam, act_type, out_word);
-  }
-  return conv_store_write_aligned_tile(final_dst, abs_row, ow, c, out_word);
-}
-
-static bool ppu_finalize_block5_emit_tiles(const tensor_desc_t& residual,
-                                           const tensor_desc_t& final_dst,
-                                           bool has_residual,
-                                           const add_q_t& residual_add_qparam,
-                                           const aff_q_t& aff_q0,
-                                           const aff_q_t& aff_q1,
-                                           const aff_q_t& aff_q2,
-                                           const aff_q_t& aff_q3,
-                                           u8_t act_type,
-                                           u16_t abs_row,
-                                           u16_t ow,
-                                           u8_t tile_count,
-                                           const act_vec_t& tile0_word,
-                                           const act_vec_t& tile1_word,
-                                           const act_vec_t& tile2_word,
-                                           const act_vec_t& tile3_word) {
-#pragma HLS INLINE off
-  for (int tile = 0; tile < 4; ++tile) {
-#pragma HLS PIPELINE off
-    if (tile >= static_cast<int>(tile_count.to_uint())) {
-      break;
-    }
-
-    act_vec_t cat_word = tile0_word;
-    aff_q_t aff_qparam = aff_q0;
-#pragma HLS ARRAY_PARTITION variable=aff_qparam.mul complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_qparam.bias complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_qparam.shift complete dim=1
-    if (tile == 1) {
-      cat_word = tile1_word;
-      aff_qparam = aff_q1;
-    } else if (tile == 2) {
-      cat_word = tile2_word;
-      aff_qparam = aff_q2;
-    } else if (tile == 3) {
-      cat_word = tile3_word;
-      aff_qparam = aff_q3;
-    }
-
-    if (!ppu_finalize_block5_emit_word(residual,
-                                       final_dst,
-                                       has_residual,
-                                       residual_add_qparam,
-                                       aff_qparam,
-                                       act_type,
-                                       abs_row,
-                                       ow,
-                                       static_cast<u16_t>(tile * TM),
-                                       cat_word)) {
-      return false;
-    }
-  }
-  return true;
+  ppu_apply_block_word(cat_word, residual_word, has_residual, residual_add_qparam,
+                        qmul, qbias, qshift, tile, act_type, out_word);
+  return conv_store_write_row_contiguous_word(final_dst, dst_offset, out_word);
 }
 
 static bool ppu_finalize_block5_static_row(const block5_sched_desc_t& sched,
@@ -947,12 +887,41 @@ static bool ppu_finalize_block5_static_row(const block5_sched_desc_t& sched,
                                            u16_t abs_row,
                                            act_vec_t row_buf[MAX_FM_W]) {
 #pragma HLS INLINE off
+  static i32_t qmul[PPU_BLOCK_LANES][TM];
+  static i32_t qbias[PPU_BLOCK_LANES][TM];
+  static u8_t qshift[PPU_BLOCK_LANES][TM];
+#pragma HLS ARRAY_PARTITION variable=qmul complete dim=1
+#pragma HLS ARRAY_PARTITION variable=qbias complete dim=1
+#pragma HLS ARRAY_PARTITION variable=qshift complete dim=1
+#pragma HLS BIND_STORAGE variable=qmul type=ram_1p impl=lutram
+#pragma HLS BIND_STORAGE variable=qbias type=ram_1p impl=lutram
+#pragma HLS BIND_STORAGE variable=qshift type=ram_1p impl=lutram
+#pragma HLS RESET variable=qmul off
+#pragma HLS RESET variable=qbias off
+#pragma HLS RESET variable=qshift off
+  static bool affine_cache_valid = false;
+  static u32_t affine_cache_generation = 0;
+  static u8_t affine_cache_param = 0;
+  static u8_t affine_cache_pattern = 0;
+  static u16_t affine_cache_next_row = 0;
+  const u32_t generation = param_dma_generation();
+  const bool reuse_affine = affine_cache_valid && abs_row != 0 &&
+      affine_cache_generation == generation && affine_cache_param == sched.affine_param_id &&
+      affine_cache_pattern == sched.pattern && affine_cache_next_row == abs_row;
+  // Any rejected/incomplete row invalidates the only coefficient cache.
+  affine_cache_valid = false;
   if (!ppu_full_aligned_tile_write_plan_ok(final_dst, sched.valid_c)) {
     return false;
   }
   const unsigned pattern = sched.pattern.to_uint();
   const bool is_l3 = pattern == static_cast<unsigned>(BLOCK5_PATTERN_L3_C28_4C25);
   if (!is_l3 && pattern != static_cast<unsigned>(BLOCK5_PATTERN_L2_C16_4C12)) {
+    return false;
+  }
+  if (abs_row >= final_dst.h || sched.out_w > final_dst.w ||
+      (has_residual &&
+       (abs_row >= residual.h || sched.out_w > residual.w ||
+        !ppu_full_aligned_tile_write_plan_ok(residual, sched.valid_c)))) {
     return false;
   }
 
@@ -980,45 +949,25 @@ static bool ppu_finalize_block5_static_row(const block5_sched_desc_t& sched,
     return false;
   }
 
-  aff_q_t aff_q0;
-  aff_q_t aff_q1;
-  aff_q_t aff_q2;
-  aff_q_t aff_q3;
-#pragma HLS ARRAY_PARTITION variable=aff_q0.mul complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_q0.bias complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_q0.shift complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_q1.mul complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_q1.bias complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_q1.shift complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_q2.mul complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_q2.bias complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_q2.shift complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_q3.mul complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_q3.bias complete dim=1
-#pragma HLS ARRAY_PARTITION variable=aff_q3.shift complete dim=1
-  if (!param_dma_get_affine_qparam(sched.affine_param_id, static_cast<u8_t>(0), aff_q0) ||
-      !param_dma_get_affine_qparam(sched.affine_param_id, static_cast<u8_t>(1), aff_q1)) {
+  const int tile_count = is_l3 ? 4 : 2;
+  if (!reuse_affine &&
+      !ppu_load_block5_affine_bank(sched.affine_param_id, tile_count, qmul, qbias, qshift)) {
     return false;
-  }
-  if (is_l3) {
-    if (!param_dma_get_affine_qparam(sched.affine_param_id, static_cast<u8_t>(2), aff_q2) ||
-        !param_dma_get_affine_qparam(sched.affine_param_id, static_cast<u8_t>(3), aff_q3)) {
-      return false;
-    }
-  } else {
-    // The common tail never consumes tiles 2/3 for L2, but explicit values
-    // avoid undefined inputs at the shared module boundary.
-    aff_q2 = aff_q0;
-    aff_q3 = aff_q1;
   }
 
   const int out_w_i = static_cast<int>(sched.out_w.to_uint());
+  u32_t dst_pixel = ppu_compact_row_base(final_dst, abs_row);
+  u32_t residual_pixel = has_residual ? ppu_compact_row_base(residual, abs_row)
+                                      : static_cast<u32_t>(0);
+  const u32_t dst_step = static_cast<u32_t>(tensor_phys_c(final_dst));
+  const u32_t residual_step = has_residual
+                                  ? static_cast<u32_t>(tensor_phys_c(residual))
+                                  : static_cast<u32_t>(0);
   for (int ow_i = 0; ow_i < MAX_FM_W; ++ow_i) {
 #pragma HLS PIPELINE off
     if (ow_i >= out_w_i) {
       break;
     }
-    const u16_t ow = static_cast<u16_t>(ow_i);
     act_vec_t tile0_word = 0;
     act_vec_t tile1_word = 0;
     act_vec_t tile2_word = 0;
@@ -1061,26 +1010,32 @@ static bool ppu_finalize_block5_static_row(const block5_sched_desc_t& sched,
                                     tile1_word);
       }
     }
-    if (!compose_ok ||
-        !ppu_finalize_block5_emit_tiles(residual,
-                                        final_dst,
-                                        has_residual,
-                                        residual_add_qparam,
-                                        aff_q0,
-                                        aff_q1,
-                                        aff_q2,
-                                        aff_q3,
-                                        act_type,
-                                        abs_row,
-                                        ow,
-                                        static_cast<u8_t>(is_l3 ? 4 : 2),
-                                        tile0_word,
-                                        tile1_word,
-                                        tile2_word,
-                                        tile3_word)) {
+    if (!compose_ok) {
       return false;
     }
+    for (int tile = 0; tile < 4; ++tile) {
+#pragma HLS PIPELINE off
+      if (tile >= tile_count) { break; }
+      act_vec_t cat_word = tile0_word;
+      if (tile == 1) { cat_word = tile1_word; }
+      else if (tile == 2) { cat_word = tile2_word; }
+      else if (tile == 3) { cat_word = tile3_word; }
+      const u32_t c = static_cast<u32_t>(tile * TM);
+      if (!ppu_finalize_block5_emit_word(
+              residual, final_dst, has_residual, residual_add_qparam,
+              qmul, qbias, qshift, act_type, residual_pixel + c, dst_pixel + c,
+              tile, cat_word)) {
+        return false;
+      }
+    }
+    dst_pixel += dst_step;
+    residual_pixel += residual_step;
   }
+  affine_cache_generation = generation;
+  affine_cache_param = sched.affine_param_id;
+  affine_cache_pattern = sched.pattern;
+  affine_cache_next_row = abs_row + static_cast<u16_t>(1);
+  affine_cache_valid = true;
   return true;
 }
 
@@ -1152,11 +1107,6 @@ bool ppu_consume_block5_final_row(const block5_sched_desc_t& sched,
                                   u16_t abs_row,
                                   act_vec_t row_buf[MAX_FM_W]) {
 #pragma HLS INLINE off
-  const unsigned pattern = sched.pattern.to_uint();
-  if (pattern != static_cast<unsigned>(BLOCK5_PATTERN_L2_C16_4C12) &&
-      pattern != static_cast<unsigned>(BLOCK5_PATTERN_L3_C28_4C25)) {
-    return false;
-  }
   return ppu_finalize_block5_static_row(sched,
                                         scratch0,
                                         scratch1,

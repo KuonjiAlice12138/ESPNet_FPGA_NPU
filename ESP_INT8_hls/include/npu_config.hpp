@@ -31,8 +31,7 @@ constexpr int INPUT_FRAME_C = 1;
 constexpr int ENCODER_OUT_H = 30;
 constexpr int ENCODER_OUT_W = 30;
 constexpr int MAX_CLASS_C = 2;
-constexpr int UPSAMPLE_CLASS_LANES = 2;
-// Binary golden/debug TB compatibility only; the synthesized path uses valid_c.
+// Binary golden/debug TB compatibility; the H240 upsample path requires C2.
 constexpr int ENCODER_OUT_C = 2;
 constexpr int UPSAMPLE_SCALE = 8;
 constexpr int FULLRES_MASK_H = INPUT_FRAME_H;
@@ -127,7 +126,6 @@ constexpr int MAX_PACK_CMDS_PER_KT = 9;
 constexpr int MAX_STAGED_WINDOW_PACK_CMDS = 64;
 constexpr int MAX_3X3_CACHE_CHUNKS = 5;
 constexpr int WINGEN_NARROW_CACHE_COL_SLOTS = 64;
-constexpr int WINGEN_NARROW_ROW_WORDS = WINGEN_NARROW_CACHE_COL_SLOTS;
 constexpr int WINGEN_WIDE_CACHE_COL_SLOTS = 4;
 
 constexpr int WINDOW_PACK_CMD_BLOB_BYTES = 8;

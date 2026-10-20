@@ -32,6 +32,8 @@ BLOCKERS = [
 
 
 HIGH_RISKS = [
+    PatternRule("clock period violation", re.compile(r"\bWARNING:\s*\[HLS 200-(871|887)\]", re.IGNORECASE)),
+    PatternRule("function signature duplication", re.compile(r"\bWARNING:\s*\[HLS 214-366\]", re.IGNORECASE)),
     PatternRule("pipeline directive not satisfied", re.compile(r"Unable to satisfy pipeline directive", re.IGNORECASE)),
     PatternRule("II violation", re.compile(r"(HLS 200-880|II Violation|Final II = ([2-9]|[1-9][0-9]+))", re.IGNORECASE)),
     PatternRule("pipeline disabled", re.compile(r"#pragma HLS PIPELINE off|PIPELINE off", re.IGNORECASE)),

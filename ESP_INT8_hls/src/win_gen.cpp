@@ -85,14 +85,18 @@ struct narrow_3x3_window_t {
     act_vec_t spatial[9];
 };
 
-// One striped column-ring owner serves the compiled narrow schedules.
-constexpr int WINGEN_NARROW_WORD_LANES = AXI_WORD_BYTES / 8;
-static u64_t
-    s_narrow_row_bank0[WINGEN_NARROW_WORD_LANES][WINGEN_NARROW_ROW_WORDS];
-static u64_t
-    s_narrow_row_bank1[WINGEN_NARROW_WORD_LANES][WINGEN_NARROW_ROW_WORDS];
-static u64_t
-    s_narrow_row_bank2[WINGEN_NARROW_WORD_LANES][WINGEN_NARROW_ROW_WORDS];
+// Column-delta storage is owned exclusively by the assembler.
+struct narrow_delta_cache_t {
+    act_vec_t data[3][WINGEN_NARROW_CACHE_COL_SLOTS];
+};
+static narrow_delta_cache_t s_delta_cache;
+
+// The raw C1 frame has 240-byte rows; no padded copy is stored in FM memory.
+static act_vec_t s_c1_rows[3][WINGEN_C1_PACKED_ROW_WORDS];
+static bool s_c1_rows_valid = false;
+static u16_t s_c1_last_row = 0;
+static u32_t s_c1_source_base = 0;
+static u8_t s_c1_source_bank = 0;
 
 
 struct wide_3x3_cache_t {
@@ -122,23 +126,6 @@ struct window_load_word_t {
     u8_t slot;
     u8_t row;
     u8_t chunk;
-};
-
-struct narrow_paired_issue_plan_t {
-    u8_t slot00;
-    u8_t slot01;
-    u8_t slot02;
-    u8_t slot10;
-    u8_t slot11;
-    u8_t slot12;
-    u8_t update_cols;
-    u8_t phase0_update_cols;
-    u8_t has_second_window;
-};
-
-enum narrow_transfer_protocol_t : unsigned char {
-    NARROW_TRANSFER_FULL_WINDOWS = 0,
-    NARROW_TRANSFER_C12_S1_INCREMENTAL = 1,
 };
 
 static u32_t win_build_lane_mask(u8_t byte_count) {
@@ -183,62 +170,17 @@ struct window_row_cfg_t {
     u8_t loader_class;
     u8_t loader_request_cols;
     u8_t loader_warmup_issues;
-    u8_t loader_warmup_new_cols;
-    u8_t loader_steady_new_cols;
     u8_t loader_words_per_col;
     u8_t loader_warmup_mask;
     u8_t loader_steady_mask;
-    u8_t loader_warmup_run_count;
-    u8_t loader_steady_run_count;
-    u8_t loader_warmup_phase0_cols;
-    u8_t loader_steady_phase0_cols;
     u16_t loader_warmup_run0;
-    u16_t loader_warmup_run1;
-    u16_t loader_warmup_run2;
     u16_t loader_steady_run0;
-    u16_t loader_steady_run1;
-    u16_t loader_steady_run2;
     u8_t narrow_transfer_protocol;
     u8_t narrow_valid_c;
     u8_t last_chunk_valid_c;
     u32_t narrow_lane_mask;
     u32_t last_chunk_lane_mask;
     u16_t out_w;
-};
-
-struct narrow_fallback_read_cfg_t {
-    tensor_desc_t src_desc;
-    u32_t row_base0;
-    u32_t row_base1;
-    u32_t row_base2;
-    u8_t row_valid_mask;
-    u8_t valid_c;
-    u32_t lane_mask;
-};
-
-struct narrow_fallback_cfg_t {
-    narrow_fallback_read_cfg_t read;
-    u8_t stride;
-    u8_t dilation;
-    u8_t padding;
-    u8_t slot_mask;
-    u16_t issue_count;
-    u8_t odd_tail;
-    u8_t warmup_issues;
-    u8_t warmup_new_cols;
-    u8_t steady_new_cols;
-    u8_t warmup_phase0_cols;
-    u8_t steady_phase0_cols;
-    u8_t warmup_mask;
-    u8_t steady_mask;
-    u8_t warmup_run_count;
-    u8_t steady_run_count;
-    u16_t warmup_run0;
-    u16_t warmup_run1;
-    u16_t warmup_run2;
-    u16_t steady_run0;
-    u16_t steady_run1;
-    u16_t steady_run2;
 };
 
 struct window_assembler_cfg_t {
@@ -250,42 +192,6 @@ struct window_assembler_cfg_t {
     u8_t loader_words_per_col;
     u8_t narrow_transfer_protocol;
 };
-
-static u8_t select_narrow_transfer_protocol(const window_row_cfg_t& cfg) {
-#pragma HLS INLINE
-    const bool paired =
-        (cfg.flags.to_uint() &
-         static_cast<unsigned>(WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)) != 0U;
-    if (cfg.loader_class.to_uint() !=
-            static_cast<unsigned>(WIN_LOADER_3X3_NARROW) ||
-        !paired ||
-        cfg.loader_warmup_issues.to_uint() != 1U ||
-        cfg.loader_warmup_run_count.to_uint() != 1U ||
-        cfg.loader_steady_run_count.to_uint() != 1U ||
-        cfg.loader_words_per_col.to_uint() != 3U) {
-        return static_cast<u8_t>(
-            static_cast<unsigned>(NARROW_TRANSFER_FULL_WINDOWS));
-    }
-
-    const unsigned warmup_run_count =
-        (cfg.loader_warmup_run0.to_uint() >> 8) & 0xFFU;
-    const unsigned steady_run_count =
-        (cfg.loader_steady_run0.to_uint() >> 8) & 0xFFU;
-    if (cfg.mode.to_uint() ==
-            static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12) &&
-        cfg.cache_col_slots.to_uint() == 4U &&
-        cfg.loader_warmup_new_cols.to_uint() == 4U &&
-        cfg.loader_steady_new_cols.to_uint() == 2U &&
-        warmup_run_count == 4U &&
-        steady_run_count == 2U &&
-        cfg.loader_warmup_phase0_cols.to_uint() == 0U &&
-        cfg.loader_steady_phase0_cols.to_uint() == 0U) {
-        return static_cast<u8_t>(
-            static_cast<unsigned>(NARROW_TRANSFER_C12_S1_INCREMENTAL));
-    }
-    return static_cast<u8_t>(
-        static_cast<unsigned>(NARROW_TRANSFER_FULL_WINDOWS));
-}
 
 static u32_t window_cfg_row_base(const window_row_cfg_t& cfg, int row) {
 #pragma HLS INLINE
@@ -310,62 +216,6 @@ static int window_issue_count(const window_row_cfg_t& cfg) {
         (cfg.flags.to_uint() &
          static_cast<unsigned>(WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)) != 0U;
     return paired ? ((out_w + 1) / 2) : out_w;
-}
-
-static narrow_fallback_cfg_t make_narrow_fallback_cfg(
-    const window_row_cfg_t& cfg) {
-#pragma HLS INLINE
-    narrow_fallback_cfg_t fallback;
-    fallback.read.src_desc = cfg.src_desc;
-    fallback.read.row_base0 = cfg.row_base0;
-    fallback.read.row_base1 = cfg.row_base1;
-    fallback.read.row_base2 = cfg.row_base2;
-    fallback.read.row_valid_mask = cfg.row_valid_mask;
-    fallback.read.valid_c = cfg.narrow_valid_c;
-    fallback.read.lane_mask = cfg.narrow_lane_mask;
-    fallback.stride = cfg.stride;
-    fallback.dilation = cfg.dilation;
-    fallback.padding = cfg.padding;
-    fallback.slot_mask = static_cast<u8_t>(
-        static_cast<unsigned>(cfg.cache_col_slots.to_uint()) - 1U);
-    fallback.issue_count = static_cast<u16_t>(window_issue_count(cfg));
-    fallback.odd_tail = static_cast<u8_t>(
-        (cfg.flags.to_uint() &
-         static_cast<unsigned>(WINDOW_SCHED_FLAG_ODD_TAIL)) != 0U);
-    fallback.warmup_issues = cfg.loader_warmup_issues;
-    fallback.warmup_new_cols = cfg.loader_warmup_new_cols;
-    fallback.steady_new_cols = cfg.loader_steady_new_cols;
-    fallback.warmup_phase0_cols = cfg.loader_warmup_phase0_cols;
-    fallback.steady_phase0_cols = cfg.loader_steady_phase0_cols;
-    fallback.warmup_mask = cfg.loader_warmup_mask;
-    fallback.steady_mask = cfg.loader_steady_mask;
-    fallback.warmup_run_count = cfg.loader_warmup_run_count;
-    fallback.steady_run_count = cfg.loader_steady_run_count;
-    fallback.warmup_run0 = cfg.loader_warmup_run0;
-    fallback.warmup_run1 = cfg.loader_warmup_run1;
-    fallback.warmup_run2 = cfg.loader_warmup_run2;
-    fallback.steady_run0 = cfg.loader_steady_run0;
-    fallback.steady_run1 = cfg.loader_steady_run1;
-    fallback.steady_run2 = cfg.loader_steady_run2;
-    return fallback;
-}
-
-static u32_t narrow_fallback_row_base(
-    const narrow_fallback_read_cfg_t& cfg, int row) {
-#pragma HLS INLINE
-    if (row == 0) {
-        return cfg.row_base0;
-    }
-    if (row == 1) {
-        return cfg.row_base1;
-    }
-    return cfg.row_base2;
-}
-
-static bool narrow_fallback_row_valid(
-    const narrow_fallback_read_cfg_t& cfg, int row) {
-#pragma HLS INLINE
-    return ((cfg.row_valid_mask.to_uint() >> row) & 1U) != 0U;
 }
 
 static i32_t window_request_column(const window_row_cfg_t& cfg,
@@ -403,32 +253,14 @@ static void configure_window_row(const tensor_desc_t& src_desc,
     cfg.loader_class = sched.loader_class;
     cfg.loader_request_cols = sched.loader_request_cols;
     cfg.loader_warmup_issues = sched.loader_warmup_issues;
-    cfg.loader_warmup_new_cols = sched.loader_warmup_new_cols;
-    cfg.loader_steady_new_cols = sched.loader_steady_new_cols;
     cfg.loader_words_per_col = sched.loader_words_per_col;
     cfg.loader_warmup_mask = sched.loader_warmup_mask;
     cfg.loader_steady_mask = sched.loader_steady_mask;
-    cfg.loader_warmup_run_count =
-        sched.reserved[WINDOW_LOADER_WARMUP_COUNT_WORD];
-    cfg.loader_steady_run_count =
-        sched.reserved[WINDOW_LOADER_STEADY_COUNT_WORD];
-    cfg.loader_warmup_phase0_cols =
-        sched.reserved[WINDOW_LOADER_PHASE_SPLIT_WORD].range(7, 0);
-    cfg.loader_steady_phase0_cols =
-        sched.reserved[WINDOW_LOADER_PHASE_SPLIT_WORD].range(15, 8);
-    cfg.loader_warmup_run0 =
-        sched.reserved[WINDOW_LOADER_WARMUP_RUN_WORD + 0];
-    cfg.loader_warmup_run1 =
-        sched.reserved[WINDOW_LOADER_WARMUP_RUN_WORD + 1];
-    cfg.loader_warmup_run2 =
-        sched.reserved[WINDOW_LOADER_WARMUP_RUN_WORD + 2];
-    cfg.loader_steady_run0 =
-        sched.reserved[WINDOW_LOADER_STEADY_RUN_WORD + 0];
-    cfg.loader_steady_run1 =
-        sched.reserved[WINDOW_LOADER_STEADY_RUN_WORD + 1];
-    cfg.loader_steady_run2 =
-        sched.reserved[WINDOW_LOADER_STEADY_RUN_WORD + 2];
-    cfg.narrow_transfer_protocol = select_narrow_transfer_protocol(cfg);
+    cfg.loader_warmup_run0 = sched.reserved[WINDOW_LOADER_WARMUP_RUN_WORD];
+    cfg.loader_steady_run0 = sched.reserved[WINDOW_LOADER_STEADY_RUN_WORD];
+    cfg.narrow_transfer_protocol = static_cast<u8_t>(
+        (sched.reserved[WINDOW_LOADER_ROW_REUSE_WORD].to_uint() >>
+         WINDOW_TRANSFER_PROTOCOL_SHIFT) & WINDOW_TRANSFER_PROTOCOL_MASK);
     const unsigned input_channels = sched.in_c.to_uint();
     unsigned narrow_valid_c = input_channels;
     if (narrow_valid_c == 0U ||
@@ -500,56 +332,6 @@ static void reset_packed_word_cursors() {
         s_packed_word_cursor[kh].valid0 = false;
         s_packed_word_cursor[kh].valid1 = false;
     }
-}
-
-template <int LANE>
-static u64_t narrow_row_bank_lane_read(unsigned bank, unsigned word_index) {
-#pragma HLS INLINE
-    if (bank == 0U) {
-        return s_narrow_row_bank0[LANE][word_index];
-    }
-    if (bank == 1U) {
-        return s_narrow_row_bank1[LANE][word_index];
-    }
-    return s_narrow_row_bank2[LANE][word_index];
-}
-
-template <int LANE>
-static void narrow_row_bank_lane_write(unsigned bank,
-                                       unsigned word_index,
-                                       const u64_t& lane_word) {
-#pragma HLS INLINE
-    if (bank == 0U) {
-        s_narrow_row_bank0[LANE][word_index] = lane_word;
-    } else if (bank == 1U) {
-        s_narrow_row_bank1[LANE][word_index] = lane_word;
-    } else {
-        s_narrow_row_bank2[LANE][word_index] = lane_word;
-    }
-}
-
-static act_vec_t narrow_row_bank_read(unsigned bank, unsigned word_index) {
-#pragma HLS INLINE
-    act_vec_t word = 0;
-    word.range(63, 0) = narrow_row_bank_lane_read<0>(bank, word_index);
-    word.range(127, 64) = narrow_row_bank_lane_read<1>(bank, word_index);
-    word.range(191, 128) = narrow_row_bank_lane_read<2>(bank, word_index);
-    word.range(255, 192) = narrow_row_bank_lane_read<3>(bank, word_index);
-    return word;
-}
-
-static void narrow_row_bank_write(unsigned bank,
-                                  unsigned word_index,
-                                  const act_vec_t& word) {
-#pragma HLS INLINE
-    narrow_row_bank_lane_write<0>(
-        bank, word_index, static_cast<u64_t>(word.range(63, 0)));
-    narrow_row_bank_lane_write<1>(
-        bank, word_index, static_cast<u64_t>(word.range(127, 64)));
-    narrow_row_bank_lane_write<2>(
-        bank, word_index, static_cast<u64_t>(word.range(191, 128)));
-    narrow_row_bank_lane_write<3>(
-        bank, word_index, static_cast<u64_t>(word.range(255, 192)));
 }
 
 static bool read_aligned_word_cached(const tensor_desc_t& src_desc,
@@ -641,15 +423,6 @@ static bool read_packed_tile_from_row_cached(const tensor_desc_t& src_desc,
     return true;
 }
 
-static act_vec_t read_staged_cache(const narrow_3x3_window_t& window,
-                                   int kh,
-                                   int kw,
-                                   int,
-                                   int) {
-#pragma HLS INLINE
-    return window.spatial[kh * 3 + kw];
-}
-
 static act_vec_t read_staged_cache(const wide_3x3_cache_t& cache,
                                    int kh,
                                    int,
@@ -702,36 +475,6 @@ static void window_loader_emit_column(
     }
 }
 
-static bool window_cfg_is_narrow_paired(const window_row_cfg_t& cfg) {
-#pragma HLS INLINE
-    return cfg.loader_class.to_uint() ==
-               static_cast<unsigned>(WIN_LOADER_3X3_NARROW) &&
-           (cfg.flags.to_uint() &
-            static_cast<unsigned>(WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)) != 0U;
-}
-
-static u16_t narrow_fallback_run_word(const narrow_fallback_cfg_t& cfg,
-                                      bool warmup,
-                                      int run_index) {
-#pragma HLS INLINE
-    if (warmup) {
-        if (run_index == 0) {
-            return cfg.warmup_run0;
-        }
-        if (run_index == 1) {
-            return cfg.warmup_run1;
-        }
-        return cfg.warmup_run2;
-    }
-    if (run_index == 0) {
-        return cfg.steady_run0;
-    }
-    if (run_index == 1) {
-        return cfg.steady_run1;
-    }
-    return cfg.steady_run2;
-}
-
 static int window_loader_run_start_delta(u16_t run_word) {
 #pragma HLS INLINE
     int delta = static_cast<int>(run_word.to_uint() & 0xFFU);
@@ -739,111 +482,6 @@ static int window_loader_run_start_delta(u16_t run_word) {
         delta -= 0x100;
     }
     return delta;
-}
-
-static u8_t window_cache_slot(i32_t input_col, unsigned slot_mask) {
-#pragma HLS INLINE
-    return static_cast<u8_t>(
-        static_cast<unsigned>(input_col.to_int()) & slot_mask);
-}
-
-static narrow_paired_issue_plan_t make_narrow_paired_issue_plan(
-    const narrow_fallback_cfg_t& cfg,
-    int issue,
-    bool warmup,
-    unsigned slot_mask) {
-#pragma HLS INLINE
-    const int stride = static_cast<int>(cfg.stride.to_uint());
-    const int dilation = static_cast<int>(cfg.dilation.to_uint());
-    const int padding = static_cast<int>(cfg.padding.to_uint());
-    const int pixel0 = issue * 2;
-    const i32_t base0 =
-        static_cast<i32_t>(pixel0 * stride - padding);
-    const i32_t base1 =
-        static_cast<i32_t>((pixel0 + 1) * stride - padding);
-
-    narrow_paired_issue_plan_t meta;
-    meta.slot00 = window_cache_slot(base0, slot_mask);
-    meta.slot01 =
-        window_cache_slot(base0 + static_cast<i32_t>(dilation), slot_mask);
-    meta.slot02 =
-        window_cache_slot(base0 + static_cast<i32_t>(2 * dilation), slot_mask);
-    meta.slot10 = window_cache_slot(base1, slot_mask);
-    meta.slot11 =
-        window_cache_slot(base1 + static_cast<i32_t>(dilation), slot_mask);
-    meta.slot12 =
-        window_cache_slot(base1 + static_cast<i32_t>(2 * dilation), slot_mask);
-    meta.update_cols =
-        warmup ? cfg.warmup_new_cols
-               : cfg.steady_new_cols;
-    meta.phase0_update_cols =
-        warmup ? cfg.warmup_phase0_cols
-               : cfg.steady_phase0_cols;
-    const bool tail_issue =
-        cfg.odd_tail.to_uint() != 0U &&
-        issue == static_cast<int>(cfg.issue_count.to_uint()) - 1;
-    meta.has_second_window =
-        tail_issue ? static_cast<u8_t>(0)
-                   : static_cast<u8_t>(1);
-    return meta;
-}
-
-static void window_loader_update_narrow_run(
-    const narrow_fallback_read_cfg_t& cfg,
-    i32_t start_col,
-    int column_count,
-    unsigned slot_mask) {
-#pragma HLS INLINE
-    for (int kh = 0; kh < 3; ++kh) {
-#pragma HLS PIPELINE off
-        packed_word_cursor_t& cursor = s_packed_word_cursor[kh];
-        const u32_t row_base = narrow_fallback_row_base(cfg, kh);
-        const bool row_valid = narrow_fallback_row_valid(cfg, kh);
-        for (int offset = 0; offset < 6; ++offset) {
-#pragma HLS PIPELINE off
-            if (offset >= column_count) {
-                break;
-            }
-            const i32_t input_col =
-                start_col + static_cast<i32_t>(offset);
-            act_vec_t word = 0;
-            read_packed_tile_from_row_cached(
-                cfg.src_desc,
-                cursor,
-                row_base,
-                row_valid,
-                input_col,
-                static_cast<u16_t>(0),
-                cfg.valid_c,
-                cfg.lane_mask,
-                word);
-            narrow_row_bank_write(
-                static_cast<unsigned>(kh),
-                window_cache_slot(input_col, slot_mask).to_uint(),
-                word);
-        }
-    }
-}
-
-static void window_loader_emit_narrow_cached_window(
-    const u8_t slot_for_kw[3],
-    hls::stream<window_load_word_t>& load_word_stream) {
-#pragma HLS INLINE
-    for (int kh = 0; kh < 3; ++kh) {
-#pragma HLS PIPELINE off
-        for (int kw = 0; kw < 3; ++kw) {
-#pragma HLS PIPELINE II=1
-            window_load_word_t token;
-            token.word = narrow_row_bank_read(
-                static_cast<unsigned>(kh),
-                slot_for_kw[kw].to_uint());
-            token.slot = 0;
-            token.row = static_cast<u8_t>(kh);
-            token.chunk = static_cast<u8_t>(kw);
-            csim_count_narrow_transfer_word();
-            load_word_stream.write(token);
-        }
-    }
 }
 
 template <int COLUMN_COUNT>
@@ -907,128 +545,23 @@ static void window_row_loader_narrow_incremental_c12(
     }
 }
 
-static void window_row_loader_narrow_paired(
-    const narrow_fallback_cfg_t& cfg,
+static void window_loader_emit_delta_column(
+    const window_row_cfg_t& cfg, i32_t input_col, u8_t slot,
     hls::stream<window_load_word_t>& load_word_stream) {
-#pragma HLS INLINE off
-    const int issue_count = static_cast<int>(cfg.issue_count.to_uint());
-    const unsigned slot_mask = cfg.slot_mask.to_uint();
-    const int stride = static_cast<int>(cfg.stride.to_uint());
-    const int padding = static_cast<int>(cfg.padding.to_uint());
-    for (int issue = 0; issue < MAX_FM_W; ++issue) {
-        if (issue >= issue_count) {
-            break;
-        }
-        const bool warmup =
-            issue < static_cast<int>(cfg.warmup_issues.to_uint());
-        const int run_count = static_cast<int>(
-            warmup ? cfg.warmup_run_count.to_uint()
-                   : cfg.steady_run_count.to_uint());
-        const narrow_paired_issue_plan_t meta =
-            make_narrow_paired_issue_plan(
-                cfg, issue, warmup, slot_mask);
-        u8_t slot_for_kw0[3] = {
-            meta.slot00, meta.slot01, meta.slot02};
-        u8_t slot_for_kw1[3] = {
-            meta.slot10, meta.slot11, meta.slot12};
-#pragma HLS ARRAY_PARTITION variable=slot_for_kw0 complete dim=1
-#pragma HLS ARRAY_PARTITION variable=slot_for_kw1 complete dim=1
-
-        const int base_column = issue * 2 * stride - padding;
-        const int total_columns =
-            static_cast<int>(meta.update_cols.to_uint());
-        const int phase0_columns =
-            static_cast<int>(meta.phase0_update_cols.to_uint());
-        const int first_phase_end =
-            phase0_columns != 0 ? phase0_columns : total_columns;
-        for (int phase = 0; phase < 2; ++phase) {
+#pragma HLS INLINE
+    for (int kh = 0; kh < 3; ++kh) {
 #pragma HLS PIPELINE off
-            const int phase_begin =
-                phase == 0 ? 0 : first_phase_end;
-            const int phase_end =
-                phase == 0 ? first_phase_end : total_columns;
-            int run_column_base = 0;
-            if (phase_begin < phase_end) {
-              for (int run_index = 0;
-                   run_index < WINDOW_LOADER_RUN_MAX;
-                   ++run_index) {
-#pragma HLS PIPELINE off
-                if (run_index >= run_count) {
-                    break;
-                }
-                const u16_t run_word =
-                    narrow_fallback_run_word(
-                        cfg, warmup, run_index);
-                const int start_delta = window_loader_run_start_delta(run_word);
-                const int run_columns = static_cast<int>(
-                    (run_word.to_uint() >> 8) & 0xFFU);
-                int local_begin = phase_begin - run_column_base;
-                if (local_begin < 0) {
-                    local_begin = 0;
-                }
-                int local_end = phase_end - run_column_base;
-                if (local_end > run_columns) {
-                    local_end = run_columns;
-                }
-                const int emit_columns = local_end - local_begin;
-                if (emit_columns > 0) {
-                    const i32_t start_col =
-                        static_cast<i32_t>(
-                            base_column + start_delta + local_begin);
-                    window_loader_update_narrow_run(
-                        cfg.read,
-                        start_col,
-                        emit_columns,
-                        slot_mask);
-                }
-                run_column_base += run_columns;
-              }
-            }
-            if (phase == 0) {
-                window_loader_emit_narrow_cached_window(
-                    slot_for_kw0, load_word_stream);
-            } else if (meta.has_second_window.to_uint() != 0U) {
-                window_loader_emit_narrow_cached_window(
-                    slot_for_kw1, load_word_stream);
-            }
-        }
-    }
-}
-
-static void window_row_loader_narrow_unpaired(
-    const narrow_fallback_cfg_t& cfg,
-    hls::stream<window_load_word_t>& load_word_stream) {
-#pragma HLS INLINE off
-    const int issue_count = static_cast<int>(cfg.issue_count.to_uint());
-    const unsigned slot_mask = cfg.slot_mask.to_uint();
-    const int stride = static_cast<int>(cfg.stride.to_uint());
-    const int dilation = static_cast<int>(cfg.dilation.to_uint());
-    const int padding = static_cast<int>(cfg.padding.to_uint());
-    for (int issue = 0; issue < MAX_FM_W; ++issue) {
-        if (issue >= issue_count) {
-            break;
-        }
-        const bool warmup =
-            issue < static_cast<int>(cfg.warmup_issues.to_uint());
-        const unsigned update_mask =
-            warmup ? cfg.warmup_mask.to_uint()
-                   : cfg.steady_mask.to_uint();
-        const int base_column = issue * stride - padding;
-        u8_t slot_for_kw[3];
-#pragma HLS ARRAY_PARTITION variable=slot_for_kw complete dim=1
-        for (int request = 0; request < 3; ++request) {
-#pragma HLS PIPELINE off
-            const i32_t input_col = static_cast<i32_t>(
-                base_column + request * dilation);
-            slot_for_kw[request] =
-                window_cache_slot(input_col, slot_mask);
-            if (((update_mask >> request) & 1U) != 0U) {
-                window_loader_update_narrow_run(
-                    cfg.read, input_col, 1, slot_mask);
-            }
-        }
-        window_loader_emit_narrow_cached_window(
-            slot_for_kw, load_word_stream);
+        window_load_word_t token;
+        token.word = 0;
+        read_packed_tile_from_row_cached(
+            cfg.src_desc, s_packed_word_cursor[kh], window_cfg_row_base(cfg, kh),
+            window_cfg_row_valid(cfg, kh), input_col, static_cast<u16_t>(0),
+            cfg.narrow_valid_c, cfg.narrow_lane_mask, token.word);
+        token.slot = slot;
+        token.row = static_cast<u8_t>(kh);
+        token.chunk = 0;
+        csim_count_narrow_transfer_word();
+        load_word_stream.write(token);
     }
 }
 
@@ -1037,34 +570,13 @@ static void window_row_loader(
     hls::stream<window_column_meta_t>& column_meta_stream,
     hls::stream<window_load_word_t>& load_word_stream) {
 #pragma HLS INLINE off
-#pragma HLS ARRAY_PARTITION variable=s_narrow_row_bank0 complete dim=1
-#pragma HLS ARRAY_PARTITION variable=s_narrow_row_bank1 complete dim=1
-#pragma HLS ARRAY_PARTITION variable=s_narrow_row_bank2 complete dim=1
-#pragma HLS BIND_STORAGE variable=s_narrow_row_bank0 type=ram_1p impl=bram
-#pragma HLS BIND_STORAGE variable=s_narrow_row_bank1 type=ram_1p impl=bram
-#pragma HLS BIND_STORAGE variable=s_narrow_row_bank2 type=ram_1p impl=bram
-#pragma HLS RESET variable=s_narrow_row_bank0 off
-#pragma HLS RESET variable=s_narrow_row_bank1 off
-#pragma HLS RESET variable=s_narrow_row_bank2 off
     const window_row_cfg_t cfg = loader_cfg_stream.read();
     reset_packed_word_cursors();
-    if (cfg.loader_class.to_uint() ==
-        static_cast<unsigned>(WIN_LOADER_3X3_NARROW)) {
-        if (cfg.narrow_transfer_protocol.to_uint() ==
-            static_cast<unsigned>(NARROW_TRANSFER_C12_S1_INCREMENTAL)) {
-            window_row_loader_narrow_incremental_c12(
-                cfg, load_word_stream);
-        } else {
-            const narrow_fallback_cfg_t fallback_cfg =
-                make_narrow_fallback_cfg(cfg);
-            if (window_cfg_is_narrow_paired(cfg)) {
-                window_row_loader_narrow_paired(
-                    fallback_cfg, load_word_stream);
-            } else {
-                window_row_loader_narrow_unpaired(
-                    fallback_cfg, load_word_stream);
-            }
-        }
+    const bool narrow = cfg.loader_class.to_uint() ==
+                        static_cast<unsigned>(WIN_LOADER_3X3_NARROW);
+    if (cfg.narrow_transfer_protocol.to_uint() ==
+        static_cast<unsigned>(WINDOW_TRANSFER_C12_S1_INCREMENTAL)) {
+        window_row_loader_narrow_incremental_c12(cfg, load_word_stream);
         return;
     }
 
@@ -1099,26 +611,24 @@ static void window_row_loader(
                                  : static_cast<u8_t>(0);
             column_meta_stream.write(meta);
             if (update) {
-                window_loader_emit_column(
-                    cfg,
-                    input_col,
-                    static_cast<u8_t>(slot),
-                    load_word_stream);
+                if (narrow) {
+                    window_loader_emit_delta_column(cfg, input_col,
+                                                    static_cast<u8_t>(slot), load_word_stream);
+                } else {
+                    window_loader_emit_column(cfg, input_col,
+                                              static_cast<u8_t>(slot), load_word_stream);
+                }
             }
         }
     }
 }
 
-template <int SPATIAL, int SRC_LANE, int DST_LANE, int COUNT, typename CacheT>
+template <int SPATIAL, int SRC_LANE, int DST_LANE, int COUNT>
 static void copy_staged_cache_segment(
-    const CacheT& cache,
-    const u8_t slot_for_kw[3],
+    const narrow_3x3_window_t& cache,
     act_vec_t& word) {
 #pragma HLS INLINE
-    const int kh = SPATIAL / 3;
-    const int kw = SPATIAL - kh * 3;
-    const int slot = static_cast<int>(slot_for_kw[kw].to_uint());
-    const act_vec_t src = read_staged_cache(cache, kh, kw, slot, 0);
+    const act_vec_t src = cache.spatial[SPATIAL];
     word.range(DST_LANE * 8 + COUNT * 8 - 1, DST_LANE * 8) =
         src.range(SRC_LANE * 8 + COUNT * 8 - 1, SRC_LANE * 8);
 }
@@ -1137,132 +647,107 @@ static void copy_staged_cache_chunk_segment(
         src.range(SRC_LANE * 8 + COUNT * 8 - 1, SRC_LANE * 8);
 }
 
-template <typename CacheT>
-static void build_staged_c1_word(
-    const CacheT& cache,
-    const u8_t slot_for_kw[3],
-    int kt,
-    act_vec_t& word) {
-#pragma HLS INLINE
-    copy_staged_cache_segment<0, 0, 0, 1>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<1, 0, 1, 1>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<2, 0, 2, 1>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<3, 0, 3, 1>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<4, 0, 4, 1>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<5, 0, 5, 1>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<6, 0, 6, 1>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<7, 0, 7, 1>(cache, slot_for_kw, word);
-    copy_staged_cache_segment<8, 0, 8, 1>(cache, slot_for_kw, word);
-    (void)kt;
-}
-
-template <typename CacheT>
 static void build_staged_c12_word(
-    const CacheT& cache,
-    const u8_t slot_for_kw[3],
+    const narrow_3x3_window_t& cache,
     int kt,
     act_vec_t& word) {
 #pragma HLS INLINE
     switch (kt) {
         case 0:
-            copy_staged_cache_segment<0, 0, 0, 12>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<1, 0, 12, 12>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<2, 0, 24, 8>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<0, 0, 0, 12>(cache, word);
+            copy_staged_cache_segment<1, 0, 12, 12>(cache, word);
+            copy_staged_cache_segment<2, 0, 24, 8>(cache, word);
             break;
         case 1:
-            copy_staged_cache_segment<2, 8, 0, 4>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<3, 0, 4, 12>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<4, 0, 16, 12>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<5, 0, 28, 4>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<2, 8, 0, 4>(cache, word);
+            copy_staged_cache_segment<3, 0, 4, 12>(cache, word);
+            copy_staged_cache_segment<4, 0, 16, 12>(cache, word);
+            copy_staged_cache_segment<5, 0, 28, 4>(cache, word);
             break;
         case 2:
-            copy_staged_cache_segment<5, 4, 0, 8>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<6, 0, 8, 12>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<7, 0, 20, 12>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<5, 4, 0, 8>(cache, word);
+            copy_staged_cache_segment<6, 0, 8, 12>(cache, word);
+            copy_staged_cache_segment<7, 0, 20, 12>(cache, word);
             break;
         case 3:
-            copy_staged_cache_segment<8, 0, 0, 12>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<8, 0, 0, 12>(cache, word);
             break;
         default:
             break;
     }
 }
 
-template <typename CacheT>
 static void build_staged_c17_word(
-    const CacheT& cache,
-    const u8_t slot_for_kw[3],
+    const narrow_3x3_window_t& cache,
     int kt,
     act_vec_t& word) {
 #pragma HLS INLINE
     switch (kt) {
         case 0:
-            copy_staged_cache_segment<0, 0, 0, 17>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<1, 0, 17, 15>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<0, 0, 0, 17>(cache, word);
+            copy_staged_cache_segment<1, 0, 17, 15>(cache, word);
             break;
         case 1:
-            copy_staged_cache_segment<1, 15, 0, 2>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<2, 0, 2, 17>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<3, 0, 19, 13>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<1, 15, 0, 2>(cache, word);
+            copy_staged_cache_segment<2, 0, 2, 17>(cache, word);
+            copy_staged_cache_segment<3, 0, 19, 13>(cache, word);
             break;
         case 2:
-            copy_staged_cache_segment<3, 13, 0, 4>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<4, 0, 4, 17>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<5, 0, 21, 11>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<3, 13, 0, 4>(cache, word);
+            copy_staged_cache_segment<4, 0, 4, 17>(cache, word);
+            copy_staged_cache_segment<5, 0, 21, 11>(cache, word);
             break;
         case 3:
-            copy_staged_cache_segment<5, 11, 0, 6>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<6, 0, 6, 17>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<7, 0, 23, 9>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<5, 11, 0, 6>(cache, word);
+            copy_staged_cache_segment<6, 0, 6, 17>(cache, word);
+            copy_staged_cache_segment<7, 0, 23, 9>(cache, word);
             break;
         case 4:
-            copy_staged_cache_segment<7, 9, 0, 8>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<8, 0, 8, 17>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<7, 9, 0, 8>(cache, word);
+            copy_staged_cache_segment<8, 0, 8, 17>(cache, word);
             break;
         default:
             break;
     }
 }
 
-template <typename CacheT>
 static void build_staged_c25_word(
-    const CacheT& cache,
-    const u8_t slot_for_kw[3],
+    const narrow_3x3_window_t& cache,
     int kt,
     act_vec_t& word) {
 #pragma HLS INLINE
     switch (kt) {
         case 0:
-            copy_staged_cache_segment<0, 0, 0, 25>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<1, 0, 25, 7>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<0, 0, 0, 25>(cache, word);
+            copy_staged_cache_segment<1, 0, 25, 7>(cache, word);
             break;
         case 1:
-            copy_staged_cache_segment<1, 7, 0, 18>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<2, 0, 18, 14>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<1, 7, 0, 18>(cache, word);
+            copy_staged_cache_segment<2, 0, 18, 14>(cache, word);
             break;
         case 2:
-            copy_staged_cache_segment<2, 14, 0, 11>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<3, 0, 11, 21>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<2, 14, 0, 11>(cache, word);
+            copy_staged_cache_segment<3, 0, 11, 21>(cache, word);
             break;
         case 3:
-            copy_staged_cache_segment<3, 21, 0, 4>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<4, 0, 4, 25>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<5, 0, 29, 3>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<3, 21, 0, 4>(cache, word);
+            copy_staged_cache_segment<4, 0, 4, 25>(cache, word);
+            copy_staged_cache_segment<5, 0, 29, 3>(cache, word);
             break;
         case 4:
-            copy_staged_cache_segment<5, 3, 0, 22>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<6, 0, 22, 10>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<5, 3, 0, 22>(cache, word);
+            copy_staged_cache_segment<6, 0, 22, 10>(cache, word);
             break;
         case 5:
-            copy_staged_cache_segment<6, 10, 0, 15>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<7, 0, 15, 17>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<6, 10, 0, 15>(cache, word);
+            copy_staged_cache_segment<7, 0, 15, 17>(cache, word);
             break;
         case 6:
-            copy_staged_cache_segment<7, 17, 0, 8>(cache, slot_for_kw, word);
-            copy_staged_cache_segment<8, 0, 8, 24>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<7, 17, 0, 8>(cache, word);
+            copy_staged_cache_segment<8, 0, 8, 24>(cache, word);
             break;
         case 7:
-            copy_staged_cache_segment<8, 24, 0, 1>(cache, slot_for_kw, word);
+            copy_staged_cache_segment<8, 24, 0, 1>(cache, word);
             break;
         default:
             break;
@@ -1668,23 +1153,13 @@ static void build_staged_c129_word(
 static void emit_narrow_words_for_mode(
     unsigned mode,
     const narrow_3x3_window_t& window,
-    const u8_t slot_for_kw[3],
     hls::stream<act_vec_t>& act_stream) {
 #pragma HLS INLINE off
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C1)) {
-        for (int kt = 0; kt < 1; ++kt) {
-#pragma HLS PIPELINE II=1
-            act_vec_t word = 0;
-            build_staged_c1_word(window, slot_for_kw, kt, word);
-            act_stream.write(word);
-        }
-        return;
-    }
     if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12)) {
         for (int kt = 0; kt < 4; ++kt) {
 #pragma HLS PIPELINE II=1
             act_vec_t word = 0;
-            build_staged_c12_word(window, slot_for_kw, kt, word);
+            build_staged_c12_word(window, kt, word);
             act_stream.write(word);
         }
         return;
@@ -1693,7 +1168,7 @@ static void emit_narrow_words_for_mode(
         for (int kt = 0; kt < 5; ++kt) {
 #pragma HLS PIPELINE II=1
             act_vec_t word = 0;
-            build_staged_c17_word(window, slot_for_kw, kt, word);
+            build_staged_c17_word(window, kt, word);
             act_stream.write(word);
         }
         return;
@@ -1702,7 +1177,7 @@ static void emit_narrow_words_for_mode(
         for (int kt = 0; kt < 8; ++kt) {
 #pragma HLS PIPELINE II=1
             act_vec_t word = 0;
-            build_staged_c25_word(window, slot_for_kw, kt, word);
+            build_staged_c25_word(window, kt, word);
             act_stream.write(word);
         }
         return;
@@ -1713,14 +1188,10 @@ static void emit_narrow_word_pair_for_mode(
     unsigned mode,
     const narrow_3x3_window_t& window0,
     const narrow_3x3_window_t& window1,
-    const u8_t slot_for_kw0[3],
-    const u8_t slot_for_kw1[3],
     hls::stream<act_vec_t>& act_stream0,
     hls::stream<act_vec_t>& act_stream1) {
 #pragma HLS INLINE off
-    const int k_tiles = (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C1))
-                            ? 1
-                            : (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12))
+    const int k_tiles = (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12))
                                   ? 4
                                   : (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C17)) ? 5 : 8;
     for (int kt = 0; kt < 8; ++kt) {
@@ -1730,18 +1201,15 @@ static void emit_narrow_word_pair_for_mode(
         }
         act_vec_t word0 = 0;
         act_vec_t word1 = 0;
-        if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C1)) {
-            build_staged_c1_word(window0, slot_for_kw0, kt, word0);
-            build_staged_c1_word(window1, slot_for_kw1, kt, word1);
-        } else if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12)) {
-            build_staged_c12_word(window0, slot_for_kw0, kt, word0);
-            build_staged_c12_word(window1, slot_for_kw1, kt, word1);
+        if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12)) {
+            build_staged_c12_word(window0, kt, word0);
+            build_staged_c12_word(window1, kt, word1);
         } else if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C17)) {
-            build_staged_c17_word(window0, slot_for_kw0, kt, word0);
-            build_staged_c17_word(window1, slot_for_kw1, kt, word1);
+            build_staged_c17_word(window0, kt, word0);
+            build_staged_c17_word(window1, kt, word1);
         } else {
-            build_staged_c25_word(window0, slot_for_kw0, kt, word0);
-            build_staged_c25_word(window1, slot_for_kw1, kt, word1);
+            build_staged_c25_word(window0, kt, word0);
+            build_staged_c25_word(window1, kt, word1);
         }
         act_stream0.write(word0);
         act_stream1.write(word1);
@@ -1877,15 +1345,48 @@ static void window_assembler_consume_c12_incremental(
     }
 }
 
-static void window_row_assembler_read_narrow_window(
+static void window_assembler_store_delta_word(const window_load_word_t& token) {
+#pragma HLS INLINE
+    const unsigned slot = token.slot.to_uint();
+    if (token.row.to_uint() == 0U) {
+        s_delta_cache.data[0][slot] = token.word;
+    } else if (token.row.to_uint() == 1U) {
+        s_delta_cache.data[1][slot] = token.word;
+    } else {
+        s_delta_cache.data[2][slot] = token.word;
+    }
+}
+
+template <int KW>
+static void window_assembler_snapshot_delta_column(u8_t slot, narrow_3x3_window_t& window) {
+#pragma HLS INLINE
+    window.spatial[KW] = s_delta_cache.data[0][slot.to_uint()];
+    window.spatial[3 + KW] = s_delta_cache.data[1][slot.to_uint()];
+    window.spatial[6 + KW] = s_delta_cache.data[2][slot.to_uint()];
+}
+
+static void window_assembler_consume_delta_phase(
+    hls::stream<window_column_meta_t>& column_meta_stream,
     hls::stream<window_load_word_t>& load_word_stream,
     narrow_3x3_window_t& window) {
 #pragma HLS INLINE
-#pragma HLS ARRAY_PARTITION variable=window.spatial complete dim=1
-    for (int spatial = 0; spatial < 9; ++spatial) {
+    u8_t slots[3];
+#pragma HLS ARRAY_PARTITION variable=slots complete dim=1
+    for (int kw = 0; kw < 3; ++kw) {
+#pragma HLS PIPELINE off
+        const window_column_meta_t meta = column_meta_stream.read();
+        slots[kw] = meta.slot;
+        if (meta.update.to_uint() != 0U) {
+            for (int row = 0; row < 3; ++row) {
 #pragma HLS PIPELINE II=1
-        window.spatial[spatial] = load_word_stream.read().word;
+                const window_load_word_t token = load_word_stream.read();
+                window_assembler_store_delta_word(token);
+            }
+        }
     }
+    window_assembler_snapshot_delta_column<0>(slots[0], window);
+    window_assembler_snapshot_delta_column<1>(slots[1], window);
+    window_assembler_snapshot_delta_column<2>(slots[2], window);
 }
 
 static void window_row_assembler(
@@ -1899,6 +1400,9 @@ static void window_row_assembler(
 #pragma HLS ARRAY_PARTITION variable=s_wide_cache.data complete dim=3
 #pragma HLS BIND_STORAGE variable=s_wide_cache.data type=ram_2p impl=lutram
 #pragma HLS RESET variable=s_wide_cache off
+#pragma HLS ARRAY_PARTITION variable=s_delta_cache.data complete dim=1
+#pragma HLS BIND_STORAGE variable=s_delta_cache.data type=ram_1p impl=bram
+#pragma HLS RESET variable=s_delta_cache off
 
     const window_assembler_cfg_t cfg = assembler_cfg_stream.read();
     const unsigned mode = cfg.mode.to_uint();
@@ -1931,7 +1435,7 @@ static void window_row_assembler(
             window_assembler_clear_narrow_window(window1);
             if (cfg.narrow_transfer_protocol.to_uint() ==
                 static_cast<unsigned>(
-                    NARROW_TRANSFER_C12_S1_INCREMENTAL)) {
+                    WINDOW_TRANSFER_C12_S1_INCREMENTAL)) {
                 window_assembler_consume_c12_incremental(
                     issue,
                     has_second_window,
@@ -1940,27 +1444,23 @@ static void window_row_assembler(
                     window0,
                     window1);
             } else {
-                window_row_assembler_read_narrow_window(
-                    load_word_stream, window0);
-                if (has_second_window) {
-                    window_row_assembler_read_narrow_window(
-                        load_word_stream, window1);
+                window_assembler_consume_delta_phase(column_meta_stream, load_word_stream, window0);
+                if (paired) {
+                    // Snapshot phase 0 before phase 1 can replace an aliased ring slot.
+                    window_assembler_consume_delta_phase(column_meta_stream, load_word_stream, window1);
+                    if (!has_second_window) {
+                        window_assembler_clear_narrow_window(window1);
+                    }
                 }
             }
-            u8_t unused_slots0[3] = {0, 0, 0};
-            u8_t unused_slots1[3] = {0, 0, 0};
-#pragma HLS ARRAY_PARTITION variable=unused_slots0 complete dim=1
-#pragma HLS ARRAY_PARTITION variable=unused_slots1 complete dim=1
             if (!paired) {
                 emit_narrow_words_for_mode(
-                    mode, window0, unused_slots0, act_stream0);
+                    mode, window0, act_stream0);
             } else {
                 emit_narrow_word_pair_for_mode(
                     mode,
                     window0,
                     window1,
-                    unused_slots0,
-                    unused_slots1,
                     act_stream0,
                     act_stream1);
             }
@@ -2119,6 +1619,95 @@ static void scheduled_1x1_window_row(const tensor_desc_t& src_desc,
     }
 }
 
+template <int ROW>
+static void c1_load_packed_source_row(const tensor_desc_t& src, int source_row) {
+#pragma HLS INLINE
+    const bool valid = source_row >= 0 && source_row < INPUT_FRAME_H;
+    const unsigned row_byte = src.base_offset.to_uint() +
+                              static_cast<unsigned>(valid ? source_row : 0) * INPUT_FRAME_W;
+    const unsigned phase = row_byte & 31U;
+    const unsigned aligned = row_byte & ~31U;
+    act_vec_t previous = 0;
+    for (int wi = 0; wi < WINGEN_C1_PACKED_ROW_WORDS; ++wi) {
+#pragma HLS PIPELINE off
+        act_vec_t current = 0;
+        if (valid) {
+            on_chip_memory_read_aligned_tensor_word(src,
+                static_cast<u32_t>(aligned + static_cast<unsigned>(wi) * AXI_WORD_BYTES), current);
+        }
+        if (phase == 0U) {
+            s_c1_rows[ROW][wi] = current;
+        } else if (wi != 0) {
+            s_c1_rows[ROW][wi - 1] = (previous >> 128) | (current << 128);
+        }
+        previous = current;
+    }
+    if (phase != 0U) {
+        s_c1_rows[ROW][WINGEN_C1_PACKED_ROW_WORDS - 1] = previous >> 128;
+    }
+    // 240 real bytes followed by 16 local zeros, including the last raw frame row.
+    s_c1_rows[ROW][WINGEN_C1_PACKED_ROW_WORDS - 1].range(255, 128) = 0;
+}
+
+template <int ROW>
+static void c1_pack_window_pair(int first_col, act_vec_t& word0, act_vec_t& word1) {
+#pragma HLS INLINE
+    const unsigned col = static_cast<unsigned>(first_col < 0 ? 0 : first_col);
+    const unsigned wi = col >> 5;
+    const unsigned offset = col & 31U;
+    ap_uint<40> bytes = s_c1_rows[ROW][wi] >> (offset * 8U);
+    if (offset > 27U && wi + 1U < static_cast<unsigned>(WINGEN_C1_PACKED_ROW_WORDS)) {
+        bytes |= ap_uint<40>(s_c1_rows[ROW][wi + 1U]) << ((32U - offset) * 8U);
+    }
+    if (first_col < 0) {
+        bytes <<= 8;
+    }
+    word0.range((ROW * 3 + 0) * 8 + 7, (ROW * 3 + 0) * 8) = bytes.range(7, 0);
+    word0.range((ROW * 3 + 1) * 8 + 7, (ROW * 3 + 1) * 8) = bytes.range(15, 8);
+    word0.range((ROW * 3 + 2) * 8 + 7, (ROW * 3 + 2) * 8) = bytes.range(23, 16);
+    word1.range((ROW * 3 + 0) * 8 + 7, (ROW * 3 + 0) * 8) = bytes.range(23, 16);
+    word1.range((ROW * 3 + 1) * 8 + 7, (ROW * 3 + 1) * 8) = bytes.range(31, 24);
+    word1.range((ROW * 3 + 2) * 8 + 7, (ROW * 3 + 2) * 8) = bytes.range(39, 32);
+}
+
+static void scheduled_c1_packed_row(const tensor_desc_t& src, u16_t out_row,
+                                    hls::stream<act_vec_t>& act_stream0,
+                                    hls::stream<act_vec_t>& act_stream1) {
+#pragma HLS INLINE off
+#pragma HLS ARRAY_PARTITION variable=s_c1_rows complete dim=1
+#pragma HLS BIND_STORAGE variable=s_c1_rows type=ram_2p impl=lutram
+#pragma HLS RESET variable=s_c1_rows off
+    const bool continuous = s_c1_rows_valid && out_row != 0 &&
+                            out_row.to_uint() == s_c1_last_row.to_uint() + 1U &&
+                            src.base_offset == s_c1_source_base &&
+                            src.bank_id.to_uint() == s_c1_source_bank.to_uint();
+    const int base_h = static_cast<int>(out_row.to_uint()) * 2 - 1;
+    if (continuous) {
+        for (int wi = 0; wi < WINGEN_C1_PACKED_ROW_WORDS; ++wi) {
+#pragma HLS PIPELINE II=1
+            s_c1_rows[0][wi] = s_c1_rows[2][wi];
+        }
+    } else {
+        c1_load_packed_source_row<0>(src, base_h);
+    }
+    c1_load_packed_source_row<1>(src, base_h + 1);
+    c1_load_packed_source_row<2>(src, base_h + 2);
+    s_c1_source_base = src.base_offset;
+    s_c1_source_bank = static_cast<u8_t>(src.bank_id.to_uint());
+    s_c1_last_row = out_row;
+    s_c1_rows_valid = true;
+    for (int issue = 0; issue < INPUT_FRAME_W / 4; ++issue) {
+#pragma HLS PIPELINE II=1
+        act_vec_t word0 = 0;
+        act_vec_t word1 = 0;
+        c1_pack_window_pair<0>(issue * 4 - 1, word0, word1);
+        c1_pack_window_pair<1>(issue * 4 - 1, word0, word1);
+        c1_pack_window_pair<2>(issue * 4 - 1, word0, word1);
+        act_stream0.write(word0);
+        act_stream1.write(word1);
+    }
+}
+
 void scheduled_window_generator_row(const tensor_desc_t& src_desc,
                                      const window_sched_desc_t& sched,
                                      hls::stream<act_vec_t>& act_stream0,
@@ -2129,7 +1718,9 @@ void scheduled_window_generator_row(const tensor_desc_t& src_desc,
     npu_profile_set_conv_win_state(prof_conv_win_state, PROF_CONV_WIN_ACTIVE);
     const unsigned mode = sched.mode.to_uint();
     const unsigned loader_class = sched.loader_class.to_uint();
-    if (loader_class == static_cast<unsigned>(WIN_LOADER_3X3_NARROW) ||
+    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C1)) {
+        scheduled_c1_packed_row(src_desc, out_row, act_stream0, act_stream1);
+    } else if (loader_class == static_cast<unsigned>(WIN_LOADER_3X3_NARROW) ||
         loader_class == static_cast<unsigned>(WIN_LOADER_3X3_WIDE)) {
         scheduled_3x3_window_row_pipeline(
             src_desc, sched, act_stream0, act_stream1, out_row);

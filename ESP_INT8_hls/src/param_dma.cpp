@@ -20,6 +20,7 @@ static block5_sched_desc_t s_block5_sched[MAX_BLOCK5_SCHED_COUNT];
 static u32_t s_weight_bytes = 0;
 
 static bool s_ready = false;
+static u32_t s_param_generation = 0;
 
 static const unsigned k_v3_affine_blocks[MAX_AFFINE_PARAM_DESC_COUNT] = {1, 2, 2, 5, 4, 4, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
@@ -407,27 +408,78 @@ static window_sched_desc_t load_window_sched_desc(const axi_vec_t* gmem_param, u
 
 static bool window_schedule_contract_valid(const window_sched_desc_t& desc) {
 #pragma HLS INLINE
-    if (desc.reserved[WINDOW_LOADER_ROW_REUSE_WORD].to_uint() != 0U) {
+    const unsigned word = desc.reserved[WINDOW_LOADER_ROW_REUSE_WORD].to_uint();
+    const unsigned reuse = word & WINDOW_ROW_REUSE_MODE_MASK;
+    const unsigned words = (word >> WINDOW_ROW_REUSE_WORDS_SHIFT) & WINDOW_ROW_REUSE_WORDS_MASK;
+    const unsigned protocol = (word >> WINDOW_TRANSFER_PROTOCOL_SHIFT) & WINDOW_TRANSFER_PROTOCOL_MASK;
+    if ((word >> WINDOW_ROW_REUSE_RESERVED_SHIFT) != 0U) {
         return false;
     }
     unsigned channels = 0U;
     switch (desc.mode.to_uint()) {
-        case WIN_MODE_3X3_STAGED_C1: channels = 1U; break;
-        case WIN_MODE_3X3_STAGED_C12: channels = 12U; break;
-        case WIN_MODE_3X3_STAGED_C17: channels = 17U; break;
-        case WIN_MODE_3X3_STAGED_C25: channels = 25U; break;
+        case WIN_MODE_3X3_STAGED_C1:
+            return word == (static_cast<unsigned>(WINDOW_ROW_REUSE_STRIDE2_KEEP1) |
+                            (WINGEN_C1_PACKED_ROW_WORDS << WINDOW_ROW_REUSE_WORDS_SHIFT)) &&
+                   desc.kernel == 3 && desc.stride == 2 && desc.dilation == 1 && desc.padding == 1 &&
+                   desc.in_c == 1 && desc.k_tiles == 1 && desc.out_w == 120 &&
+                   desc.loader_class.to_uint() == static_cast<unsigned>(WIN_LOADER_3X3_NARROW) &&
+                   desc.flags.to_uint() == static_cast<unsigned>(WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2);
+        case WIN_MODE_3X3_STAGED_C12:
+            channels = 12U;
+            if (protocol != ((desc.stride == 1 && desc.dilation == 1 &&
+                              (desc.flags.to_uint() & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2) != 0U)
+                                 ? static_cast<unsigned>(WINDOW_TRANSFER_C12_S1_INCREMENTAL)
+                                 : static_cast<unsigned>(WINDOW_TRANSFER_COLUMN_DELTA))) { return false; }
+            break;
+        case WIN_MODE_3X3_STAGED_C17:
+            channels = 17U;
+            if (protocol != static_cast<unsigned>(WINDOW_TRANSFER_COLUMN_DELTA)) { return false; }
+            break;
+        case WIN_MODE_3X3_STAGED_C25:
+            channels = 25U;
+            if (protocol != static_cast<unsigned>(WINDOW_TRANSFER_COLUMN_DELTA)) { return false; }
+            break;
         case WIN_MODE_3X3_STAGED_C28: channels = 28U; break;
         case WIN_MODE_3X3_STAGED_C64: channels = 64U; break;
         case WIN_MODE_3X3_STAGED_C128: channels = 128U; break;
         case WIN_MODE_3X3_STAGED_C129: channels = 129U; break;
         case WIN_MODE_1X1_ALIGNED:
         case WIN_MODE_1X1_PACKED:
-            return desc.kernel.to_uint() == 1U && desc.in_c.to_uint() > 0U &&
+            return word == 0U && desc.kernel.to_uint() == 1U && desc.in_c.to_uint() > 0U &&
                    desc.in_c.to_uint() <= static_cast<unsigned>(MAX_FM_C) &&
                    desc.k_tiles.to_uint() == (desc.in_c.to_uint() + 31U) / 32U;
         default: return false;
     }
-    return desc.kernel.to_uint() == 3U && desc.in_c.to_uint() == channels &&
+    const unsigned slots = desc.cache_col_slots.to_uint();
+    const bool narrow = channels <= 25U;
+    const unsigned flags = desc.flags.to_uint();
+    const bool paired = (flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2) != 0U;
+    const unsigned requests = paired ? 6U : 3U;
+    if ((flags & ~3U) != 0U || desc.out_w == 0 ||
+        (((flags & WINDOW_SCHED_FLAG_ODD_TAIL) != 0U) !=
+         (paired && (desc.out_w.to_uint() & 1U) != 0U))) {
+        return false;
+    }
+    if (narrow && (desc.loader_request_cols.to_uint() != requests ||
+                   (desc.loader_warmup_mask.to_uint() >> requests) != 0U ||
+                   (desc.loader_steady_mask.to_uint() >> requests) != 0U ||
+                   slots != 4U * desc.dilation.to_uint())) {
+        return false;
+    }
+    if (protocol == static_cast<unsigned>(WINDOW_TRANSFER_C12_S1_INCREMENTAL) &&
+        (desc.loader_warmup_issues != 1 || desc.loader_warmup_new_cols != 4 ||
+         desc.loader_steady_new_cols != 2 ||
+         desc.reserved[WINDOW_LOADER_WARMUP_RUN_WORD] != 0x0400 ||
+         desc.reserved[WINDOW_LOADER_STEADY_RUN_WORD] != 0x0202)) {
+        return false;
+    }
+    if (!narrow && paired) { return false; }
+    return reuse == 0U && words == 0U && (narrow || protocol == 0U) &&
+           slots > 0U && (slots & (slots - 1U)) == 0U &&
+           slots <= static_cast<unsigned>(narrow ? WINGEN_NARROW_CACHE_COL_SLOTS : WINGEN_WIDE_CACHE_COL_SLOTS) &&
+           desc.kernel.to_uint() == 3U && desc.in_c.to_uint() == channels &&
+           (!narrow || (desc.cache_chunks == 1 && desc.loader_words_per_col == 3 &&
+                        desc.loader_class.to_uint() == static_cast<unsigned>(WIN_LOADER_3X3_NARROW))) &&
            desc.k_tiles.to_uint() == (channels * 9U + 31U) / 32U;
 }
 
@@ -594,6 +646,7 @@ void param_dma_init(const axi_vec_t* gmem_param) {
 #pragma HLS RESET variable=s_fixed_exec_desc off
 #pragma HLS RESET variable=s_exec_plan off
 #pragma HLS RESET variable=s_block5_sched off
+    ++s_param_generation;
     s_ready = false;
     s_weight_bytes = 0;
 
@@ -647,6 +700,18 @@ void param_dma_init(const axi_vec_t* gmem_param) {
             conv.stride != sched.stride || conv.dilation != sched.dilation ||
             conv.padding != sched.padding || conv.k_tiles != sched.k_tiles) {
             return;
+        }
+        if (sched.mode.to_uint() == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C1)) {
+            const unsigned tid = conv.src_tensor.to_uint();
+            if (tid >= s_header.tensor_desc_count.to_uint()) { return; }
+            const tensor_desc_t& src = s_tensor_desc[tid];
+            if (src.h != INPUT_FRAME_H || src.w != INPUT_FRAME_W || src.c != 1 ||
+                tensor_phys_c(src) != 1 || tensor_row_stride_bytes(src) != INPUT_FRAME_W ||
+                src.reserved1 != 0 || src.elem_bytes != 1 ||
+                (src.base_offset.to_uint() & 31U) != 0U ||
+                conv.in_h != src.h || conv.in_w != src.w || conv.out_c == 0 || conv.out_c > 16) {
+                return;
+            }
         }
     }
     for (int i = 0; i < MAX_ROW_CONSUMER_DESC_COUNT; ++i) {
@@ -717,6 +782,11 @@ void param_dma_init(const axi_vec_t* gmem_param) {
 bool param_dma_ready() {
 #pragma HLS INLINE
     return s_ready;
+}
+
+u32_t param_dma_generation() {
+#pragma HLS INLINE
+    return s_param_generation;
 }
 
 bool param_dma_is_schedule_blob() {

@@ -65,7 +65,7 @@ static bool test_padded_tensor(unsigned tensor_id, unsigned channels, unsigned e
 
 int main() {
     using namespace esp_int8;
-    std::ifstream in("D:/ESP_INT8/hw_artifacts/binary2_int8_h240w240_gray_v4/PARAM.BIN",
+    std::ifstream in("D:/ESP_INT8/hw_artifacts/binary2_int8_h240w240_gray_r6_v4/PARAM.BIN",
                      std::ios::binary);
     const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), {});
     if (!in || bytes.empty()) {

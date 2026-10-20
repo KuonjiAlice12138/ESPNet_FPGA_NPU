@@ -13,7 +13,7 @@ bool on_chip_memory_read_main_uram_word(u8_t, u32_t, act_vec_t&);
 
 int main() {
     using namespace esp_int8;
-    std::ifstream in("D:/ESP_INT8/hw_artifacts/binary2_int8_h240w240_gray_v4/input_q.bin",
+    std::ifstream in("D:/ESP_INT8/hw_artifacts/binary2_int8_h240w240_gray_r6_v4/input_q.bin",
                      std::ios::binary);
     const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)), {});
     if (!in || bytes.size() != INPUT_FRAME_BYTES) {

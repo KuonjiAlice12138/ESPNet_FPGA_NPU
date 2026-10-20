@@ -1,11 +1,12 @@
-ESP INT8 board app: H240W240 grayscale binary2 single-image profiling.
+ESP INT8 board app: H240W240 grayscale binary2 Round 7R single-image profiling.
 
-Platform: platform_h240_1012, standalone_psu_cortexa53_0, Cortex-A53 0.
-App tag: INT8-BOARD-20261011-P7-H240W240-GRAY-B2.
-The user rebuilt the App on 2026-10-12 at 17:05. The debug launch uses the
-new platform's bitstream and FSBL; it must not use the failed R5A platform.
-BOOT.BIN was packaged from boot_h240.bif and the rebuilt App, then copied to E:/.
-All three SD files were verified by SHA256. No old ELF or BOOT is used.
+Platform: platform_h240_1020, standalone_psu_cortexa53_0, Cortex-A53 0.
+App tag: INT8-BOARD-20261020-P7-H240W240-GRAY-R7R-B2.
+app.yaml, the App component, boot_h240.bif and the JTAG launch configuration
+select this platform. JTAG bitstream, FSBL and psu_init paths are aligned.
+App builds remain manual. The Round 7R ELF has been built and the single-image
+board test has passed. Never boot an old Round 7 BOOT.BIN for this release;
+any rebuild requires packaging a matching BOOT.BIN before SD boot.
 
 One boot runs binary2 once. Dual-model, EXEC-prefix and validation-set modes
 are disabled. PARAM v4 has 75 logical UOPs, 16 EXEC records including END,
@@ -20,8 +21,11 @@ I2G.BIN   grayscale input, 57600 bytes
 O2G.BIN   generated output, 57600 bytes; remove any old copy before running
 
 Copy PARAM.BIN and INPUTQ.BIN from:
-hw_artifacts/binary2_int8_h240w240_gray_v4
-Do not use either preserved H256/RGB artifact with this hardware.
+hw_artifacts/binary2_int8_h240w240_gray_r6_v4
+Hardware profile: p7_h240w240_gray_c1_r6_delta.
+Round 7R reuses this artifact without re-export/QAT. Schedule word 9 selects packed-row/delta
+transfer protocols. The baseline H240 PARAM is not compatible with this IP.
+Do not use preserved H256/RGB artifacts or the baseline H240 BOOT.
 The input uses center-square crop, resize to 240x240 and the QAT grayscale
 normalization. Labels are vehicles=0, valid background=1, ignored target=255.
 Golden fullres output contains c0=4105, c1=53495 and no invalid class IDs.
@@ -38,26 +42,47 @@ ARM timing uses CNTPCT_EL0 / runtime CNTFRQ_EL0, BSP reference 33333000 Hz.
 PL counters use nominal 100 MHz (10 ns), independently of the ARM timer.
 MODE_RUN includes hardware frame transfers. SD I/O, MODE_INIT, cache
 maintenance and counter/UART dumps are outside the measured interval.
-Initial target: <=6000000 PL cycles (60 ms); bring-up ceiling: 7000000 (70 ms).
+Board-tested Round 7 baseline: 5334364 cycles (53.34364 ms), Conv=3418908,
+PPU row=289114, BLOCK5 final=773550, Vec=667534, Pool=135617 cycles.
+Round 7R measured 5097039 PL cycles (50.97039 ms), a 4.45% improvement over R7.
+Conv=3418908, PPU row=289114, BLOCK5 final=679846, Vec=523904, Pool=135617.
+ARM measured 1699004 ticks / 33333000 Hz = 50.9706297 ms; ERROR=0.
+The SD output matches golden byte for byte (0/57600 mismatch).
+The first Vec<=631133 gate passes; working budgets Vec<=450000 and
+BLOCK5 final<=600000 remain unmet. Frozen stages retain Round 7 performance.
+Whole-network goal: <5000000 cycles (<50 ms). These are board targets,
+not conclusions from the synthesis report or the achieved commit II=1.
 Actual performance and correctness require the board result, not HLS max latency.
+Check at least three consecutive runs before claiming <50 ms.
 Only after the single-image gate passes should the 500-image run be prepared.
 
 Verified SHA256:
-P2G.BIN  bb92bafa4ac297a760ee4880887fdeffe8cee0279107f9f01f3fa355e4244fa0
+P2G.BIN  9e380cebe305c4945642c4a334f75a7a2ba94eefa1f2ccc7f2964f8d3bf9d878
 I2G.BIN  c1f3b03245d4bc6514c2a2dfcada898453f0d8eca6292ddcd46b40c1c2b5dd87
 Golden   88bc39cb00f9f6056d76ed85f74b69c86ff4808e6f868d40f6f4e6203ce426ce
-XSA      67eb53a804bedf6d1f8a12ad5415569251d370a327b7fcec847c7c72eac9ec56
-Bit      b3f1ddbf970ed68784f28d7bfb1d336b8894024446cb51dd409dddbce65201f3
-App ELF  2f440a0dffa089ab9f845329307e459d23d18252cf98bed4dccb02f7990ae56b
-BOOT.BIN f1d82983e24f08694b42369fc76bfaa32358c219be8fdf86c44f12c05a08a6f2
+XSA      a215d4cc86824526cb7123f8c52b82c10b3a60bd9f27668a71dcf48eb01b18f7
+Bit      9357b6e05b11ec77915f6804c4d2c51be5d91399357f089b2e1257e01e855083
+FSBL     19fc2810213e7d07935b2042a4bbb587e24f2183c62f6ee8a42b36136a4454db
+App ELF  b08242877a1f608fc87b6f16e65de1d90aef77bf7fe400e75d5cb3d6595f7f24
+BOOT.BIN hash must be verified after each manual package.
 
-Implementation: routing errors=0, WNS=+0.252 ns, WHS=+0.010 ns at 100 MHz.
-Placed resources: logic LUT=219686, total LUT=236675, FF=192017,
-BRAM tile=203.5, DSP=1298, URAM=28. Post-route phys-opt did not modify the
-netlist. XSA, exported platform XSA and embedded bitstream hashes agree.
+Implementation: routing errors=0, WNS=+0.163 ns, WHS=+0.010 ns at 100 MHz.
+Placed resources: logic LUT=208173, total LUT=225886, FF=174321,
+BRAM tile=204, DSP=1292, URAM=28, CLB=96.17%. XSA, exported platform XSA
+and embedded bitstream hashes agree with the completed implementation.
 NPU control=0xA0000000; RTL counter=0xA0010000. The stage-valid and all three
 Conv-state ports are connected to the counter in the exported hardware.
-SD root now contains BOOT.BIN, P2G.BIN and I2G.BIN, with O2G.BIN absent.
-Old H256 root test files were removed; validation folders B/C/D/Q were preserved.
-ELF buffers: input=0x28440, output=0x36540, param=0x44640; aligned and nonoverlapping.
-Board execution and output-correctness/performance gates remain pending.
+Prepare E:/ with P2G.BIN and I2G.BIN plus a newly packaged BOOT.BIN for SD boot.
+The Round 7R O2G.BIN was verified against golden; preserve it until analyzed,
+then remove any previous output before the next board test.
+Preserve validation folders B/C/D/Q; do not reformat the card.
+Check the rebuilt ELF buffer addresses for 64-byte alignment and non-overlap.
+
+After manually building ESP_INT8_app on platform_h240_1020:
+1. Check the new ELF contains the Round 7R tag above and uses the new BSP.
+2. From D:/ESP_INT8, package the corrected boot recipe:
+   & 'D:/Xilinx/2025.1/Vivado/bin/bootgen.bat' -arch zynqmp -image ESP_INT8_app/src/boot_h240.bif -o ESP_INT8_app/BOOT.BIN -w on
+3. Copy the newly generated ESP_INT8_app/BOOT.BIN to E:/BOOT.BIN and verify hashes.
+Do not start SD boot until this final step is complete.
+This is the H240W240 1020 board-tested checkpoint. Strict <50 ms, at least
+three consecutive timing runs and 500-image board validation remain pending.

@@ -1648,7 +1648,12 @@ WINDOW_ROW_REUSE_STRIDE2_KEEP1 = 2
 WINDOW_ROW_REUSE_MODE_MASK = 0x3
 WINDOW_ROW_REUSE_WORDS_SHIFT = 2
 WINDOW_ROW_REUSE_WORDS_MASK = 0x7F
-WINDOW_ROW_REUSE_RESERVED_SHIFT = 9
+WINDOW_TRANSFER_PROTOCOL_SHIFT = 9
+WINDOW_TRANSFER_PROTOCOL_MASK = 0x3
+WINDOW_ROW_REUSE_RESERVED_SHIFT = 11
+WINDOW_TRANSFER_SPATIAL_WORDS = 0
+WINDOW_TRANSFER_C12_S1_INCREMENTAL = 1
+WINDOW_TRANSFER_COLUMN_DELTA = 2
 WINGEN_NARROW_ROW_WORDS = 96
 
 
@@ -1670,7 +1675,9 @@ def compile_window_row_reuse_word(
     ):
         return 0
 
-    # C12 KEEP2 bypasses horizontal column reuse and regressed on hardware.
+    if in_c == 1 and source_w == 240 and stride == 2:
+        return WINDOW_ROW_REUSE_STRIDE2_KEEP1 | (8 << WINDOW_ROW_REUSE_WORDS_SHIFT)
+    # Preserve offline RGB compilation; it is not a handler in the H240 IP.
     if in_c != 3 or stride != 2:
         return 0
 
@@ -1686,6 +1693,55 @@ def compile_window_row_reuse_word(
             f"row-reuse packed word count out of range: {packed_words}"
         )
     return WINDOW_ROW_REUSE_STRIDE2_KEEP1 | (packed_words << WINDOW_ROW_REUSE_WORDS_SHIFT)
+
+
+def compile_window_transfer_protocol(in_c: int, kernel: int, stride: int,
+                                     dilation: int, flags: int) -> int:
+    if kernel != 3 or in_c not in (12, 17, 25):
+        return WINDOW_TRANSFER_SPATIAL_WORDS
+    if in_c == 12 and stride == 1 and dilation == 1 and flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2:
+        return WINDOW_TRANSFER_C12_S1_INCREMENTAL
+    return WINDOW_TRANSFER_COLUMN_DELTA
+
+
+def audit_window_transfer_contract(desc: WindowSchedDesc) -> dict:
+    paired = bool(desc.flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
+    issues = (desc.out_w + 1) // 2 if paired else desc.out_w
+    word = desc.reserved[WINDOW_LOADER_ROW_REUSE_WORD]
+    protocol = (word >> WINDOW_TRANSFER_PROTOCOL_SHIFT) & WINDOW_TRANSFER_PROTOCOL_MASK
+    produced = consumed = 0
+    if desc.kernel == 3 and desc.in_c in (12, 17, 25) and protocol:
+        tags = [None] * desc.cache_col_slots
+        for issue in range(issues):
+            mask = desc.loader_warmup_mask if issue < desc.loader_warmup_issues else desc.loader_steady_mask
+            for phase in range(2 if paired else 1):
+                columns = [(issue * (2 if paired else 1) + phase) * desc.stride -
+                           desc.padding + kw * desc.dilation for kw in range(3)]
+                for kw, column in enumerate(columns):
+                    slot = column & (desc.cache_col_slots - 1)
+                    update = bool(mask & (1 << (phase * 3 + kw)))
+                    miss = tags[slot] != column
+                    if update != miss:
+                        raise ValueError(f"invalid delta program: issue={issue} phase={phase} kw={kw}")
+                    produced += 3 * int(update)
+                    consumed += 3 * int(miss)
+                    if update:
+                        tags[slot] = column
+                if any(tags[c & (desc.cache_col_slots - 1)] != c for c in columns):
+                    raise ValueError("delta program overwrites a live window column")
+        if protocol == WINDOW_TRANSFER_C12_S1_INCREMENTAL:
+            if not (desc.in_c == 12 and desc.stride == desc.dilation == 1 and paired):
+                raise ValueError("invalid fixed C12 incremental protocol")
+            if produced != 12 + (issues - 1) * 6:
+                raise ValueError("fixed C12 stream length does not match its program")
+    elif desc.kernel == 3 and desc.in_c == 1 and word & WINDOW_ROW_REUSE_MODE_MASK:
+        produced = consumed = 0  # Direct packed-row -> act streams, no spatial FIFO.
+    else:
+        produced = consumed = 9 * desc.out_w if desc.kernel == 3 and desc.in_c <= 25 else 0
+    return {"protocol": protocol, "produced_words": produced, "consumed_words": consumed,
+            "full_window_words": 9 * desc.out_w if desc.kernel == 3 else 0,
+            "act_words_per_stream": issues * desc.k_tiles,
+            "metadata_words": issues * (6 if paired else 3) if protocol == WINDOW_TRANSFER_COLUMN_DELTA else 0}
 
 
 def encode_window_loader_run(start_delta: int, count: int) -> int:
@@ -1966,7 +2022,7 @@ def compile_window_loader_contract(
             pixel0 * stride - padding + kw * dilation
             for kw in range(3)
         ]
-        if paired and pixel0 + 1 < out_w:
+        if paired:
             columns.extend(
                 (pixel0 + 1) * stride - padding + kw * dilation
                 for kw in range(3)
@@ -2154,6 +2210,9 @@ def make_window_pack_schedule(
         if source_w > 0
         else 0
     )
+    reserved_words[WINDOW_LOADER_ROW_REUSE_WORD] |= (
+        compile_window_transfer_protocol(in_c, kernel, stride, dilation, flags)
+        << WINDOW_TRANSFER_PROTOCOL_SHIFT)
 
     desc = WindowSchedDesc(
         mode=window_mode_for(in_c, kernel) if mode is None else mode,
@@ -2720,6 +2779,7 @@ def build_window_schedule_sections(uops: Sequence[Uop]) -> Tuple[List[WindowSche
                     >> WINDOW_ROW_REUSE_WORDS_SHIFT
                 )
                 & WINDOW_ROW_REUSE_WORDS_MASK,
+                "transfer_audit": audit_window_transfer_contract(desc),
                 "segment_capable": False,
                 "segment_out_w_max": 0,
                 "k_tiles": desc.k_tiles,
@@ -4760,6 +4820,10 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
             raise ValueError(
                 f"window schedule[{sid}] has nonzero reserved row-reuse bits"
             )
+        protocol = (reuse_word >> WINDOW_TRANSFER_PROTOCOL_SHIFT) & WINDOW_TRANSFER_PROTOCOL_MASK
+        expected_protocol = compile_window_transfer_protocol(in_c, kernel, stride, dilation, flags)
+        if protocol and (protocol != expected_protocol or loader_class != WIN_LOADER_3X3_NARROW):
+            raise ValueError(f"window schedule[{sid}] invalid transfer protocol={protocol}")
         if reuse_mode == WINDOW_ROW_REUSE_NONE:
             if packed_words != 0:
                 raise ValueError(
@@ -4771,12 +4835,12 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
                 and dilation == 1
                 and loader_class == WIN_LOADER_3X3_NARROW
                 and bool(flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
-                and mode == WIN_MODE_3X3_STAGED_C3
+                and mode in (WIN_MODE_3X3_STAGED_C3, WIN_MODE_3X3_STAGED_C1)
                 and 0 < packed_words <= WINGEN_NARROW_ROW_WORDS
             )
             stride2_ok = (
                 reuse_mode == WINDOW_ROW_REUSE_STRIDE2_KEEP1
-                and in_c == 3
+                and (in_c == 3 or (in_c == 1 and packed_words == 8 and padding == 1 and out_w == 120))
                 and stride == 2
             )
             if not common_reuse or not stride2_ok:
@@ -4886,7 +4950,7 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
 
 
 def compile_window_reuse_param(path: Path) -> bytes:
-    """Recompile reuse words without touching frozen numeric/control sections."""
+    """Recompile transfer words without touching frozen numeric/control sections."""
     from hw_param_replay import ParamBlob, window_row_reuse_contract_valid
     blob = ParamBlob(path)
     data = bytearray(path.read_bytes())
@@ -4898,15 +4962,40 @@ def compile_window_reuse_param(path: Path) -> bytes:
                 source_w=references[0].in_w, in_c=sched.in_c, kernel=sched.kernel,
                 stride=sched.stride, dilation=sched.dilation,
                 loader_class=sched.loader_class, flags=sched.flags)
+        word |= compile_window_transfer_protocol(sched.in_c, sched.kernel, sched.stride,
+                                                sched.dilation, sched.flags) << WINDOW_TRANSFER_PROTOCOL_SHIFT
         reserved = list(sched.reserved)
         reserved[WINDOW_LOADER_ROW_REUSE_WORD] = word
         compiled = replace(sched, reserved=reserved)
-        if word and not all(window_row_reuse_contract_valid(
-                compiled, conv, blob.tensor_desc[conv.src_tensor]) for conv in references):
-            raise ValueError(f"schedule[{sid}] has invalid row-reuse source layout")
+        audit_window_transfer_contract(compiled)
+        if compiled.row_reuse_mode:
+            valid = bool(references) and all(
+                0 <= conv.src_tensor < len(blob.tensor_desc) and window_row_reuse_contract_valid(
+                    compiled, conv, blob.tensor_desc[conv.src_tensor]) for conv in references)
+        else:
+            # BLOCK5 scratch sources are supplied by the engine, not tensor_desc[].
+            valid = window_row_reuse_contract_valid(compiled)
+        if not valid:
+            raise ValueError(f"schedule[{sid}] has an invalid transfer/source contract")
         offset = blob.header["window_sched_offset"] + sid * 128 + 126
         struct.pack_into("<H", data, offset, word)
     return bytes(data)
+
+
+def relocate_artifact_metadata(value, source_dir: Path, out_dir: Path):
+    if isinstance(value, dict):
+        return {key: relocate_artifact_metadata(item, source_dir, out_dir) for key, item in value.items()}
+    if isinstance(value, list):
+        return [relocate_artifact_metadata(item, source_dir, out_dir) for item in value]
+    if isinstance(value, str):
+        paths = [source_dir]
+        try:
+            paths.append(source_dir.relative_to(Path(__file__).resolve().parents[1]))
+        except ValueError:
+            pass
+        for path in paths:
+            value = value.replace(str(path), str(out_dir)).replace(path.as_posix(), out_dir.as_posix())
+    return value
 
 
 def recompile_window_reuse_artifact(source_dir: Path, out_dir: Path) -> dict:
@@ -4924,11 +5013,11 @@ def recompile_window_reuse_artifact(source_dir: Path, out_dir: Path) -> dict:
     original = (source_dir / "PARAM.BIN").read_bytes()
     compiled = compile_window_reuse_param(source_dir / "PARAM.BIN")
     blob = ParamBlob(source_dir / "PARAM.BIN")
-    if (blob.geometry.input_height, blob.geometry.input_width) != (256, 512):
-        raise ValueError("this recovery export is limited to H256W512")
+    if (blob.geometry.input_height, blob.geometry.input_width, blob.geometry.input_channels) not in ((256, 512, 3), (240, 240, 1)):
+        raise ValueError("schedule recompile supports H256 RGB and H240 grayscale releases")
     original_golden = (source_dir / "golden_output_q.bin").read_bytes()
     shutil.copytree(source_dir, out_dir, dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns("sa_utilization*"))
+                    ignore=shutil.ignore_patterns("sa_utilization*", "csim_*"))
     for filename in ("PARAM.BIN", "param_blob.bin"):
         (out_dir / filename).write_bytes(compiled)
     # The replay publisher expects the model reference as input. Do not
@@ -4940,7 +5029,7 @@ def recompile_window_reuse_artifact(source_dir: Path, out_dir: Path) -> dict:
     if (out_dir / "golden_output_q.bin").read_bytes() != original_golden:
         raise ValueError("schedule-only recompile changed frozen logits")
     new_blob = ParamBlob(out_dir / "PARAM.BIN")
-    provenance = {"kind": "window_row_reuse_only",
+    provenance = {"kind": "window_transfer_only",
                   "source_artifact_dir": str(source_dir),
                   "source_param_sha256": hashlib.sha256(original).hexdigest(),
                   "numeric_sections_unchanged": True,
@@ -4951,19 +5040,9 @@ def recompile_window_reuse_artifact(source_dir: Path, out_dir: Path) -> dict:
                        "packed_words": sched.packed_words_per_source_row}
                       for i, sched in enumerate(new_blob.window_sched_by_index)]}
 
-    def relocate(value):
-        if isinstance(value, dict):
-            return {key: relocate(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [relocate(item) for item in value]
-        if isinstance(value, str):
-            return value.replace(str(source_dir), str(out_dir)).replace(
-                source_dir.as_posix(), out_dir.as_posix())
-        return value
-
     # Refresh schedule audit rows and hashes in all copied metadata.
     for filename in out_dir.glob("*.json"):
-        metadata = relocate(load_json(filename))
+        metadata = relocate_artifact_metadata(load_json(filename), source_dir, out_dir)
         if filename.name == "param_audit.json":
             metadata["window_row_reuse_recompile"] = provenance
         if filename.name in ("export_manifest.json", "single_manifest.json"):
@@ -4972,6 +5051,8 @@ def recompile_window_reuse_artifact(source_dir: Path, out_dir: Path) -> dict:
             metadata["schedule_recompile"] = provenance
             metadata["param_blob_sha256"] = sha256_file(out_dir / "PARAM.BIN")
             metadata["param_blob_bytes"] = len(compiled)
+            if blob.geometry.input_channels == 1:
+                metadata["hardware_profile"] = "p7_h240w240_gray_c1_r6_delta"
             metadata["frame_data"].update(replay_report)
             for key, entry in metadata["artifact_hashes"].items():
                 entry["sha256"] = sha256_file(out_dir / entry["file"])
@@ -4985,6 +5066,7 @@ def recompile_window_reuse_artifact(source_dir: Path, out_dir: Path) -> dict:
         sched = new_blob.window_sched[sid]
         entry["row_reuse_mode"] = sched.row_reuse_mode
         entry["packed_words_per_source_row"] = sched.packed_words_per_source_row
+        entry["transfer_audit"] = audit_window_transfer_contract(sched)
     audit_path.write_text(json.dumps(audit, indent=2, ensure_ascii=False), encoding="utf-8")
     parse_and_check_blob_v4(out_dir / "PARAM.BIN", audit)
     return load_json(out_dir / "export_manifest.json")
@@ -4994,7 +5076,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--recompile-window-reuse-from", type=Path,
-        help="Schedule-only export from a frozen H256W512 v4 hardware artifact; never retrains.",
+        help="Schedule-only export from a frozen H256 RGB or H240 grayscale v4 artifact; never retrains.",
     )
     parser.add_argument(
         "--artifact-dir",

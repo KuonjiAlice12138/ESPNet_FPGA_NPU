@@ -5,10 +5,19 @@
 #include <cstdint>
 #include <cstdio>
 
+static int g_failures = 0;
+static unsigned g_aligned_reads = 0;
+static int g_generation = 0;
+
 namespace esp_int8 {
 
+#ifdef ESP_INT8_CSIM_VALIDATE_INCREMENTAL_TRANSFER
+void csim_reset_narrow_transfer_words();
+unsigned long long csim_get_narrow_transfer_words();
+#endif
+
 static std::int8_t mock_value(int h, int w, int c) {
-    return static_cast<std::int8_t>(((h * 17 + w * 11 + c * 5 + 63) % 127) - 63);
+    return static_cast<std::int8_t>(((h * 17 + w * 11 + c * 5 + g_generation * 19 + 63) % 127) - 63);
 }
 
 static void set_lane(act_vec_t& word, int lane, std::int8_t value) {
@@ -22,9 +31,7 @@ bool on_chip_memory_prepare_row_base(const tensor_desc_t& desc,
     row_valid = h >= 0 && h < static_cast<i32_t>(desc.h);
     row_base = 0;
     if (row_valid) {
-        u32_t row_offset = static_cast<u32_t>(h);
-        row_offset *= static_cast<u32_t>(desc.w);
-        row_offset *= static_cast<u32_t>(desc.reserved0);
+        u32_t row_offset = static_cast<u32_t>(h) * tensor_row_stride_bytes(desc);
         row_base = desc.base_offset + row_offset + static_cast<u32_t>(desc.reserved1);
     }
     return true;
@@ -34,23 +41,31 @@ bool on_chip_memory_read_aligned_tensor_word(const tensor_desc_t& desc,
                                              u32_t byte_offset,
                                              act_vec_t& packed) {
     packed = 0;
+    ++g_aligned_reads;
+    if (desc.c == 1 && desc.w == 240 &&
+        (byte_offset < desc.base_offset || byte_offset.to_uint() + 32U >
+         desc.base_offset.to_uint() + desc.h.to_uint() * 240U)) {
+        ++g_failures;
+        return false;
+    }
     for (int lane = 0; lane < TK; ++lane) {
         const unsigned absolute = byte_offset.to_uint() + static_cast<unsigned>(lane);
         if (absolute < desc.base_offset.to_uint()) {
             continue;
         }
         const unsigned relative = absolute - desc.base_offset.to_uint();
-        const unsigned phys_c = desc.reserved0.to_uint();
-        const unsigned pixel = relative / phys_c;
-        const unsigned physical_channel = relative % phys_c;
+        const unsigned phys_c = tensor_phys_c(desc).to_uint();
+        const unsigned row_stride = tensor_row_stride_bytes(desc).to_uint();
+        const unsigned h = relative / row_stride;
+        const unsigned row_byte = relative % row_stride;
+        const unsigned w = row_byte / phys_c;
+        const unsigned physical_channel = row_byte % phys_c;
         const unsigned channel_offset = desc.reserved1.to_uint();
-        if (pixel >= desc.h.to_uint() * desc.w.to_uint() ||
+        if (h >= desc.h.to_uint() || w >= desc.w.to_uint() ||
             physical_channel < channel_offset ||
             physical_channel >= channel_offset + desc.c.to_uint()) {
             continue;
         }
-        const int h = static_cast<int>(pixel / desc.w.to_uint());
-        const int w = static_cast<int>(pixel % desc.w.to_uint());
         const int c = static_cast<int>(physical_channel - channel_offset);
         set_lane(packed, lane, mock_value(h, w, c));
     }
@@ -96,8 +111,6 @@ void scheduled_window_generator_row(const tensor_desc_t& src_desc,
                                      volatile u8_t& prof_conv_win_state);
 
 }  // namespace esp_int8
-
-static int g_failures = 0;
 
 static std::int8_t lane_i8(const esp_int8::act_vec_t& word, int lane) {
     esp_int8::i8_t value;
@@ -263,9 +276,6 @@ static void configure_loader_contract(esp_int8::window_sched_desc_t& sched) {
         for (int request = 0; request < request_cols; ++request) {
             const bool second = request >= 3;
             const int pixel = pixel0 + (second ? 1 : 0);
-            if (second && pixel >= sched.out_w.to_uint()) {
-                continue;
-            }
             const int kw = second ? request - 3 : request;
             const int column =
                 pixel * sched.stride.to_uint() -
@@ -353,7 +363,7 @@ static void check_case(const char* tag,
                        int dilation,
                        unsigned mode,
                        bool paired,
-                       bool row_reuse = false) {
+                       bool row_reuse = false, int row_step = 1) {
     esp_int8::tensor_desc_t desc = {};
     desc.h = in_h;
     desc.w = in_w;
@@ -382,25 +392,23 @@ static void check_case(const char* tag,
     sched.k_tiles = (kernel * kernel * in_c + esp_int8::TK - 1) / esp_int8::TK;
     configure_loader_contract(sched);
     if (row_reuse) {
-        const unsigned packed_words =
-            static_cast<unsigned>(in_w * in_c / esp_int8::AXI_WORD_BYTES);
-        const unsigned reuse_mode =
-            stride == 1
-                ? static_cast<unsigned>(
-                      esp_int8::WINDOW_ROW_REUSE_STRIDE1_KEEP2)
-                : static_cast<unsigned>(
-                      esp_int8::WINDOW_ROW_REUSE_STRIDE2_KEEP1);
-        sched.reserved[esp_int8::WINDOW_LOADER_ROW_REUSE_WORD] =
-            static_cast<esp_int8::u16_t>(
-                reuse_mode |
-                (packed_words << esp_int8::WINDOW_ROW_REUSE_WORDS_SHIFT));
+        sched.reserved[esp_int8::WINDOW_LOADER_ROW_REUSE_WORD] = 2U | (8U << 2);
+    } else if (kernel == 3 && in_c <= 25) {
+        const unsigned protocol = in_c == 12 && stride == 1 && dilation == 1 && paired ? 1U : 2U;
+        sched.reserved[esp_int8::WINDOW_LOADER_ROW_REUSE_WORD] = protocol << 9;
     }
 
     hls::stream<esp_int8::act_vec_t> stream0;
     hls::stream<esp_int8::act_vec_t> stream1;
     volatile esp_int8::u8_t prof_conv_win_state = 0;
     const int out_h = (in_h + stride - 1) / stride;
-    for (int oh = 0; oh < out_h; ++oh) {
+    g_aligned_reads = 0;
+#ifdef ESP_INT8_CSIM_VALIDATE_INCREMENTAL_TRANSFER
+    esp_int8::csim_reset_narrow_transfer_words();
+#endif
+    ++g_generation;
+    for (int row_index = 0; row_index < out_h; ++row_index) {
+        const int oh = row_index * row_step % out_h;
         const int issue_count = paired ? (sched.out_w.to_uint() + 1) / 2 : sched.out_w.to_uint();
         esp_int8::scheduled_window_generator_row(
             desc,
@@ -447,21 +455,47 @@ static void check_case(const char* tag,
         std::printf("[FAIL] %s left unread stream data\n", tag);
         ++g_failures;
     }
+    if (row_reuse) {
+        const unsigned expected_reads = row_step == 1 ? 1920U : 2872U;
+        if (g_aligned_reads != expected_reads) { ++g_failures; }
+        std::printf("[C1] %s source_reads=%u expected=%u errors=%d\n", tag,
+                    g_aligned_reads, expected_reads, g_failures);
+    } else if (kernel == 3 && in_c <= 25) {
+#ifdef ESP_INT8_CSIM_VALIDATE_INCREMENTAL_TRANSFER
+        unsigned updates_per_row = 0;
+        const int issues = paired ? (sched.out_w.to_uint() + 1) / 2 : sched.out_w.to_uint();
+        for (int issue = 0; issue < issues; ++issue) {
+            const unsigned mask = issue < sched.loader_warmup_issues.to_uint()
+                                      ? sched.loader_warmup_mask.to_uint()
+                                      : sched.loader_steady_mask.to_uint();
+            for (int bit = 0; bit < (paired ? 6 : 3); ++bit) {
+                updates_per_row += (mask >> bit) & 1U;
+            }
+        }
+        const unsigned long long wanted = 3ULL * updates_per_row * out_h;
+        const unsigned long long actual = esp_int8::csim_get_narrow_transfer_words();
+        if (actual != wanted) { ++g_failures; }
+        std::printf("[DELTA] %s words=%llu expected=%llu errors=%d\n", tag,
+                    actual, wanted, g_failures);
+#endif
+    }
 }
 
 int main() {
-    check_case("C3-single", 7, 9, 3, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C3, false);
-    check_case("C3-paired", 7, 9, 3, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C3, true);
-    check_case("C3-row-reuse", 5, 1024, 3, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C3, true, true);
+    check_case("C1 packed phases/borders", 240, 240, 1, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C1, true, true);
+    check_case("C1 new frame", 240, 240, 1, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C1, true, true);
+    check_case("C1 noncontiguous rows", 240, 240, 1, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C1, true, true, 37);
     check_case("C12-paired-d1", 4, 12, 12, 3, 1, 1, esp_int8::WIN_MODE_3X3_STAGED_C12, true);
-    check_case("C12-row-reuse", 4, 256, 12, 3, 1, 1, esp_int8::WIN_MODE_3X3_STAGED_C12, true, true);
     check_case("C12-single", 6, 8, 12, 3, 1, 2, esp_int8::WIN_MODE_3X3_STAGED_C12, false);
     check_case("C12-paired", 6, 8, 12, 3, 1, 2, esp_int8::WIN_MODE_3X3_STAGED_C12, true);
     check_case("C12-paired-d16", 3, 40, 12, 3, 1, 16, esp_int8::WIN_MODE_3X3_STAGED_C12, true);
-    check_case("C19-paired", 6, 9, 19, 3, 1, 1, esp_int8::WIN_MODE_3X3_STAGED_C19, true);
-    check_case("C19-paired-s2", 6, 11, 19, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C19, true);
+    check_case("C17-paired", 6, 9, 17, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C17, true);
     check_case("C25-paired", 5, 7, 25, 3, 1, 2, esp_int8::WIN_MODE_3X3_STAGED_C25, true);
-    check_case("C131-wide", 4, 5, 131, 3, 1, 1, esp_int8::WIN_MODE_3X3_STAGED_C131, false);
+    check_case("C129-wide", 4, 5, 129, 3, 1, 1, esp_int8::WIN_MODE_3X3_STAGED_C129, false);
+    for (int dilation = 1; dilation <= 16; dilation *= 2) {
+        check_case("C12 delta slot wrap", 6, 67, 12, 3, 1, dilation, esp_int8::WIN_MODE_3X3_STAGED_C12, true);
+        check_case("C25 delta slot wrap", 5, 67, 25, 3, 1, dilation, esp_int8::WIN_MODE_3X3_STAGED_C25, false);
+    }
     check_case("C64-1x1-single", 4, 6, 64, 1, 1, 1, esp_int8::WIN_MODE_1X1_ALIGNED, false);
     check_case("C64-1x1-paired", 4, 6, 64, 1, 1, 1, esp_int8::WIN_MODE_1X1_ALIGNED, true);
     if (g_failures != 0) {

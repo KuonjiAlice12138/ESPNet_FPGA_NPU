@@ -50,7 +50,7 @@ constexpr int WINDOW_LOADER_PHASE_SPLIT_WORD = 8;
 constexpr int WINDOW_LOADER_ROW_REUSE_WORD = 9;
 constexpr int WINDOW_LOADER_RESERVED_WORDS = 10;
 
-// Historical ABI values only. H240 schedules require the entire reuse word = 0.
+// reserved[9]: row reuse [1:0], packed row words [8:2], transfer [10:9].
 enum window_row_reuse_mode_t : std::uint8_t {
   WINDOW_ROW_REUSE_NONE = 0,
   WINDOW_ROW_REUSE_STRIDE1_KEEP2 = 1,
@@ -60,7 +60,16 @@ enum window_row_reuse_mode_t : std::uint8_t {
 constexpr unsigned WINDOW_ROW_REUSE_MODE_MASK = 0x3U;
 constexpr unsigned WINDOW_ROW_REUSE_WORDS_SHIFT = 2U;
 constexpr unsigned WINDOW_ROW_REUSE_WORDS_MASK = 0x7FU;
-constexpr unsigned WINDOW_ROW_REUSE_RESERVED_SHIFT = 9U;
+constexpr unsigned WINDOW_TRANSFER_PROTOCOL_SHIFT = 9U;
+constexpr unsigned WINDOW_TRANSFER_PROTOCOL_MASK = 0x3U;
+constexpr unsigned WINDOW_ROW_REUSE_RESERVED_SHIFT = 11U;
+constexpr int WINGEN_C1_PACKED_ROW_WORDS = 8;
+
+enum window_transfer_protocol_t : std::uint8_t {
+  WINDOW_TRANSFER_SPATIAL_WORDS = 0,
+  WINDOW_TRANSFER_C12_S1_INCREMENTAL = 1,
+  WINDOW_TRANSFER_COLUMN_DELTA = 2,
+};
 
 enum row_consumer_mode_t : std::uint8_t {
   ROW_CONSUMER_NONE = 0,

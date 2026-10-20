@@ -78,7 +78,8 @@ static bool validate_v4_schedule_contract() {
     ok &= expect(sched0.out_w == 120 && sched0.cache_chunks == 1, "first layer staged window descriptor");
     ok &= expect(sched0.cmd_count == 0 && sched0.cmd_base == 0, "staged C1 uses a static composer, not a runtime pack program");
     ok &= expect(sched0.kt_cmd_base[0] == 0 && sched0.kt_cmd_base[1] == 0, "retired kt command range is empty");
-    ok &= expect(sched0.reserved[WINDOW_LOADER_ROW_REUSE_WORD] == 0, "gray schedule disables retired RGB row reuse");
+    ok &= expect(sched0.reserved[WINDOW_LOADER_ROW_REUSE_WORD] == (2U | (8U << 2)),
+                 "C1 schedule selects raw packed-row KEEP1");
 
     window_sched_desc_t c12_sched;
     ok &= expect(param_dma_get_window_sched(2, c12_sched), "C12 schedule loaded");
@@ -122,7 +123,7 @@ static bool validate_v4_schedule_contract() {
 }
 
 int main() {
-    const char* blob_path = "D:/ESP_INT8/hw_artifacts/binary2_int8_h240w240_gray_v4/PARAM.BIN";
+    const char* blob_path = "D:/ESP_INT8/hw_artifacts/binary2_int8_h240w240_gray_r6_v4/PARAM.BIN";
     std::vector<esp_int8::axi_vec_t> param;
     std::size_t byte_count = 0;
     if (!load_blob(blob_path, param, byte_count)) {

@@ -1,9 +1,11 @@
 """Deployment geometry checks for the grayscale H240 branch."""
 
 import inspect
+from dataclasses import replace
 import json
 import pickle
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -17,6 +19,9 @@ from tools.geometry_contract import DeploymentGeometry
 from tools import export_int8_hw_blob as compiler
 from tools import eval_single_hw_outputs as single_eval
 from tools import export_val_hw_dataset as val_export
+from tools import hw_param_replay as replay
+from tools import check_p6_hls_structure as structure
+from tools import audit_hls_reports as report_audit
 
 
 class GrayGeometryContractTests(unittest.TestCase):
@@ -112,6 +117,94 @@ class GrayCompilerContractTests(unittest.TestCase):
         self.assertEqual(audit["stages"][0]["first4_compact_bytes"], 190080)
         self.assertEqual(audit["stages"][1]["first4_compact_bytes"], 95040)
 
+    def test_round6_c1_compiles_eight_word_keep1(self):
+        desc, _ = compiler.make_window_pack_schedule(
+            1, 3, source_w=240, stride=2, dilation=1, padding=1,
+            out_w=120, flags=compiler.WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
+        self.assertEqual(desc.reserved[9], 2 | (8 << 2))
+
+    def test_round6_transfer_protocol_is_explicit_and_audited(self):
+        for channels, paired in ((12, True), (17, True), (25, False)):
+            for dilation in (1, 2, 4, 8, 16):
+                if channels == 17 and dilation != 1:
+                    continue
+                desc, _ = compiler.make_window_pack_schedule(
+                    channels, 3, source_w=60, stride=2 if channels == 17 else 1,
+                    dilation=dilation, padding=dilation, out_w=30 if channels == 17 else 60,
+                    flags=compiler.WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2 if paired else 0)
+                protocol = (desc.reserved[9] >> 9) & 3
+                self.assertEqual(protocol, 1 if channels == 12 and dilation == 1 else 2)
+                audit = compiler.audit_window_transfer_contract(desc)
+                self.assertEqual(audit["produced_words"], audit["consumed_words"])
+                self.assertLess(audit["produced_words"], audit["full_window_words"])
+                self.assertEqual(audit["act_words_per_stream"],
+                                 ((desc.out_w + 1) // 2 if paired else desc.out_w) * desc.k_tiles)
+
+    def test_round6_replay_rejects_bad_reuse_and_transfer_bits(self):
+        path = Path(__file__).resolve().parents[1] / "hw_artifacts/binary2_int8_h240w240_gray_v4/PARAM.BIN"
+        blob = replay.ParamBlob(path)
+        conv = blob.conv_exec_by_index[0]
+        source = blob.tensor_desc[conv.src_tensor]
+        desc = blob.window_sched_by_index[conv.window_sched_id]
+        words = list(desc.reserved)
+        words[9] = 2 | (8 << 2)
+        compiled = replace(desc, reserved=words)
+        self.assertTrue(replay.window_row_reuse_contract_valid(compiled, conv, source))
+        for bad in (2 | (7 << 2), 2 | (8 << 2) | (1 << 11), 1 | (8 << 2)):
+            altered = list(words)
+            altered[9] = bad
+            self.assertFalse(replay.window_row_reuse_contract_valid(
+                replace(compiled, reserved=altered), conv, source))
+        self.assertFalse(replay.window_row_reuse_contract_valid(
+            compiled, conv, replace(source, reserved1=1)))
+
+    def test_round6_replay_checks_delta_and_fixed_run_contracts(self):
+        blob = replay.ParamBlob(Path(__file__).resolve().parents[1] /
+                                "hw_artifacts/binary2_int8_h240w240_gray_v4/PARAM.BIN")
+        for desc in blob.window_sched_by_index:
+            protocol = compiler.compile_window_transfer_protocol(
+                desc.in_c, desc.kernel, desc.stride, desc.dilation, desc.flags)
+            if not protocol:
+                continue
+            words = list(desc.reserved)
+            words[9] = protocol << 9
+            compiled = replace(desc, reserved=words)
+            self.assertTrue(replay.window_row_reuse_contract_valid(compiled))
+            self.assertFalse(replay.window_row_reuse_contract_valid(
+                replace(compiled, flags=desc.flags | 4)))
+            malformed = list(words)
+            malformed[9] = 3 << 9
+            self.assertFalse(replay.window_row_reuse_contract_valid(
+                replace(compiled, reserved=malformed)))
+            if protocol == 1:
+                malformed = list(words)
+                malformed[1] = 0x0300
+                self.assertFalse(replay.window_row_reuse_contract_valid(
+                    replace(compiled, reserved=malformed)))
+
+    def test_round6_schedule_only_recompile_handles_scratch_sources(self):
+        path = Path(__file__).resolve().parents[1] / "hw_artifacts/binary2_int8_h240w240_gray_v4/PARAM.BIN"
+        source = path.read_bytes()
+        blob = replay.ParamBlob(path)
+        self.assertTrue(any(conv.src_tensor >= len(blob.tensor_desc) for conv in blob.conv_exec_by_index))
+        compiled = compiler.compile_window_reuse_param(path)
+        self.assertEqual(len(compiled), len(source))
+        allowed = {blob.header["window_sched_offset"] + sid * 128 + 126 + byte
+                   for sid in range(len(blob.window_sched_by_index)) for byte in (0, 1)}
+        changed = {index for index, (a, b) in enumerate(zip(source, compiled)) if a != b}
+        self.assertTrue(changed)
+        self.assertTrue(changed <= allowed)
+
+    def test_round6_metadata_relocates_relative_and_absolute_artifact_paths(self):
+        root = Path(__file__).resolve().parents[1]
+        source = root / "hw_artifacts/binary2_int8_h240w240_gray_v4"
+        target = root / "hw_artifacts/binary2_int8_h240w240_gray_r6_v4"
+        metadata = {"param": str(source.relative_to(root) / "PARAM.BIN"),
+                    "nested": [source.as_posix() + "/param_audit.json"]}
+        result = compiler.relocate_artifact_metadata(metadata, source, target)
+        self.assertEqual(Path(result["param"]).resolve(), target / "PARAM.BIN")
+        self.assertEqual(Path(result["nested"][0]).resolve(), target / "param_audit.json")
+
 
 class GrayEvaluationContractTests(unittest.TestCase):
     def test_binary_target_mapping_does_not_remap_already_mapped_labels(self):
@@ -169,8 +262,183 @@ class GrayEvaluationContractTests(unittest.TestCase):
             self.assertEqual(Path(checks["input_vs_I0000"]["right"]).name, "B0000.BIN")
 
 
+class GrayRound7SourceTests(unittest.TestCase):
+    root = Path(__file__).resolve().parents[1] / "ESP_INT8_hls/src"
+
+    def test_block5_has_one_four_lane_resident_word_kernel(self):
+        source = (self.root / "ppu.cpp").read_text(encoding="utf-8-sig")
+        self.assertIn("PPU_BLOCK_LANES = 4", source)
+        self.assertIn("ppu_load_block5_affine_bank(", source)
+        self.assertIn("ppu_apply_block_word(", source)
+        self.assertNotIn("ppu_apply_block_add_affine_word(", source)
+        self.assertNotIn("ppu_apply_block_affine_word(", source)
+        self.assertNotIn("ppu_finalize_block5_emit_tiles(", source)
+
+    def test_vec_uses_one_absolute_span_and_store_service(self):
+        source = (self.root / "vec_alu_engine.cpp").read_text(encoding="utf-8-sig")
+        self.assertIn("on_chip_memory_read_packed_span(", source)
+        self.assertIn("tile_service_count", source)
+        self.assertNotIn("read_block_affine_source_tile(", source)
+        self.assertNotIn("for (int middle =", source)
+        self.assertEqual(source.count("conv_store_write_row_contiguous_word("), 2)
+
+    def test_ppu_uses_pairs_without_the_retired_group_loop(self):
+        source = (self.root / "ppu.cpp").read_text(encoding="utf-8-sig")
+        self.assertIn("ppu_append_compact_pair(", source)
+        self.assertIn("source_cursor >>= 64", source)
+        self.assertNotIn("ppu_merge_compact_group(", source)
+        self.assertIn("conv_stream.read()", source)
+
+    def test_compact_pack_memory_commit_is_outside_the_pipeline(self):
+        ppu = (self.root / "ppu.cpp").read_text(encoding="utf-8-sig")
+        conv = (self.root / "conv_engine.cpp").read_text(encoding="utf-8-sig")
+        self.assertEqual(structure.check_round4a_ppu_structure(ppu, conv), 0)
+
+    def test_report_audit_flags_clock_and_specialization_warnings(self):
+        for message in (
+            "WARNING: [HLS 200-871] Estimated clock period exceeds the target",
+            "WARNING: [HLS 200-887] Cannot meet target clock period",
+            "WARNING: [HLS 214-366] Duplicating function as different function signatures were detected",
+        ):
+            self.assertTrue(any(rule.pattern.search(message) for rule in report_audit.HIGH_RISKS),
+                            message)
+
+    def test_upsample_reuses_binary_corners_and_keeps_ties(self):
+        source = (self.root / "upsample_unit.cpp").read_text(encoding="utf-8-sig")
+        self.assertIn("binary_corner_difference(", source)
+        self.assertIn("cached_x0", source)
+        self.assertIn("difference > 0", source)
+        self.assertNotIn("interpolate_argmax_label(", source)
+
+    def test_pool_arithmetic_is_separate_from_memory_commit(self):
+        source = (self.root / "avgpool_unit.cpp").read_text(encoding="utf-8-sig")
+        begin = source.index("static void compute_c1_group_word(")
+        end = source.index("\nstatic bool ", begin)
+        arithmetic = source[begin:end]
+        self.assertIn("#pragma HLS PIPELINE II=1", arithmetic)
+        self.assertNotIn("on_chip_memory_", arithmetic)
+        self.assertIn("round_div9(sum)", arithmetic)
+        self.assertNotIn("#pragma HLS UNROLL factor=32", source)
+
+
+class GrayRound7RSourceTests(unittest.TestCase):
+    root = Path(__file__).resolve().parents[1] / "ESP_INT8_hls/src"
+
+    def test_vec_commit_is_a_short_loop_without_tile_dispatch(self):
+        source = (self.root / "vec_alu_engine.cpp").read_text(encoding="utf-8-sig")
+        body = structure.function_body(source, "run_fixed_affine_common")
+        self.assertIn("VEC_AFFINE_TILES:", body)
+        self.assertIn("VEC_COMMIT_WORDS:", body)
+        commit = body.split("VEC_COMMIT_WORDS:", 1)[1].split("aligned_row +=", 1)[0]
+        self.assertIn("#pragma HLS PIPELINE II=1", commit)
+        self.assertIn("ROW_CONTIG_MAX_WORDS", commit)
+        self.assertIn("conv_store_write_row_contiguous_word(", commit)
+        for token in ("tile_service_count", "vec_select_source_span(",
+                      "vec_alu_apply_affine_block(", "vec_stage_compact_word(",
+                      "vec_finish_compact_row("):
+            self.assertNotIn(token, commit)
+
+    def test_vec_aligned_staging_reuses_the_single_existing_row_buffer(self):
+        source = (self.root / "vec_alu_engine.cpp").read_text(encoding="utf-8-sig")
+        body = structure.function_body(source, "run_fixed_affine_common")
+        self.assertIn("s_shared_row_contig_words[tile.to_uint()] = out_packed;", body)
+        self.assertEqual(re.findall(r"static\s+axi_vec_t\s+(\w+)\s*\[", source),
+                         ["s_shared_row_contig_words"])
+        self.assertEqual(source.count("vec_alu_apply_affine_block("), 2)
+        self.assertEqual(source.count("on_chip_memory_read_packed_span("), 2)
+        self.assertEqual(source.count("conv_store_write_row_contiguous_word("), 2)
+        finish = body.index("if (row_contiguous && !vec_finish_compact_row(")
+        self.assertLess(finish, body.index("VEC_COMMIT_WORDS:"))
+
+    def test_vec_commit_uses_an_independent_bounded_incremental_cursor(self):
+        source = (self.root / "vec_alu_engine.cpp").read_text(encoding="utf-8-sig")
+        body = structure.function_body(source, "run_fixed_affine_common")
+        self.assertIn("for (ap_uint<9> word = 0; word < ROW_CONTIG_MAX_WORDS; ++word)", body)
+        self.assertIn("commit_offset += commit_step;", body)
+        self.assertNotIn("VEC_MAX_ROW_SERVICES", source)
+        self.assertNotIn("service_count = tile_service_count +", body)
+        self.assertNotIn("service.to_uint() -", body)
+
+    def test_vec_commit_prevalidates_the_span_without_status_feedback(self):
+        source = (self.root / "vec_alu_engine.cpp").read_text(encoding="utf-8-sig")
+        body = structure.function_body(source, "run_fixed_affine_common")
+        self.assertTrue("conv_store_word_span_plan_ok(" in body,
+                        "Vec must prove the destination span before dropping redundant per-word status")
+        self.assertLess(body.index("conv_store_word_span_plan_ok("), body.index("for (int outer"))
+        self.assertIn("const u64_t last_write_span", body)
+        commit = body.split("VEC_COMMIT_WORDS:", 1)[1].split("aligned_row +=", 1)[0]
+        self.assertIn("(void)conv_store_write_row_contiguous_word(", commit)
+        self.assertNotIn("return ERR_", commit)
+        self.assertNotIn("if (!conv_store_write", commit)
+
+    def test_vec_span_validator_is_scalar_and_overflow_safe(self):
+        source = (self.root / "conv_store.cpp").read_text(encoding="utf-8-sig")
+        body = structure.function_body(source, "conv_store_word_span_plan_ok")
+        self.assertIsNotNone(body, "The existing store owner must validate the whole word span")
+        self.assertIn("const u64_t end_offset", body)
+        self.assertIn("ROW_CONTIG_MAX_WORDS", body)
+        self.assertIn("BRAM_SCR1_BYTES", body)
+        self.assertIn("FMBUF_POOL_TMP_BASE", body)
+        self.assertNotIn("on_chip_memory_", body)
+        self.assertNotIn("#pragma HLS PIPELINE II=1", body)
+
+    def test_absent_vec_source_metadata_is_not_evaluated(self):
+        source = (self.root / "vec_alu_engine.cpp").read_text(encoding="utf-8-sig")
+        self.assertTrue("const u32_t base2 = has_src2" in source,
+                        "Two-source EXEC must not read the absent third descriptor")
+        self.assertTrue("aligned_source = {0, 0, 0, 0, 0};" in source,
+                        "Compact EXEC must not copy uninitialized aligned metadata")
+
+    def test_vec_hoists_aligned_source_plan_and_keeps_one_datapath(self):
+        source = (self.root / "vec_alu_engine.cpp").read_text(encoding="utf-8-sig")
+        self.assertIn("vec_select_source_span(", source)
+        self.assertIn("aligned_source", source)
+        self.assertIn("VEC_MAX_ROW_TILES", source)
+        self.assertNotIn("read_block_affine_source_span(", source)
+        self.assertNotIn("MAX_FM_H * MAX_FM_W + ROW_CONTIG_MAX_WORDS", source)
+        self.assertEqual(source.count("vec_alu_apply_affine_block("), 2)
+        self.assertEqual(source.count("on_chip_memory_read_packed_span("), 2)
+        self.assertEqual(source.count("conv_store_write_row_contiguous_word("), 2)
+        finish = source.index("if (row_contiguous && !vec_finish_compact_row(", source.index("static error_code_t run_fixed_affine_common"))
+        commit = source.index("VEC_COMMIT_WORDS:", finish)
+        self.assertLess(finish, commit)
+        self.assertNotIn("if (word_idx == 0", source)
+
+    def test_block5_coefficient_cache_is_bound_to_param_generation_and_row(self):
+        ppu = (self.root / "ppu.cpp").read_text(encoding="utf-8-sig")
+        param = (self.root / "param_dma.cpp").read_text(encoding="utf-8-sig")
+        self.assertIn("param_dma_generation()", ppu)
+        self.assertIn("++s_param_generation;", param)
+        self.assertIn("static bool affine_cache_valid = false;", ppu)
+        self.assertIn("affine_cache_next_row == abs_row", ppu)
+        self.assertIn("affine_cache_generation == generation", ppu)
+        self.assertIn("abs_row != 0", ppu)
+        self.assertIn("affine_cache_valid = false;", ppu)
+        self.assertEqual(ppu.count("ppu_load_block5_affine_bank("), 2)
+        self.assertIn("static i32_t qmul[PPU_BLOCK_LANES][TM];", ppu)
+
+    def test_preadd_uses_incremental_span_without_coordinate_reader(self):
+        ppu = (self.root / "ppu.cpp").read_text(encoding="utf-8-sig")
+        begin = ppu.index("bool ppu_preadd_segment(")
+        end = ppu.index("\nbool ppu_preadd_row(", begin)
+        preadd = ppu[begin:end]
+        self.assertIn("on_chip_memory_read_packed_span(", preadd)
+        self.assertIn("source_offset += source_step;", preadd)
+        self.assertNotIn("on_chip_memory_read_packed_tile(", preadd)
+        self.assertIn("ppu_apply_add_word(", preadd)
+
+
 class GrayHlsContractTests(unittest.TestCase):
     root = Path(__file__).resolve().parents[1] / "ESP_INT8_hls"
+
+    def test_schedule_fields_do_not_compare_ap_int_directly_with_enums(self):
+        field = r"\b(?:desc|sched)\.(?:mode|loader_class|flags)\b"
+        enum = r"\b(?:WIN_MODE_|WIN_LOADER_|WINDOW_SCHED_FLAG_)\w+\b"
+        comparison = rf"(?:{field}\s*(?:==|!=)\s*{enum}|{enum}\s*(?:==|!=)\s*{field})"
+        for path in (self.root / "src").glob("*.cpp"):
+            source = path.read_text(encoding="utf-8-sig")
+            self.assertEqual(re.findall(comparison, source), [],
+                             f"{path.name}: ambiguous synthesis AP-int/enum comparison")
 
     def test_fixed_frame_contract_is_gray_h240(self):
         config = (self.root / "include/npu_config.hpp").read_text(encoding="utf-8-sig")
@@ -193,8 +461,10 @@ class GrayHlsContractTests(unittest.TestCase):
 
     def test_old_rgb_kernels_do_not_remain_in_gray_owners(self):
         win = (self.root / "src/win_gen.cpp").read_text(encoding="utf-8-sig")
-        for channels in (1, 17, 129):
+        for channels in (17, 129):
             self.assertIn(f"build_staged_c{channels}_word(", win)
+        self.assertIn("scheduled_c1_packed_row(", win)
+        self.assertNotIn("build_staged_c1_word(", win)
         for token in ("build_staged_c3_word(", "build_staged_c19_word(",
                       "build_staged_c131_word(", "s_narrow_reuse_", "c3_reuse_incremental"):
             self.assertNotIn(token, win)

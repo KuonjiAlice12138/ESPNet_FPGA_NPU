@@ -9,11 +9,6 @@ bool on_chip_memory_write_fmbuf_abs_word(u8_t bank_id,
                                          act_vec_t packed);
 bool on_chip_memory_write_pool2_abs_word(u32_t byte_offset,
                                          act_vec_t packed);
-bool on_chip_memory_write_aligned_full_tile(const tensor_desc_t& desc,
-                                            u16_t h,
-                                            u16_t w,
-                                            u16_t c_begin,
-                                            axi_vec_t packed);
 
 
 static bool row_contiguous_write_plan_ok(const tensor_desc_t& dst,
@@ -52,20 +47,53 @@ static bool write_row_contiguous_abs_word(const tensor_desc_t& dst,
   return on_chip_memory_write_fmbuf_abs_word(dst.bank_id, byte_offset, word);
 }
 
-bool conv_store_write_aligned_tile(const tensor_desc_t& dst,
-                                   u16_t h,
-                                   u16_t w,
-                                   u16_t c,
-                                   const act_vec_t& word) {
-#pragma HLS INLINE off
-  return on_chip_memory_write_aligned_full_tile(dst, h, w, c, word);
-}
-
 bool conv_store_write_row_contiguous_word(const tensor_desc_t& dst,
                                           u32_t abs_offset,
                                           const axi_vec_t& word) {
 #pragma HLS INLINE off
   return write_row_contiguous_abs_word(dst, abs_offset, word);
+}
+
+bool conv_store_word_span_plan_ok(u8_t bank_id,
+                                   u64_t first_offset,
+                                   u32_t byte_step,
+                                   u16_t word_count) {
+#pragma HLS INLINE off
+  static_assert((FMBUF_POOL_TMP_BASE & (AXI_WORD_BYTES - 1)) == 0,
+                "Pool scratch base must be word aligned");
+  static_assert((FMBUF_POOL2_ALIAS_BASE & (AXI_WORD_BYTES - 1)) == 0 &&
+                    BRAM_SCR1_BYTES <= FMBUF_POOL2_ALIAS_BYTES &&
+                    FMBUF_POOL2_ALIAS_BASE + BRAM_SCR1_BYTES <= FMBUF_BYTES,
+                "Pool alias must fit the shared physical memory");
+  const unsigned count = word_count.to_uint();
+  if (count == 0U || count > static_cast<unsigned>(ROW_CONTIG_MAX_WORDS) ||
+      first_offset.range(4, 0).to_uint() != 0U ||
+      byte_step.to_uint() < static_cast<unsigned>(AXI_WORD_BYTES) ||
+      (byte_step.to_uint() & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U) {
+    return false;
+  }
+  unsigned byte_capacity = 0U;
+  switch (bank_id.to_uint()) {
+    case static_cast<unsigned>(BANK_FMEM0):
+    case static_cast<unsigned>(BANK_FMEM1):
+    case static_cast<unsigned>(BANK_FMEM2):
+      byte_capacity = FMBUF_BYTES;
+      break;
+    case static_cast<unsigned>(BANK_BRAM_SCR0):
+      byte_capacity = FMBUF_BYTES - FMBUF_POOL_TMP_BASE;
+      break;
+    case static_cast<unsigned>(BANK_BRAM_SCR1):
+      byte_capacity = BRAM_SCR1_BYTES;
+      break;
+    default:
+      return false;
+  }
+  if (first_offset >= static_cast<u64_t>(byte_capacity)) { return false; }
+  // Widen before the last-address calculation; a wrapped 32-bit end is not valid.
+  const ap_uint<9> last_word = static_cast<ap_uint<9>>(count - 1U);
+  const u64_t end_offset = first_offset +
+      static_cast<u64_t>(last_word * byte_step) + static_cast<u64_t>(AXI_WORD_BYTES);
+  return end_offset <= static_cast<u64_t>(byte_capacity);
 }
 
 bool conv_store_row_contiguous_plan_ok(const tensor_desc_t& dst,

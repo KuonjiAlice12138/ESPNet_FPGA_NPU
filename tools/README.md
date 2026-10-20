@@ -6,7 +6,12 @@ Model training and hardware-constrained QAT tools live in `D:/ESPNet`.
 
 ## Artifact Contract
 
-Use all files from `hw_artifacts/binary2_int8_h240w240_gray_v4` together.
+Round 6/7 HLS uses `hw_artifacts/binary2_int8_h240w240_gray_r6_v4`.
+The initial board release remains `hw_artifacts/binary2_int8_h240w240_gray_v4`;
+its PARAM must not be used with Round 6/7 HLS. The v4 record layout is unchanged,
+but schedule word 9 now explicitly selects C1 packed-row reuse and narrow-channel
+column transfer. Round 6 INIT rejects the retired narrow transfer protocol.
+Weights, qparams, input and numerical golden remain identical to the baseline.
 `INPUTQ.BIN` and the full-resolution mask are each 57,600 bytes;
 low-resolution HWC INT8 logits are 1,800 bytes. The manifest records grayscale
 normalization, center-square crop, checkpoint/cache hashes and tensor geometry.
@@ -15,9 +20,10 @@ pool tensors remain tightly packed.
 
 The Python tools can still inspect the preserved H256W512 binary2/cityscapes20
 releases. Those artifacts are **not compatible with the current H240/C1 HLS IP**,
-despite both using PARAM v4. The App now selects `platform_h240_1012` and runs
+despite both using PARAM v4. The App selects Round 7R `platform_h240_1020` and runs
 the H240 grayscale single image using `P2G.BIN` / `I2G.BIN` / `O2G.BIN`.
-Rebuild it manually before use. SD boot additionally requires a newly packaged
+Round 7R reuses the Round 6 artifact without re-exporting or changing golden data.
+Rebuild App manually after aligning its platform configuration. SD boot also requires a newly packaged
 `BOOT.BIN`; `ESP_INT8_app/src/boot_h240.bif` fixes the platform/bitstream/ELF paths.
 
 ## Compile and Validate
@@ -33,16 +39,18 @@ Run from `D:/ESP_INT8`:
 
 ```powershell
 & 'D:/ESPNet/.venv/Scripts/python.exe' tools/export_int8_hw_blob.py `
-  --artifact-dir D:/ESPNet/resolution_h240w240_gray/quantized_artifacts_binary2_int8_hw `
-  --out-dir hw_artifacts/binary2_int8_h240w240_gray_v4 `
-  --param-version 4 --height 240 --width 240 --target-scale 8 `
-  --strict-zp --strict-schedule
+  --recompile-window-reuse-from hw_artifacts/binary2_int8_h240w240_gray_v4 `
+  --out-dir hw_artifacts/binary2_int8_h240w240_gray_r6_v4
 
 & 'D:/ESPNet/.venv/Scripts/python.exe' tools/hw_param_replay.py `
-  --param hw_artifacts/binary2_int8_h240w240_gray_v4/PARAM.BIN `
-  --input hw_artifacts/binary2_int8_h240w240_gray_v4/INPUTQ.BIN `
-  --output hw_artifacts/binary2_int8_h240w240_gray_v4/replay_check.bin
+  --param hw_artifacts/binary2_int8_h240w240_gray_r6_v4/PARAM.BIN `
+  --input hw_artifacts/binary2_int8_h240w240_gray_r6_v4/INPUTQ.BIN `
+  --output hw_artifacts/binary2_int8_h240w240_gray_r6_v4/replay_check.bin
 ```
+
+Schedule-only export changes only schedule word 9, reruns replay and requires
+bit-exact frozen logits. It refuses to overwrite an existing output directory;
+the candidate above has already been exported and validated.
 
 ## Accuracy and Reports
 
@@ -79,4 +87,19 @@ measurement, not a performance measurement for the grayscale IP.
 
 Full-resolution CSim is configured by `ESP_INT8_hls/hls_config.cfg` and writes
 `csim_u72_lowres_logits.bin` and `hls_output_mask.bin` under the chosen CSim
-work directory. Synthesis, packaging, implementation and app build remain manual.
+work directory. Its TB defaults to the Round 6 candidate. To run the dedicated
+Round 7 final validation without changing the production cfg, use this from `ESP_INT8_hls`:
+
+```powershell
+$env:ESP_INT8_CSIM_ROUND = '7'
+$env:ESP_INT8_ROUND6_TEST = 'full'
+& 'D:/Xilinx/2025.1/Vitis/bin/vitis-run.bat' --mode hls --tcl run_csim_1011_round6.tcl
+```
+
+The same Tcl script retains Round 6 focus/full validation when
+`ESP_INT8_CSIM_ROUND` is unset or `6`. Round 7 runs in a separate work directory.
+The full-frame TB also checks compact tails/error draining and exact binary
+bilinear edge, tie and cross-frame behavior within that single CSim run.
+
+Synthesis, packaging, implementation and app build remain manual. CSim validates
+functional/token contracts, not RTL FIFO liveness or measured cycle savings.

@@ -138,6 +138,7 @@ WIN_MODE_3X3_STAGED_C129 = 14
 
 WIN_LOADER_3X3_NARROW = 1
 WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2 = 1 << 0
+WINDOW_SCHED_FLAG_ODD_TAIL = 1 << 1
 WINDOW_LOADER_ROW_REUSE_WORD = 9
 WINDOW_ROW_REUSE_NONE = 0
 WINDOW_ROW_REUSE_STRIDE1_KEEP2 = 1
@@ -145,7 +146,9 @@ WINDOW_ROW_REUSE_STRIDE2_KEEP1 = 2
 WINDOW_ROW_REUSE_MODE_MASK = 0x3
 WINDOW_ROW_REUSE_WORDS_SHIFT = 2
 WINDOW_ROW_REUSE_WORDS_MASK = 0x7F
-WINDOW_ROW_REUSE_RESERVED_SHIFT = 9
+WINDOW_TRANSFER_PROTOCOL_SHIFT = 9
+WINDOW_TRANSFER_PROTOCOL_MASK = 0x3
+WINDOW_ROW_REUSE_RESERVED_SHIFT = 11
 WINGEN_NARROW_ROW_WORDS = 96
 
 
@@ -161,8 +164,40 @@ def window_row_reuse_contract_valid(
         return False
     mode = desc.row_reuse_mode
     words = desc.packed_words_per_source_row
+    protocol = (word >> WINDOW_TRANSFER_PROTOCOL_SHIFT) & WINDOW_TRANSFER_PROTOCOL_MASK
+    expected = (1 if desc.in_c == 12 and desc.stride == desc.dilation == 1 and
+                desc.flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2 else 2)
+    if protocol and (desc.kernel != 3 or desc.in_c not in (12, 17, 25) or
+                     protocol != expected or desc.loader_class != WIN_LOADER_3X3_NARROW):
+        return False
+    if protocol:
+        paired = bool(desc.flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
+        requests = 6 if paired else 3
+        if (desc.flags & ~3 or desc.out_w <= 0 or
+                bool(desc.flags & WINDOW_SCHED_FLAG_ODD_TAIL) != bool(paired and desc.out_w % 2) or
+                desc.cache_chunks != 1 or desc.cache_col_slots != 4 * desc.dilation or
+                desc.loader_words_per_col != 3 or desc.loader_request_cols != requests or
+                desc.loader_warmup_mask >> requests or desc.loader_steady_mask >> requests):
+            return False
+        if protocol == 1 and (desc.loader_warmup_issues != 1 or
+                              desc.loader_warmup_new_cols != 4 or desc.loader_steady_new_cols != 2 or
+                              desc.reserved[1] != 0x0400 or desc.reserved[5] != 0x0202):
+            return False
     if mode == WINDOW_ROW_REUSE_NONE:
         return words == 0
+    if desc.mode == WIN_MODE_3X3_STAGED_C1:
+        common = (mode == WINDOW_ROW_REUSE_STRIDE2_KEEP1 and words == 8 and protocol == 0
+                  and desc.kernel == 3 and desc.in_c == 1 and desc.stride == 2
+                  and desc.dilation == 1 and desc.padding == 1 and desc.k_tiles == 1
+                  and desc.out_w == 120 and desc.loader_class == WIN_LOADER_3X3_NARROW
+                  and desc.flags == WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
+        if not common or conv is None or src is None:
+            return False
+        return (src.h == src.w == conv.in_h == conv.in_w == 240 and src.c == src.phys_c == 1
+                and src.row_stride_bytes == 240 and src.elem_bytes == 1 and src.c_offset == 0
+                and src.base_offset % 32 == 0 and 0 < conv.out_c <= 16
+                and all(getattr(conv, f) == getattr(desc, f) for f in
+                        ("in_c", "kernel", "stride", "dilation", "padding", "k_tiles")))
     common = (
         mode == WINDOW_ROW_REUSE_STRIDE2_KEEP1
         and desc.mode == WIN_MODE_3X3_STAGED_C3

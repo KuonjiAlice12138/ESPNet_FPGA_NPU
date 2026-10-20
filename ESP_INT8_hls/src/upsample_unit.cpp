@@ -59,73 +59,46 @@ static void copy_logits_row(const act_vec_t src[ENCODER_OUT_W],
   }
 }
 
-static i16_t packed_logit(const act_vec_t& packed, int class_id) {
+static i16_t binary_corner_difference(const act_vec_t& packed) {
 #pragma HLS INLINE
-  const int lo = class_id * 8;
-  const u8_t raw = packed.range(lo + 7, lo);
-  return byte_to_i16_signed(raw);
+  const i16_t class0 = byte_to_i16_signed(static_cast<u8_t>(packed.range(7, 0)));
+  const i16_t class1 = byte_to_i16_signed(static_cast<u8_t>(packed.range(15, 8)));
+  return static_cast<i16_t>(class1 - class0);
 }
 
-static u8_t interpolate_argmax_label(const act_vec_t curr_row[ENCODER_OUT_W],
-                                     bool use_prev_row,
-                                     int col,
-                                     int wy0,
-                                     int wy1,
-                                     u8_t valid_c) {
+static ap_uint<64> interpolate_binary_segment(i32_t left,
+                                              i32_t right,
+                                              bool clipped,
+                                              int pixel_count) {
 #pragma HLS INLINE off
-  int x0 = 0;
-  int x1 = 0;
-  int wx0 = 16;
-  int wx1 = 0;
-  bilinear_axis_map(col, ENCODER_OUT_W, x0, x1, wx0, wx1);
-
-  const act_vec_t top_packed0 =
-      use_prev_row ? s_prev_logits_row[x0] : curr_row[x0];
-  const act_vec_t top_packed1 =
-      use_prev_row ? s_prev_logits_row[x1] : curr_row[x1];
-  const act_vec_t bottom_packed0 = curr_row[x0];
-  const act_vec_t bottom_packed1 = curr_row[x1];
-
-  i32_t best_value = static_cast<i32_t>(-0x7fffffff);
-  u8_t best_class = 0;
-  const unsigned class_count = valid_c.to_uint();
-  for (int group = 0; group < MAX_CLASS_C / UPSAMPLE_CLASS_LANES; ++group) {
-    if (static_cast<unsigned>(group * UPSAMPLE_CLASS_LANES) >= class_count) {
-      break;
+  u8_t labels[UPSAMPLE_SCALE];
+#pragma HLS ARRAY_PARTITION variable=labels complete dim=1
+  const i32_t delta = right - left;
+  for (int pixel = 0; pixel < UPSAMPLE_SCALE; ++pixel) {
+#pragma HLS PIPELINE II=1
+    u8_t label = 0;
+    if (pixel < pixel_count) {
+      const int wx1 = clipped ? 0 : 1 + pixel * 2;
+      // The original two scores are linear, with no intermediate rounding.
+      // |difference| <= 255*256, and a tie must still select class 0.
+      const i32_t difference = left * 16 + delta * static_cast<i32_t>(wx1);
+      label = difference > 0 ? static_cast<u8_t>(1) : static_cast<u8_t>(0);
     }
-    for (int lane = 0; lane < UPSAMPLE_CLASS_LANES; ++lane) {
-#pragma HLS UNROLL
-      const int class_id = group * UPSAMPLE_CLASS_LANES + lane;
-      if (static_cast<unsigned>(class_id) < class_count) {
-        const i32_t top =
-            static_cast<i32_t>(packed_logit(top_packed0, class_id)) *
-                static_cast<i32_t>(wx0) +
-            static_cast<i32_t>(packed_logit(top_packed1, class_id)) *
-                static_cast<i32_t>(wx1);
-        const i32_t bottom =
-            static_cast<i32_t>(packed_logit(bottom_packed0, class_id)) *
-                static_cast<i32_t>(wx0) +
-            static_cast<i32_t>(packed_logit(bottom_packed1, class_id)) *
-                static_cast<i32_t>(wx1);
-        const i32_t interp =
-            top * static_cast<i32_t>(wy0) +
-            bottom * static_cast<i32_t>(wy1);
-        if (interp > best_value) {
-          best_value = interp;
-          best_class = static_cast<u8_t>(class_id);
-        }
-      }
-    }
+    labels[pixel] = label;
   }
-  return best_class;
+  ap_uint<64> packed = 0;
+  for (int pixel = 0; pixel < UPSAMPLE_SCALE; ++pixel) {
+#pragma HLS UNROLL
+    packed.range(pixel * 8 + 7, pixel * 8) = labels[pixel];
+  }
+  return packed;
 }
 
 static void emit_fullres_rows(axi_vec_t* gmem_frame_out,
                               const act_vec_t curr_row[ENCODER_OUT_W],
                               bool use_prev_row,
                               int out_row_begin,
-                              int row_count,
-                              u8_t valid_c) {
+                              int row_count) {
 #pragma HLS INLINE off
   for (int rel_row = 0; rel_row < UPSAMPLE_SCALE; ++rel_row) {
     if (rel_row >= row_count) {
@@ -138,18 +111,55 @@ static void emit_fullres_rows(axi_vec_t* gmem_frame_out,
     int wy1 = 0;
     bilinear_axis_map(out_row, ENCODER_OUT_H, y0, y1, wy0, wy1);
 
-    for (int col = 0; col < FULLRES_MASK_W; ++col) {
+    int cached_x0 = -1;
+    int cached_x1 = -1;
+    i16_t top0 = 0, top1 = 0, bottom0 = 0, bottom1 = 0;
+    for (int segment = 0; segment <= ENCODER_OUT_W; ++segment) {
 #pragma HLS PIPELINE off
-      const u8_t label = interpolate_argmax_label(
-          curr_row, use_prev_row, col, wy0, wy1, valid_c);
-      s_mask_pack_word >>= 8;
-      s_mask_pack_word.range(255, 248) = label;
-      ++s_mask_pack_fill;
-      if (s_mask_pack_fill == AXI_WORD_BYTES) {
-        gmem_frame_out[s_mask_word_index] = s_mask_pack_word;
-        ++s_mask_word_index;
-        s_mask_pack_word = 0;
-        s_mask_pack_fill = 0;
+      const bool clipped = segment == 0 || segment == ENCODER_OUT_W;
+      const int x0 = segment == 0 ? 0 : segment - 1;
+      const int x1 = segment == ENCODER_OUT_W ? segment - 1 : segment;
+      if (x0 != cached_x0 || x1 != cached_x1) {
+        if (x0 == cached_x1) {
+          top0 = top1;
+          bottom0 = bottom1;
+        } else {
+          bottom0 = binary_corner_difference(curr_row[x0]);
+          top0 = use_prev_row ? binary_corner_difference(s_prev_logits_row[x0]) : bottom0;
+        }
+        if (x1 == x0) {
+          top1 = top0;
+          bottom1 = bottom0;
+        } else {
+          bottom1 = binary_corner_difference(curr_row[x1]);
+          top1 = use_prev_row ? binary_corner_difference(s_prev_logits_row[x1]) : bottom1;
+        }
+        cached_x0 = x0;
+        cached_x1 = x1;
+      }
+      const i32_t left = static_cast<i32_t>(top0) * wy0 + static_cast<i32_t>(bottom0) * wy1;
+      const i32_t right = static_cast<i32_t>(top1) * wy0 + static_cast<i32_t>(bottom1) * wy1;
+      const int pixels = clipped ? UPSAMPLE_SCALE / 2 : UPSAMPLE_SCALE;
+      ap_uint<64> labels = interpolate_binary_segment(left, right, clipped, pixels);
+      axi_vec_t completed_word = 0;
+      bool completed = false;
+      for (int pixel = 0; pixel < UPSAMPLE_SCALE; ++pixel) {
+#pragma HLS PIPELINE II=1
+        if (pixel >= pixels) { break; }
+        const u8_t label = labels.range(7, 0);
+        labels >>= 8;
+        s_mask_pack_word >>= 8;
+        s_mask_pack_word.range(255, 248) = label;
+        ++s_mask_pack_fill;
+        if (s_mask_pack_fill == AXI_WORD_BYTES) {
+          completed_word = s_mask_pack_word;
+          completed = true;
+          s_mask_pack_word = 0;
+          s_mask_pack_fill = 0;
+        }
+      }
+      if (completed) {
+        gmem_frame_out[s_mask_word_index++] = completed_word;
       }
     }
   }
@@ -170,7 +180,9 @@ void upsample_fused_consume_logits_row(axi_vec_t* gmem_frame_out,
 #pragma HLS INLINE off
 #pragma HLS BIND_STORAGE variable=s_prev_logits_row type=ram_2p impl=lutram
 #pragma HLS RESET variable=s_prev_logits_row off
-  if (valid_c.to_uint() < 2U || valid_c.to_uint() > static_cast<unsigned>(MAX_CLASS_C)) {
+  static_assert(MAX_CLASS_C == 2 && UPSAMPLE_SCALE == 8,
+                "This branch implements exact binary 8x bilinear output only");
+  if (valid_c.to_uint() != 2U) {
     return;
   }
 
@@ -202,7 +214,7 @@ void upsample_fused_consume_logits_row(axi_vec_t* gmem_frame_out,
 
     if (emit) {
       emit_fullres_rows(
-          gmem_frame_out, row_buf, use_prev_row, out_row_begin, row_count, valid_c);
+          gmem_frame_out, row_buf, use_prev_row, out_row_begin, row_count);
     }
   }
 

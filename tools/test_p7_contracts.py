@@ -161,7 +161,8 @@ def test_exec_prefix_app_contract() -> None:
     ).read_text(encoding="utf-8")
 
     assert '#define INT8_APP_ENABLE_EXEC_PREFIX_PROFILE 0U' in config
-    assert '#define INT8_APP_ENABLE_DUAL_SINGLE_TEST 1U' in config
+    gray = '#define INT8_APP_INPUT_C 1U' in config
+    assert f'#define INT8_APP_ENABLE_DUAL_SINGLE_TEST {0 if gray else 1}U' in config
     assert '#define INT8_APP_EXEC_PREFIX_COUNT 16U' in config
     assert (
         '#define INT8_APP_EXEC_PREFIX_REFERENCE_FULL_RTL_CYCLES 0ULL'
@@ -171,8 +172,12 @@ def test_exec_prefix_app_contract() -> None:
         '#define INT8_APP_EXEC_PREFIX_TARGET_MAX_RTL_CYCLES 0ULL'
         in config
     )
-    assert 'INT8-BOARD-20260923-P7-H256W512-R4R-DUAL-PROF' in config
-    assert "platform_r4_0922" in app_yaml
+    if gray:
+        assert 'INT8-BOARD-20261019-P7-H240W240-GRAY-R7-B2' in config
+        assert "platform_h240_1019" in app_yaml
+    else:
+        assert 'INT8-BOARD-20260923-P7-H256W512-R4R-DUAL-PROF' in config
+        assert "platform_r4_0922" in app_yaml
     assert "run_exec_prefix_profile" in main_src
     assert "EXEC_PREFIX_CYCLES_BEGIN" in main_src
     assert "PREFIX_CUM" in main_src
@@ -190,7 +195,7 @@ def _window_request_columns(desc, issue: int) -> list[int]:
         pixel0 * desc.stride - desc.padding + kw * desc.dilation
         for kw in range(3)
     ]
-    if paired and pixel0 + 1 < desc.out_w:
+    if paired:
         columns.extend(
             (pixel0 + 1) * desc.stride - desc.padding + kw * desc.dilation
             for kw in range(3)
@@ -416,7 +421,10 @@ def test_window_schedule_contracts() -> None:
                 assert warmup_split == 0
                 assert steady_split == 0
         else:
-            assert all(int(value) == 0 for value in sched.reserved)
+            assert all(int(value) == 0 for value in sched.reserved[:9])
+        protocol = (sched.reserved[9] >> blob_tools.WINDOW_TRANSFER_PROTOCOL_SHIFT) & 3
+        assert protocol == blob_tools.compile_window_transfer_protocol(
+            sched.in_c, sched.kernel, sched.stride, sched.dilation, sched.flags)
     # P7F keeps L20/L2B0 materialized as compact C64 tensors. U21 therefore
     # should use the fast aligned 1x1 path instead of the old wide-slice packed
     # reader.
@@ -473,7 +481,10 @@ def test_serial_row_schedule_contracts() -> None:
             assert blob_tools.decode_window_loader_runs(sched.reserved, warmup=True)
             assert blob_tools.decode_window_loader_runs(sched.reserved, warmup=False)
         else:
-            assert all(int(value) == 0 for value in sched.reserved)
+            assert all(int(value) == 0 for value in sched.reserved[:9])
+        protocol = (sched.reserved[9] >> blob_tools.WINDOW_TRANSFER_PROTOCOL_SHIFT) & 3
+        assert protocol == blob_tools.compile_window_transfer_protocol(
+            sched.in_c, sched.kernel, sched.stride, sched.dilation, sched.flags)
         assert int(desc.reserved) == 0
         assert row_consumers[desc.row_consumer_id]
 
@@ -495,8 +506,7 @@ def test_serial_row_wingen_source_contract() -> None:
     assert win_source.count("void scheduled_window_generator_row(") == 1
     assert conv_source.count("scheduled_window_generator_row(") == 2
 
-    # A row-local issue_count field is valid in the narrowed fallback config;
-    # reject only the retired segment API and its derived loop variables.
+    # No segment API or runtime fallback program may return to the row path.
     for legacy_token in (
         "u16_t issue_begin",
         "bool row_begin",
@@ -514,28 +524,24 @@ def test_serial_row_wingen_source_contract() -> None:
     assert "s_wide_col_tag" not in win_source
     assert "s_narrow_col_tag" not in win_source
 
-    # Round 4 keeps one FMBUF reader and one assembler-owned rolling spatial
-    # cache in the bounded DATAFLOW region. Full-window transfer remains only
-    # for schedule classes that did not opt into the incremental protocol.
+    # Round6 keeps the existing bounded row pipeline. C1 is packed-row direct;
+    # other narrow modes share an assembler-owned delta cache.
     for required in (
         "window_row_loader",
         "window_row_assembler",
         "scheduled_3x3_window_row_pipeline",
         "window_column_meta_t",
         "window_load_word_t",
-        "narrow_paired_issue_plan_t",
-        "window_row_loader_narrow_paired",
-        "window_loader_emit_narrow_cached_window",
-        "window_row_assembler_read_narrow_window",
-        "select_narrow_transfer_protocol",
+        "scheduled_c1_packed_row",
+        "s_delta_cache",
+        "window_loader_emit_delta_column",
+        "window_assembler_consume_delta_phase",
+        "WINDOW_TRANSFER_PROTOCOL_SHIFT",
         "window_row_loader_narrow_incremental_c12",
         "window_loader_emit_narrow_direct_run<4>",
         "window_loader_emit_narrow_direct_run<2>",
         "window_assembler_consume_c12_incremental",
         "narrow_incremental_cache_t incremental_cache",
-        "s_narrow_row_bank0",
-        "s_narrow_row_bank1",
-        "s_narrow_row_bank2",
     ):
         assert required in win_source
     assert "s_narrow_reuse_" not in win_source
@@ -553,6 +559,12 @@ def test_serial_row_wingen_source_contract() -> None:
         "s_narrow_cache_row",
         "window_loader_emit_narrow_run",
         "window_loader_emit_narrow_run_row",
+        "s_narrow_row_bank",
+        "narrow_paired_issue_plan_t",
+        "window_row_loader_narrow_paired",
+        "window_loader_emit_narrow_cached_window",
+        "window_row_assembler_read_narrow_window",
+        "select_narrow_transfer_protocol",
     ):
         assert obsolete not in win_source
     assert "#pragma HLS STREAM variable=column_meta_stream depth=16" in win_source

@@ -6,8 +6,10 @@
 
 **目标：** 将 `workplan_0922.md` 中精度最好的 `240x240` 单通道灰度 binary2 模型做
 硬件约束 INT8 QAT，导出 PARAM v4 artifact，完成对应 HLS/App 平台修改并上板验证。
-首版已上板，延时为 **64.855 ms**；后续目标是在 **100 MHz、相同模型与输出** 下压至
-**50 ms 以内**，具体执行第 10 节，不改回已失败的跨行常驻流水架构。
+首版已上板，延时为 **64.855 ms**；Round 6 为 **58.452 ms**，Round 7 已降至
+**53.34364 ms（较 R6 -8.74%，较首版 -17.75%）**，单图 mask 仍与 golden 完全一致。
+后续目标是在 **100 MHz、相同模型与输出** 下压至 **50 ms 以内**，先执行第 10.4.3 节的
+Vec/BLOCK5 定点修补，不改回已失败的跨行常驻流水架构。
 
 **架构：** 从已签核的 H256W512 Round 4 提交 `a9c5a43` 建立独立 H240W240/C1
 分支，保留 R4 的单套 32x32 SA、WinGen、Conv POST、PPU 和 RTL counter。新版本采用
@@ -51,9 +53,10 @@
 | 时钟 | 100 MHz，10 ns |
 | SD 单图文件名 | `P2G.BIN`、`I2G.BIN`、`O2G.BIN` |
 
-PARAM v4 只表示二进制 record ABI 不变。新 artifact 必须额外声明
-`hardware_profile=p7_h240w240_gray_c1_v1`；HLS geometry gate 必须拒绝旧 H256W512
-PARAM，因此同为 v4 也不能混用。
+PARAM v4 只表示二进制 record ABI 不变。首版 artifact 声明
+`hardware_profile=p7_h240w240_gray_c1_v1`；Round 6 已上板版本为
+`p7_h240w240_gray_c1_r6_delta`。HLS geometry/transfer gate 必须拒绝旧 H256W512
+及已替换的窄通道传输协议，因此同为 v4 也不能混用。
 
 ### 0.3 绝对约束
 
@@ -593,19 +596,25 @@ commit 是 psum word 分类，包含等待、量化、pack/write；不能据此�
 
 ### 10.1 冻结约束与周期预算
 
-从本次基线至少节省 **1485468 cycles（14.855 ms、22.905%）**，才到 5.0M 边界；
-正式目标必须严格小于它，建议按 **4.83M / 48.3 ms** 预留余量。下表是工作预算，不是
-已经证明的收益；每轮用板级 cycle gate 更新，不能用 HLS max latency 代替。
+Round 7 已上板，当前为 **5.334364M cycles / 53.34364 ms**，相对 R6 节省 510787 cycles
+（8.74%），相对首版降低 17.75%。严格小于 50 ms 至少还需节省 **334365 cycles**，约为
+当前整网的 6.27%。PPU row/Pool 原预算已经通过，BLOCK5/Vec 未通过；Vec 还比 R6 增加
+36401 cycles，不能因整网变快而忽略这一回退，也不能沿用旧局部报告推断该路径已提速。
+
+后续只做 **Round 7R：Vec 回退修复 + BLOCK5 局部服务收敛**，见 10.4.3。以下为工作预算，
+合计 **4.943639M / 49.43639 ms**，留约 0.56 ms 余量；不是已经证明可达的预测。
+预算须先通过真实 EXEC 数量加权的局部服务分析，不再盲目追求旧 0.45M/0.36M 极限目标。
+Conv/PPU row/Pool 保留 R7 收益；**原 <=3.10M Conv gate 仍未通过**。
 
 | 区域 | 当前 M cycles | 目标预算 M cycles |
 |---|---:|---:|
-| Conv | 4.129114 | 3.10 |
-| PPU row（含上采样） | 0.528634 | 0.40 |
-| BLOCK5 final | 0.893550 | 0.62 |
-| Vec | 0.631133 | 0.46 |
-| Pool | 0.253337 | 0.20 |
-| 其他 | 0.049700 | 0.05 |
-| **合计** | **6.485468** | **4.83** |
+| Conv（冻结 R7） | 3.418908 | 3.418908 |
+| PPU row（含上采样，冻结） | 0.289114 | 0.289114 |
+| BLOCK5 final | 0.773550 | 0.60 |
+| Vec | 0.667534 | 0.45 |
+| Pool（冻结） | 0.135617 | 0.135617 |
+| 其他 | 0.049641 | 0.05 |
+| **合计** | **5.334364** | **4.943639** |
 
 继承第 0.3 节约束：固定模型、240x240/C1、W8A8、100 MHz、PARAM v4 record ABI，
 不重新 QAT、不加 decoder、不恢复 U71 融合、不扩/减 SA。仍为单套 Conv/SA/POST/PPU，
@@ -615,91 +624,464 @@ commit 是 psum word 分类，包含等待、量化、pack/write；不能据此�
 
 ### 10.2 Round 5：一次逐 EXEC 归因，冻结修改对象
 
+**执行决定：** 按用户要求跳过本轮实验，不重新设为后续修复的必跑门槛。当前已有 R6/R7
+整网 Stage 数据，但没有逐 EXEC 实测，不能把全部收益分配给某一层。只有局部服务分析仍
+不能确定修补对象时才补做；使用 R7 已验证的 R6 artifact，不导出旧 transfer 协议的 PARAM。
+
 **范围：** `tools/export_exec_prefix_params.py`、`tools/analyze_conv_cycle_profile.py`、
 `ESP_INT8_app/src/app_config.h`、`tools/test_app_h240w240_gray_contract.py`，必要时修
 `main.c` 中 profiling 元数据；本轮不改 HLS。
 
 - [ ] 从当前 143040-byte PARAM 导出 P00..P15，保持 geometry/weight/qparam/descriptors
   不变，只修改提前 END；P15 必须与完整 PARAM hash 一致。App 保持 H240/C1，切 prefix
-  单次启动跑全套，input=I2G.BIN，最终 output=O2G.BIN，reference=6485468，target 暂为 0。
+  单次启动跑全套，input=I2G.BIN，最终 output=O2G.BIN，reference=5334364，target 暂为 0。
   App contract 同步允许本轮明确的 prefix 模式，其他 dual/valset 模式仍关闭；最终单图
   验收前恢复原配置与对应测试，不能为通过测试静默关闭 prefix 实验。
 - [ ] 取得每个 EXEC 的 stage/WIN/SA/POST delta。P15 与本次 full MODE_RUN 允许测量差
   `<=0.1%`，输出仍为 0 mismatch；三组 Conv owner sum 各自等于 Conv delta。重点区分
   U2/C1、U7/C17、U40/C129、四个 BLOCK5、U39/U71 与 U72，不根据 MAC 数排序代替实测。
-- [ ] 用结果确定 Round 6 的热点顺序，记录 C1/narrow/wide/1x1 各组可节省的服务开销；
-  若 C1 占比不高，不把 C1 优化假定为足够节省 1.03M Conv cycles。
+- [ ] 若需补修 Conv，用结果定位 R6 剩余 C1/narrow/wide/1x1 与调用开销；不把已经取得
+  的 640246 cycles 收益全部归给 C1，也不把约 1.28M idle 当作可免费消除的空间。
 
 ```powershell
 & 'D:/ESPNet/.venv/Scripts/python.exe' tools/export_exec_prefix_params.py `
-  --param hw_artifacts/binary2_int8_h240w240_gray_v4/PARAM.BIN `
-  --out-dir hw_artifacts/binary2_int8_h240w240_gray_v4/exec_prefix
+  --param hw_artifacts/binary2_int8_h240w240_gray_r6_v4/PARAM.BIN `
+  --out-dir hw_artifacts/binary2_int8_h240w240_gray_r6_v4/exec_prefix
 ```
 
 ### 10.3 Round 6：WinGen 减少无效搬运，保持行级 Conv DATAFLOW
 
 **范围：** `win_gen.cpp`、`npu_schedule.hpp`、`param_dma.cpp`；配套修改
 `export_int8_hw_blob.py`、`hw_param_replay.py`、`test_h240w240_gray_contract.py`。
-改动顺序固定为 C1 packed-row，再由 Round 5 的热点决定窄通道增量传输；不能一次扩至
-所有 mode 或重新写 generic WinGen。原 `scheduled_window_generator_row()` 仍是唯一主入口。
+改动顺序固定为 C1 packed-row，再做 C12/C25 窄通道增量传输；C17 同步归入同一个 assembler
+缓存 owner，以移除 loader 的旧 full-window 缓存，不新增独立 datapath。wide/1x1 保持不变，
+不重写 generic WinGen。原 `scheduled_window_generator_row()` 仍是唯一主入口。
 
-- [ ] C1 用编译器明确编码的 packed-row/stride2 KEEP1 协议替换当前 9 spatial-token
+- [x] C1 用编译器明确编码的 packed-row/stride2 KEEP1 协议替换当前 9 spatial-token
   路径。用三份小行缓存，每份 **8 个 256-bit words**；读入有效源行后直接组成每像素
   9 个有效 TK lanes，输出到原 act_stream0/1，其余 lanes 为 0。每个新输出行保留一行，
   只更新两行；整层最多 240x8=1920 个 aligned source-word 读取，不含 act FIFO token。
   这只是 WinGen 内部复用，不是 Conv/PPU 跨行 resident pipeline。
-- [ ] 严格处理 240-byte 行起点的 0/16-byte 相位：每行只取覆盖真实行的 8 个源字，局部
+- [x] 严格处理 240-byte 行起点的 0/16-byte 相位：每行只取覆盖真实行的 8 个源字，局部
   拼成标准行；末尾 16 bytes 清零，不改变全帧 NHWC、输入 DMA 或 FM row stride。
   最后一行不得预读第 1800 个输入字；边界行/列补零，out_row=0 无条件清缓存有效位，
   换 source/非连续 row 也失效。重复 MODE_RUN、prefix 后重新 INIT 都不能带入旧行。
-- [ ] 在 PARAM v4 现有 reserved schedule 字段内显式编码协议与 packed row count=8；
+- [x] 在 PARAM v4 现有 reserved schedule 字段内显式编码协议与 packed row count=8；
   不复用旧 C3 对齐假设，不按 cfg.shape 临时推断协议。INIT/compiler/replay 共用合法性
   约束，拒绝不支持的 flags/count；候选 artifact 单独命名并记录新 hardware_profile，
   保留本次 baseline。只重新编译 schedule，不改变 QAT、weights、qparams 或数学 golden。
-- [ ] 对确认为热点的 C12/C25 mode，改为只传编译 update columns 的增量 token，assembler
+- [x] C12/C17/C25 mode 改为只传编译 update columns 的增量 token，assembler
   单独拥有所需 slot cache，用现有固定段 composer 生成 4/8 个 K words；不再每像素重传
   9 个 spatial words。保留已有效的 C12/d1 incremental 路径；d2/4/8/16、paired phase、
   slot wrap 的 FIFO 生产/消费数必须由 exporter 审计。禁止宽 2304-bit window token、
   dynamic lane scatter、完整 runtime segment interpreter 或 loader/assembler 双写缓存。
-- [ ] 全面移除已替换 mode 的旧入口/分支，不让新旧 producer 同时进入 hierarchy。
+- [x] 全面移除已替换 mode 的旧入口/分支，不让新旧 producer 同时进入 hierarchy。
   运行轻量窗口边界/重入测试、structure check 和一次 fullres CSim：logits 0/1800、mask
-  0/57600 mismatch。然后交用户手动 csynth/package/实现，必要时同套 prefix 复测。
+  0/57600 mismatch，last_error=0；C1 连续两帧分别为 1920 次源字读取，非连续行重入与
+  narrow paired/odd-tail/slot-wrap 测试通过。结构和 Python contract 检查通过。
+- [x] 用户已手动完成 csynth、package、实现、平台/App build 与单图上板；clone/II、
+  物理时序及单图功能通过。原 <=3.10M Conv 性能 gate 尚未通过，见下一节实测。
+
+已上板目录为 `hw_artifacts/binary2_int8_h240w240_gray_r6_v4`，只改变 schedule word 9
+的 12 个字节，权重、qparams、输入、logits/mask golden 与首版逐字节一致。reserved[9]
+的 bits1:0 为 reuse、bits8:2 为 packed words、bits10:9 为 transfer；INIT 拒绝旧 narrow
+协议。首版 artifact 保留用于历史对比；当前 App/SD 已切到 R6，不与旧 IP/PARAM 混用。
+主 `hls_config.cfg` 不变。
+
+**2026-10-13 首次综合失败：** 55.505 秒即停在 source analysis，未进入 scheduling；
+`HLS 207-3325` 报出 `param_dma.cpp` 四处 `ap_uint<8> == enum` 歧义，不是搜索爆炸。
+已统一改成 `.to_uint() == static_cast<unsigned>(enum)`，不改变校验值、协议或数据流。
+新增回归测试先复现四处问题再通过；全部 14 个生产 CPP 已通过真实 HLS synthesis headers
+下的 frontend 检查，35 项 H240/App 测试通过。后续用户手动综合成功；本修复无需重新导出
+artifact。普通代码实施细节不再追加记录。
 
 **Gate：** 原 act/psum FIFO 和单套 SA/POST 不变，K-loop/emit/POST II=1，clone count=1。
-Conv 预算为 <=3.10M；若实测未达，不假装结束本轮，也不盲目增大 cache/强制大 loop II=1。
-先用 delta 定位仍占主导的 wide/1x1 或共同调用开销，再做同一 owner 内的局部修补。
+原 Conv 预算为 <=3.10M；实测未达，不宣称该性能 gate 通过，也不盲目增大 cache/强制
+大 loop II=1。现在优先按修订 Round 7 压非 Conv 开销；若需进一步改 Conv，先用 delta
+定位 wide/1x1 或共同调用开销，再做同一 owner 内的局部修补。
 
-### 10.4 Round 7：PPU/Vec 局部字级流水，Pool 只做小修
+#### 10.3.1 1014 Round 6 上板验收与归因
 
-**范围：** `ppu.cpp`、`vec_alu_engine.cpp`、`conv_store.cpp`、`avgpool_unit.cpp`；保持
-MainCtrl、Conv 调用图和 memory layout 不变，默认无需修改 PARAM 数学语义。
+App=`INT8-BOARD-20261014-P7-H240W240-GRAY-R6-B2`，平台=`platform_1014`。
+PARAM v4/75 UOP/16 EXEC 完整，Conv capability=1，MODE_RUN 正常结束，ERROR=0。
+ARM 为 **1948375/33333000=58.4518345 ms**，PL 为 **5845151/100MHz=58.451510 ms**，
+相差 0.325 us（5.55 ppm），计时可信；终端的 58 ms 是整数显示，不是精确延时。
+输入/输出/参数地址为 `0x2F440/0x3D540/0x4B640`，均 64-byte 对齐且不重叠。
 
-- [ ] compact writer 从 4-byte group 改为 8-byte pair 加 4/1-byte tail；使用固定切片、
-  小 carry、顺序字拼接，满 256-bit 再写，行 padding 保持 zero。覆盖 C12/C16/C17/C25/C28，
-  不加动态 256-bit lane scatter 或逐像素 RMW；通过后删除旧整组实现。
-- [ ] BLOCK5 与 Vec 的对齐 tile 路径缩短 read/transform/write 的调用/循环边界：先明确
-  实际 RAM 端口能力，再将可流水的局部固定数量 tile 服务收敛为单个有界 word loop。
-  source/residual 读取、一次 add/affine、一次提交按数据依赖推进；是否能 II=1 必须由
-  schedule/端口证据判断，禁止对共享 URAM 的整行调度强制 II=1。保持一套底层 add/affine/
-  store kernel，不能按 L2/L3、affine/add-affine 分别克隆。现有参数驻留保持，不重复加缓存。
-- [ ] Vec compact 的逆行遍历及读完一行再提交顺序不得打乱；BLOCK5 scratch/residual
-  先读后写语义不变，不能通过重排 tile 悄悄覆盖后续 source。局部寄存器只缓存在途 word，
-  不引入 current Conv output 中间 FM，不把 BLOCK5 finalizer 恢复成 Vec standalone。
-- [ ] AvgPool 仅将 group cache 中的纯算术/pack loop 局部流水；word write 若限制 II，
-  拆出该调用而不是展开 32 个像素或强行流水整个内存 loop。保持 signed round_div9、
-  两级 pool padding、跨行 pack 和 POOL2 尾字；该小修不能占用主线资源/综合预算。
-- [ ] 修改全部完成后做 static/deadlogic/singleton 扫描及一次 fullres CSim，确认同一
-  golden 全一致，再由用户手动综合/实现。PPU row/BLOCK5/Vec/Pool 分别以
-  <=0.40/0.62/0.46/0.20M 为预算；任一路出现回退先定位，不用 Conv 的收益掩盖回退。
+实读 SD 的 P2G/I2G 与 R6 artifact hash 一致；`E:/O2G.BIN` 为 57600 bytes，
+**0/57600 mismatch、invalid=0、c0=4105、c1=53495**。mask SHA256 仍为
+`88bc39cb00f9f6056d76ed85f74b69c86ff4808e6f868d40f6f4e6203ce426ce`，与首版及 R6 golden
+完全一致。该单图 PA/mIoU 仍为 97.8722%/87.2564%；不代表已完成 500 张板级验证，也不
+代表本次已单独读取板级 logits。
+
+| Stage | R6 cycles | ms @100MHz | 占比 | 相对首版 cycles |
+|---|---:|---:|---:|---:|
+| Conv row datapath | 3488868 | 34.88868 | 59.69% | -640246 |
+| PPU row（含上采样） | 528634 | 5.28634 | 9.04% | 0 |
+| BLOCK5 final | 893550 | 8.93550 | 15.29% | 0 |
+| Vec | 631133 | 6.31133 | 10.80% | 0 |
+| Pool | 253337 | 2.53337 | 4.33% | 0 |
+| 其他 | 49629 | 0.49629 | 0.85% | -71 |
+| **TOTAL** | **5845151** | **58.45151** | **100%** | **-640317（-9.87%）** |
+
+其他包括 IDLE=262、FRAME_LOAD=14028、MAIN_CTRL=923、WEIGHT_LOAD=34416；PARAM_INIT、
+UPSAMPLE_OUT、FRAME_STORE、ERROR 均为 0。Conv 减少 **15.51%**，其余四个计算 Stage
+完全未变，说明收益来自本轮 Conv 服务优化；不能把改善归给未修改的 PPU/Vec/Pool。
+
+| 并行 owner | 首版状态 cycles | R6 状态 cycles | 差值 |
+|---|---:|---:|---:|
+| WIN active | 2840704 | 2194248 | -646456 |
+| SA compute-or-wait | 269993 | 260640 | -9353 |
+| SA emit-or-wait | 2578031 | 1948368 | -629663 |
+| POST staging-or-wait | 546341 | 572277 | +25936 |
+| POST commit-or-wait | 2149380 | 1493781 | -655599 |
+
+R6 WIN/SA/POST idle 分别为 1294620/1279860/1422810，各 owner 状态总和都为 3488868。
+上述减少发生在同一并行窗口，不能相加；POST staging 增加也不能单独认定为量化回退。
+约 1.28M idle 仍存在，但未取得逐 EXEC 或启动/等待拆分，不能承诺全部消除。当前有效 Conv
+吞吐约 4.085 GMAC/s，仅占 102.4 GMAC/s 理论峰值约 3.99%；仍以片上服务/控制开销为
+优先方向，不据此声称已到 compute-bound 或已经测得 roofline ridge。
+
+综合用时 10m7s，LUT/FF/DSP/BRAM18K/URAM=361303/194376/1275/654/28，主循环 II=1、
+singleton 通过。实现 413601 个 routable nets 全部合法，100MHz 下 WNS=+0.876ns、
+WHS=+0.009ns、TNS/THS=0。placed logic/total LUT=213085/230632、FF=187186、
+BRAM tile=200.5、DSP=1296、URAM=28，较首版下降；但 CLB 使用率仍为 96.78%，不能因
+LUT 仅用约 68% 就假设可以任意复制 datapath。298 个 packaged/integrated RTL 文件 hash
+一致，平台 XSA/内嵌 bit 与实现输出一致。
+
+**结论：R6 架构、单图功能和物理实现通过，有确定性能收益；原 Conv 3.10M 与整网 <50ms
+均未达到。保留 R6 为新的安全回退点，进入调整后的 Round 7，不回退 WinGen，也不恢复 R5A。**
+
+### 10.4 Round 7：收敛 BLOCK5/Vec 服务开销，补上融合上采样
+
+**范围：** `ppu.cpp`、`vec_alu_engine.cpp`、`conv_store.cpp`、`upsample_unit.cpp`、
+`avgpool_unit.cpp`。MainCtrl/Conv 调用图、WinGen/SA/POST、memory layout 和 PARAM v4
+数学语义保持不变，沿用 R6 artifact/golden，不重新 QAT 或导出权重。执行顺序为 A/B/C，
+只在最后 D 做一次 fullres CSim；每项都必须删除被替换的旧路径。
+
+**A. 优先压 BLOCK5/Vec，不重复做已存在的 8-byte Vec pack。** R6 两个 Stage 合计
+1.524683M（26.08%）；源码与本轮局部报告显示 BLOCK5 emit_word 有独立 residual read、
+add/affine、store 调用，服务为 3..27 cycles；Vec inner tile 为 19..31 cycles。这些是
+具体局部服务证据，不把 generic 整网 max latency 换算成推理时间。
+
+- [x] `ppu_finalize_block5_emit_tiles/emit_word` 收敛为单个共享 word-service 入口，L2/L3
+  静态 composer 不变，只选当前 tile/qparam；每 word 先取 residual，按原顺序完成
+  **INT8 add 饱和，再 affine/ReLU**，最后通过唯一 conv_store tail 提交。当前
+  `ppu_apply_block_add_affine_word()` 已是逐 lane 融合，不能再把“融合 add+affine”当作
+  新改进；应缩短现有 4-lane group 的服务和 emit 调用边界，默认保持 unroll factor=4，
+  不全展开 32 lanes。BLOCK5 前置 branch-chain add 和 scratch compose 也计入 Stage 7，
+  必须保留前置 add 的 INT8 饱和及先读后写语义，不能为了省一遍处理直接删除。
+  无 residual 路径不增加空 add pass；保持一套 affine 算术，不按 pattern/mode 克隆。
+- [x] `run_fixed_affine_common()` 已有 resident qparam 和 8-byte pair pack，保留它们；
+  对 aligned 与 compact 的内部服务明确地址递推和实际有效 tile 上界，缩短多重 loop 的
+  进入/退出。保持同一个 affine call-site。compact 仍逆行处理，读完一行后再提交原
+  `s_shared_row_contig_words`，禁止边读边覆盖；aligned 的 cblock-major 顺序也不得随意换。
+  `memory.cpp` 的 RAM owner 不迁移；若确需新增小型地址 gateway，必须替换旧热点调用，
+  不能同时保留两个底层 datapath 或增加不明 underlying-object 的 context pointer。
+- [x] 先为实际 BRAM/URAM 数组列出每 word 的 read/write 占用；两个逻辑 bank 可能仍
+  共享物理 RAM，不据逻辑名字假定无冲突。有证据才流水有界算术/word loop，接受端口要求
+  的 II=2/3，不强制整行 II=1、不展开 2/4 个 tile 同时访存，不引入新跨行 DATAFLOW。
+  用局部真实 II、服务周期和单套 kernel 证明改进，而不是仅补 PIPELINE pragma；源码
+  端口约束已落实，实际 II/服务周期及物理 clone 数仍由本轮 csynth 核验。
+
+端口核对：FMEM0/1/2 共享 `memory.cpp` 的同一 URAM/BRAM 地址空间，SCR0 映射 pool
+临时区，SCR1 映射 pool1 的 BRAM alias；逻辑 bank 名不同不代表独立端口。保持串行访存：
+
+| 服务 | 物理共享存储访问上界/占用 | 局部流水边界 |
+|---|---|---|
+| BLOCK5 final word | residual 存在时读 1 字，最终写 1 字；无 residual 不读 | 仅 4-lane 算术的 8 个 group；系数为 4-bank 小 LUTRAM |
+| BLOCK5 四路 scratch | L2/L3 分别消费 52/103 bytes 每像素；四个滚动 cursor 顺序补字，每 cursor 每次最多读 1 字，另有行首预取 | 不并发发出四路读，不对整个 pixel/tile 强制 II=1 |
+| Vec source tile | 最多读 2 字处理未对齐 span；aligned 再写 1 字；compact 先完整缓存一行，再按字提交 | 16-lane 算术和已有 pair pack；共享 RAM 的大循环不流水 |
+| C1 Pool group | 三行 cache 最多读 9 字，每 32 个有效输出最多提交 1 字 | 纯缓存算术与 pack，提交调用隔离在 loop 外 |
+| 上采样 | corner 只读原有前/当前 logits 行；每 32 个输出 label 写 1 个 AXI 字 | 8 像素插值/pack，AXI 写在小 loop 外 |
+
+**B. PPU compact pack + 融合上采样，目标 PPU row <=0.35M。** Stage 6 同时包括普通
+compact store/cat-affine 与 U72 上采样，不能把 528634 cycles 全归给其中任一项。
+
+- [x] `ppu_consume_conv_stream()` 的 4-byte group 改为 8-byte pair 加 4/1-byte tail，
+  可借鉴 Vec 已有 pair append；固定切片、小 carry、顺序拼字，允许 pair 跨 32-byte
+  word 边界。覆盖 C12/C16/C17/C25/C28 和行尾 zero padding；保留错误时 drain stream，
+  不引入动态 lane scatter、hot RMW、第二套旧 packer 或共享 buffer 双写。
+- [x] `upsample_unit.cpp:interpolate_argmax_label/emit_fullres_rows` 当前逐输出像素重复
+  读取四个低分辨率 corner。对固定 8x 插值用少量 corner 寄存器，在 x0/x1 改变时才更新；
+  复用一组 corner 计算连续位置，不新增完整输出行或 logits 副本，不移出 PPU owner。
+  保持现有首/末 4 行处理、align_corners=False 坐标、跨行 256-bit 输出 pack 和 1800 字提交。
+  二分类可在证明精确等价后用 `(logit1-logit0)` 的插值符号做 argmax，差值/乘加仍用足够
+  signed 位宽且 0 必须选 class0；禁止先 argmax 再插值或省略中间精度语义。局部 loop
+  流水须证明 corner 端口与 AXI write 不冲突，不能恢复 Conv/PPU resident feedback。
+
+**C. Pool 只做有限算术/pack 小修，目标 <=0.20M。**
+
+- [x] 保留 C1 group cache，仅局部流水纯算术/pack，word write 若限制 II 则隔离调用；
+  不展开 32 像素、不给整个共享 memory loop 强制 II=1。signed round_div9、requant、
+  padding、跨行 pack 和 POOL2 尾字必须与现有 golden 一致。若资源/搜索代价不划算，
+  停止该小修，明确记录仍缺的 cycles，不把 2.533ms 的整个 Pool 当作可免费消除。
+
+**D. 一次统一验证与性能门槛。**
+
+- [x] A/B/C 完成后静态扫描 dead/legacy 和 singleton，检查 source single call-site、
+  buffer owner、读写依赖及 FIFO 数量；仅跑一次 H240 fullres CSim，logits 0/1800、mask
+  0/57600 mismatch、last_error=0。用户手动 csynth/实现；不能自动运行或改主 cfg。
+- [x] 1019 已完成单图板测：PPU row/Pool/Conv 不回退门槛通过；BLOCK5/Vec 原预算未通过，
+  整网 <50ms 未通过。保留已证明有效的小修，按 10.4.2/10.4.3 修订预算和后续任务，
+  不以降低模型、移除 counter、升频或复活 U71/R5A 绕过性能 gate。
+
+#### 10.4.1 1015 Round 7 综合检查：资源通过，compact pack 时序未通过
+
+检查本轮 `ESP_INT8_hls/ESP_INT8_hls/hls/syn/report`，报告时间为 2026-10-15
+15:46；源码修改早于本轮综合启动。综合完成，用时 **10m17s**，峰值内存 3.149GB，
+未出现搜索时间失控。H240 fullres CSim 已通过 logits 0/1800、mask 0/57600，ERROR=0。
+
+| 同级 HLS 资源 | R6 | Round 7 | 变化 |
+|---|---:|---:|---:|
+| LUT | 361303 | 353273 | -8030（-2.22%） |
+| FF | 194376 | 186761 | -7615（-3.92%） |
+| DSP | 1275 | 1266 | -9（-0.71%） |
+| BRAM18K | 654 | 661 | +7（+1.07%） |
+| URAM | 28 | 28 | 0 |
+
+资源增长门槛通过，但 HLS LUT 仍为器件容量的约 103.51%，不能据此保证物理实现。
+RTL 实例和 hierarchy 确认 Conv row engine、WinGen、SA、Conv POST、BLOCK5 final
+word service、Vec affine owner 各一套；SA 仍为 **1024 DSP**，profiling 输出完整。
+BLOCK5 `emit_word` 局部服务从 3..27 收敛到 **4..18 cycles**，4-lane 算术 8 个 group
+达到 II=1。Vec 新混合 tile/commit loop 报告 **11..29 cycles/iteration**，旧 tile loop
+为 19..31；新下限包含 commit 分支，不能当作每个 affine tile 的周期。这些仅是局部
+调度证据，不等于对应 Stage 按相同比例下降，更不能直接宣称已达到 <50ms。
+
+**阻塞项：** `ppu_consume_conv_stream()` 的 8-byte pair loop（当前 `ppu.cpp:540`）
+产生 **14.281ns** 估计周期，顶层估计 Fmax 降至 70.02MHz；报告 timing slack=-6.98ns。
+日志 `hls_compile.log:3124` 的 HLS 200-887/200-871/200-1016 明确定位到
+`remaining/pair_bytes -> carry/group_count -> 256-bit word mux -> ppu_write_compact_word`
+及 loop 回授，写 helper 在该组合路径上占约 5.498ns。虽报告 Final II=1、全部 loop
+constraints 满足，**100MHz 时序门槛仍未通过**。不能用总资源下降或 R6 实现曾收敛来
+忽略这一新增长路径；本版暂不推进实现。
+
+次要风险：HLS 214-366 将 `ppu_apply_add_word` 生成为两套（preadd 与 compact consumer
+两个调用路径），每套约 LUT5124/DSP8。主要 engine singleton 检查通过不代表所有 helper
+均只有一份；现有 checker 未将该 helper 纳入 clone gate。另有 task builder/SA/PPU 控制
+fanout 约 6.5k..8.5k，须继续在实现中核验，不因主循环 II=1 宣称 routing 风险消失。
+
+**下一轮最小修复：**
+
+1. 保留 8-byte pack 和现有数学行为，将完整字提交移出 pair loop。当前 compact layout
+   每像素最多 28 bytes，加上已有不足 32 bytes 的残留，每像素最多形成 1 个完整字；用
+   一个 pending word/valid 承接，pair loop 只更新小 carry/group 状态，结束后唯一 write
+   tail 提交。不新增整行缓存、DATAFLOW feedback 或第二套旧 packer。
+2. 缩短 `pair_bytes/group_count` 的控制回授；访存结果不得参与 pack loop 的同拍状态链。
+   若纯算术仍无法收敛，再做局部寄存/有界 II 调整并核算实际服务周期，不盲目强制 II=1，
+   也不把整个 pixel/memory loop 流水化。保留现有 BLOCK5/Vec/Pool/上采样收益。
+3. 检查上述 ADD 两个调用接口的 specialization 来源；只有能保持调用图简单和性能时才
+   合并，不借修 pack 时序恢复跨行大调度或用 ALLOCATION/Tcl 掩盖复制。复核 C12/16/17/
+   25/28、跨字 carry、尾字 padding、错误 drain 与完整 golden，再由用户手动综合。
+   验收：该 pack 的 timing violation 消失，按 10ns/2.7ns uncertainty 尽量回到约 7.3ns
+   的局部预算；资源不显著回退、单套 SA/engine 保持，局部服务与 FIFO 不引入新瓶颈。
+
+#### 10.4.2 1019 Round 7 上板结果：53.34364 ms，仍未达到 50 ms
+
+App=`INT8-BOARD-20261019-P7-H240W240-GRAY-R7-B2`，平台=`platform_h240_1019`。
+PARAM v4/75 UOP/16 EXEC，Conv capability=1；MODE_RUN 正常结束，ERROR=0。
+ARM 为 **1778112/33333000=53.3438934 ms**，PL 为 **5334364/100MHz=53.3436400 ms**，
+相差 0.253 us（4.75 ppm）。终端 53 ms 为整数显示，不能据此认为已接近到仅差 3 ms。
+
+实读 `E:/P2G.BIN`、`I2G.BIN` 与 R6 artifact 逐字节一致；`E:/O2G.BIN` 为 57600 bytes，
+**0/57600 mismatch、invalid=0、c0=4105、c1=53495**，SHA256 为
+`88bc39cb00f9f6056d76ed85f74b69c86ff4808e6f868d40f6f4e6203ce426ce`。
+该图 PA/mIoU 仍为 97.8722%/87.2564%；不代表已完成 500 张板测或已读取板级 logits。
+
+| Stage | R6 cycles | R7 cycles | R7 ms | R7 占比 | R7-R6 cycles |
+|---|---:|---:|---:|---:|---:|
+| Conv row datapath | 3488868 | 3418908 | 34.18908 | 64.09% | -69960 |
+| PPU row（含上采样） | 528634 | 289114 | 2.89114 | 5.42% | -239520 |
+| BLOCK5 final | 893550 | 773550 | 7.73550 | 14.50% | -120000 |
+| Vec | 631133 | 667534 | 6.67534 | 12.51% | **+36401** |
+| Pool | 253337 | 135617 | 1.35617 | 2.54% | -117720 |
+| 其他 | 49629 | 49641 | 0.49641 | 0.93% | +12 |
+| **TOTAL** | **5845151** | **5334364** | **53.34364** | **100%** | **-510787** |
+
+其他为 IDLE=258、FRAME_LOAD=14044、MAIN_CTRL=923、WEIGHT_LOAD=34416；其余 Stage=0。
+上采样和输出写入融合在 PPU row，Stage 10/11 为 0 不是遗漏这些工作。
+
+**Conv 不能按状态名误归因。** WIN active=2194248，SA compute-or-wait=260640、
+emit-or-wait=1948368，POST staging-or-wait=572277、commit-or-wait=1493781，全部与 R6
+相同；WIN/SA/POST idle 分别为 1224660/1209900/1352850，均比 R6 减少 69960。
+三个 owner 的状态总和各自等于 3418908，互相重叠，不能相加。此次 Conv 改善出现在共同
+idle/调用间隔，而不是更多 MAC 吞吐；尚不能细分到哪个 EXEC/控制边界。POST 两类仍含
+等待/量化/pack，不是独立的“纯写 RAM 时间”。没有带宽测量，不能宣称已达到 compute-bound。
+
+**本轮有效，但并未全面收尾：** PPU row 降低 45.31%、Pool 降低 46.47%，均达到原预算；
+BLOCK5 降低 13.43%，但未达到 0.45M；Vec 增加 5.77%，未达到 0.36M。HLS 新混合 loop
+11..29 cycles 含 commit 分支，不能与 R6 的纯 tile 19..31 cycles 直接比较后宣称提速。
+旧目标未完成，不整轮回退；R7 成为新的单图功能/物理实现安全基线。
+
+最新修复版 csynth 用时 9m38s，LUT/FF/DSP/BRAM18K/URAM=
+352400/186464/1266/661/28；100MHz 实现 WNS=+0.476ns、WHS=+0.007ns、TNS/THS=0，
+405935 个 routable nets 全部合法。placed logic/total LUT=212172/229889、FF=180278、
+BRAM tile=204、DSP=1291、URAM=28，CLB=41068/42660（96.27%）。资源不是任意增加并行
+datapath 的空间；后续应优先缩短串行服务和控制，不通过增加整行副本/核复制换性能。
+证据见 `D:/ESP_INT8_vp/ESP_INT8_vp.runs/impl_1/` 下的
+`ESP_INT8_wrapper_timing_summary_postroute_physopted.rpt`、`ESP_INT8_wrapper_route_status.rpt`
+及 `ESP_INT8_wrapper_utilization_placed.rpt`。
+
+#### 10.4.3 Round 7R：先消除 Vec 回退，再压 BLOCK5 服务
+
+沿用 10.1 的绝对约束。冻结已有效的 R6 WinGen、SA/POST、PPU compact pack、上采样和
+Pool；不重做 QAT/export，不改 PARAM v4、MainCtrl 边界或 counter。只改原模块内部，
+**不新建 resident DATAFLOW、反馈 FIFO、任务数组或 mode-specific affine datapath。**
+
+1. **Vec 先定位服务回退，再改控制。** 用当前 PARAM 的 U39/U71 descriptor，逐项列出
+   aligned/compact 的有效 tile 数、跨字 source read 数、pack 数、commit 字数、系数加载
+   次数，结合现有局部 schedule/RTL 状态计算加权服务开销；不能再用混合 loop 的 min/max
+   代替两个 EXEC 的实际成本。`run_fixed_affine_common()` 当前把 tile 和 commit 合到一个
+   service loop，每 tile 还携带多源选择、column/cblock 和 row 地址更新；这是需排查的
+   控制开销，不是已证明的唯一根因。优先将 aligned cblock 内恒定的 source bank/base/
+   count 选择、stride/边界校验提前到外层，收窄计数器，减少每次服务的重复决策，保留
+   一个 affine call-site 和共同 store tail。compact 仍逆行、完整读完一行再写，不删除
+   alias 保护。R6/R7 的 source reader 底层都依赖 `read_tile_packed_word()`，不能仅凭
+   gateway 改名断言多了一次物理读取；若改 aligned gateway，须证明端口/实际服务收益，
+   并复用唯一 RAM owner，不能恢复整套旧 Vec 路径。第一门槛是 Vec <=631133，后续预算
+   <=450000；仅恢复 R6 的 36401 cycles 还不足 50ms，严格达标仍缺 297964 cycles。
+2. **BLOCK5 按实际工作量压开销，不删必要 pass。** Stage 7 包括 branch-chain preadd、
+   scratch cursor/compose、qparam 装载、final residual/add/affine/store，先把四个 block
+   的调用/word/group 数分别加权，找出 773550 cycles 中哪个服务真正占主导。当前
+   `ppu_finalize_block5_static_row()` 每行重新校验布局、初始化 cursor、加载系数，再对
+   每像素顺序读四个 scratch source、组 2/4 个 tile、调用唯一 `emit_word`。优先去掉热
+   路径重复 descriptor/地址运算和小循环启动；能上提的布局校验与系数加载可在现有 PPU
+   owner 中使用一份小型上下文复用，必须有明确的 INIT/descriptor/行连续性失效条件，
+   不增加完整 FM/行副本。保留静态 L2/L3 composer、4-lane/8-group 算术和共用写尾；
+   scratch/残差/写回仍按真实共享 RAM 端口串行，禁止无依据地把四路读同时展开。
+   branch preadd 的 INT8 饱和及最终 residual-add→affine/ReLU 顺序不变，不将 preadd
+   静默吸收到 final affine，也不将 finalizer 迁回 Vec。目标 <=600000，须由局部加权
+   服务证明可行，不能用 `emit_word` max latency 的下降比例推算整个 Stage。
+3. **一次统一验证，保留退路。** 上述两个局部改动完成后清理替代路径和 deadlogic，
+   检查 singleton/端口/缓存重入；仅最后跑一次 H240 fullres CSim，mask 0/57600、logits
+   0/1800 mismatch、last_error=0，再交给用户手动 csynth。与 R7 同级资源及关键 II/局部
+   时序比较，不能以 HLS 总 max latency 决定性能；实现必须 100MHz 合法布线、setup/hold
+   均通过。上板按 10.5 验收，PPU row/Pool 不回退。若局部加权证据表明仍不足节省
+   334365 cycles，先明确缺口，再有针对性地补做 10.2 的 EXEC delta，定位同一 Conv
+   owner 内的剩余开销；不重启跨行 overlap 大改，不无条件要求先重复整套 prefix 实验。
+
+当前 PARAM 的固定工作量：U39 为 18000 个 affine tile、18000 次源字读取、14520 个提交字；
+U71 为 7200 个 tile/源字/提交字，两个 EXEC 均无跨字源读取。BLOCK5 final Stage 合计
+9000 个最后分支 preadd word、21600 个 final word（其中 10800 次 residual 读取）、
+36000 次 scratch cursor 服务；其他分支的链式 add 留在 PPU row Stage，不能重复计入。
+连续执行下，单份系数缓存将 BLOCK5 qparam block 装载从 480 次减为 12 次；这只是工作量
+变化，不代表已证明达到 0.60M Stage 预算或整网 <50ms。
+
+#### 10.4.4 Round 7R 综合检查与补修结果
+
+2026-10-19 前两轮报告已核对源码。16:48 版用时 9m33s，compact 有效提交从 R7 的
+11 cycles/word 回退为 12，因而拆开 tile/commit 两个循环。23:21 完成的短提交版本用时
+11m44s，仍无搜索失控。同级顶层比较如下，不与 Vivado placed 资源混比：
+
+| 指标 | 已上板 R7 | 16:48 R7R | 23:21 短提交版 |
+| --- | ---: | ---: | ---: |
+| LUT | 352400 | 353011 | 351652 |
+| FF | 186464 | 181800 | 180392 |
+| DSP / BRAM18K / URAM | 1266 / 661 / 28 | 1266 / 661 / 28 | 1266 / 661 / 28 |
+| HLS 估计周期 | 7.300ns | 7.300ns | 7.589ns |
+
+23:21 版 LUT/FF 相对 R7 降低 0.21%/3.26%。生成 RTL 实例树中的 Conv、WinGen、SA、POST、
+PPU consumer、BLOCK5 finalizer、Vec affine 及 commit pipeline 均各一份；SA 仍为
+1024 DSP，Vec 原行 BRAM 仍为 8 个 BRAM18K。未发现主计算核复制或新增行存储。
+
+**23:21 版方向有效，但当时暂缓实现。** `VEC_COMMIT_WORDS` 实际 II=2、目标 II=1，iteration
+latency=2，已显著缩短原每字串行提交，但没有通过门槛。顶层摘要虽写 all loop constraints
+satisfied，具体子报告及日志 `HLS 200-1470` 仍明确记录 II=2，不能据摘要宣称 II=1。
+同时新增 `HLS 200-871`：Vec 的 7.589ns 超过 10ns-2.7ns=7.300ns 有效预算 0.289ns；
+这不等于物理 100MHz 必然失败，但不应忽略新风险直接进入高代价 routing。
+
+根因证据在 `.autopilot/db/run_fixed_affine_common_Pipeline_VEC_COMMIT_WORDS.verbose.sched.rpt`
+及对应 RTL：第 1 拍读行 BRAM，第 2 拍完成 checked write 后，word/offset 才在
+write-success 条件下更新，形成跨两拍控制反馈。局部关键链为 BRAM Q（1.237ns）→
+写 gateway（5.498ns）→状态/游标寄存（0.427ns），父模块 commit 调用被报为 7.589ns。
+不是 SA、WinGen 或 BLOCK5 新增热点。
+
+下一补修只针对该链：在写前一次性验证行/通道块的目标 bank、首址、步长、末址及计数界限，
+保留无效请求拒绝与错误报告；解除正常 word/offset 迭代对每字 checked-write 返回值的
+反馈依赖，并对完成/错误状态形成明确寄存边界。仍只允许一个源读、一个 affine、一个
+共同全字写尾及原逆行 alias 保护，复用原行 BRAM，不放宽时钟、不删检查或改被冻结模块。
+下一报告须确认 II=1、无新增时钟预算 warning、singleton 与资源不回退。U39/U71 共
+21720 次提交，II=2→1 的纯吞吐差仅约 0.2172ms，不能将它宣传成整网 <50ms；仍须按
+tile、aligned staging、行启动及 BLOCK5 实际工作量加权，最终上板验收。
+
+BLOCK5 preadd 18..20 cycles、final tile 16..18 cycles 及系数缓存保持不变；不以局部
+iteration 或 HLS 总 latency 外推 Stage 7 <=600000 / Vec <=631133 已通过。
+
+**2026-10-20 最新检查：源码补修已通过综合门槛，可以进入实现。** 顶层报告生成于
+10-19 23:59:23，全部报告于 10-20 00:00 完成，综合约 10m01s、峰值内存 3.517GB。
+预处理源码包含末址验证与解除提交状态反馈的补修；`VEC_COMMIT_WORDS` 实际 II=1、
+depth=2、局部估计周期 6.735ns，Vec 为 7.093ns，顶层恢复 7.300ns；本轮无
+`HLS 200-871`、`HLS 200-880`，日志中的 target/final II 均无违反。
+
+最新顶层 LUT=352151、FF=180503、DSP=1269、BRAM18K=661、URAM=28。相对已上板 R7，
+LUT -249（-0.07%）、FF -5961（-3.20%）、DSP +3，存储不变；新增 DSP 位于 Vec 地址/
+跨度校验相关计算，SA 仍为 1024 DSP。RTL 实例树确认 Conv、WinGen、SA、POST、PPU
+consumer、BLOCK5 finalizer、Vec affine、commit pipeline 各一份，结构检查与报告审计通过。
+跨度验证仅执行前调用一次，延时 3 cycles、386 LUT、1 DSP，不在每字提交热循环中。
+
+**下一步先验证物理结果，不继续盲改。** HLS LUT 仍约 103%，已有 SA 控制高扇出及
+DATAFLOW 提示仍需关注；结合 R7 的 CLB96.27%，不能保证本轮 routing/setup/hold 必过。
+若合法布线且 100MHz setup/hold 通过，再上板核验 Vec/BLOCK5 与整网周期；II=1 仅证明
+提交吞吐修复，未证明 Vec <=631133、BLOCK5 <=600000 或整网 <50ms，不能用总 max
+latency 或局部 II 比例替代实测。
+
+**2026-10-20 实现与导出核查通过。** 全部 395696 条可绕线网络合法布线，错误为 0；
+100MHz 下 WNS=+0.163ns、WHS=+0.010ns，TNS/THS=0。Placed logic/total LUT 为
+208173/225886，FF174321、BRAM tile204、DSP1292、URAM28，CLB96.17%；相对 R7
+资源略降，但 setup 裕度从 +0.476ns 收窄，不能称时序改善。`platform_h240_1020` 的
+XSA/bitstream 与该实现 hash 一致，关键 Vec/BLOCK5 RTL 与本轮综合一致。App 已对齐
+R7R 单图 profiling，复用 R6 artifact；SD 参数/输入已核验，旧 BOOT/输出已移除。
+用户随后完成 App build 和本轮单图上板，结果见 10.4.5；该实现本身不证明 <50ms。
+
+#### 10.4.5 Round 7R 上板结果：50.97039 ms，Vec 回退已修复
+
+App=`INT8-BOARD-20261020-P7-H240W240-GRAY-R7R-B2`，平台=`platform_h240_1020`。
+PARAM v4/75 UOP/16 EXEC、240x240 灰度输入不变，Conv capability=1，ERROR=0。
+PL 为 **5097039 cycles = 50.9703900ms**；ARM 为
+**1699004/33333000 = 50.9706297ms**，两者相差 0.240us（4.70ppm）。终端的
+51ms 为整数显示，不能当作精确值，也不能四舍五入后宣称 <50ms。
+
+实读 SD 的 `P2G.BIN` / `I2G.BIN` 与 R6 artifact 逐字节一致；`O2G.BIN` 为 57600 bytes，
+与 frozen golden **0/57600 mismatch**，invalid=0、c0=4105、c1=53495，SHA256 为
+`88bc39cb00f9f6056d76ed85f74b69c86ff4808e6f868d40f6f4e6203ce426ce`。
+该同图输出与 R7 完全一致，沿用其 PA/mIoU=97.8722%/87.2564%；本轮未读取板级 logits，
+也未完成 500 张验证集或至少三次连续时延测试。
+
+| Stage | R7 cycles | R7R cycles | R7R ms | R7R 占比 | R7R-R7 cycles |
+|---|---:|---:|---:|---:|---:|
+| Conv row datapath | 3418908 | 3418908 | 34.18908 | 67.08% | 0 |
+| PPU row（含上采样） | 289114 | 289114 | 2.89114 | 5.67% | 0 |
+| BLOCK5 final | 773550 | 679846 | 6.79846 | 13.34% | -93704 |
+| Vec | 667534 | 523904 | 5.23904 | 10.28% | -143630 |
+| Pool | 135617 | 135617 | 1.35617 | 2.66% | 0 |
+| 其他 | 49641 | 49650 | 0.49650 | 0.97% | +9 |
+| **TOTAL** | **5334364** | **5097039** | **50.97039** | **100%** | **-237325** |
+
+其他为 IDLE=267、FRAME_LOAD=14044、MAIN_CTRL=923、WEIGHT_LOAD=34416，其余 Stage=0。
+Conv 内 WIN/SA/POST 各状态与 R7 逐项相同，三个 owner 总和各为 3418908，不能相加。
+本轮整网节省 **237325 cycles（2.37325ms，4.45%）**，可归因于 Vec 减少 21.52%、
+BLOCK5 减少 12.11%，未损失被冻结路径的性能。Vec 不仅消除了 R7 的回退，相比 R6
+631133 cycles 也减少 107229（16.99%）；第一门槛 Vec<=631133 已通过。
+但 Vec<=450000 与 BLOCK5<=600000 的工作预算尚差 73904/79846 cycles，不能整轮标记完成。
+现有 counter 仍不能把 BLOCK5 收益精确拆成系数缓存、preadd 和 final tail 的独立贡献，
+也不能把 POST wait 分类当纯 RAM 服务时间；本轮不据此宣称达到 compute-bound。
+
+**下一步沿用局部优化方向，不回退本轮、不重启跨行 overlap。** PL 严格 <50ms 至少还需
+节省 **97040 cycles（0.97040ms，当前总周期的 1.904%）**；ARM 也须独立满足 <50ms，
+因此不能只卡 PL 等号边界，应预留测量和调用开销裕度。保留当前单图功能/实现可用点，
+先按 10.4.3 分解 U39/U71 的剩余 Vec 服务与 BLOCK5 preadd/compose/final 服务，优先去掉
+重复控制/地址/小循环启动开销，维持 singleton、原 RAM owner、整数饱和顺序及 alias 保护。
+现有两个预算若均兑现且其他 Stage 不变，总周期为 4943289（49.43289ms）；这是条件预算，
+不是性能预测或已验收结果。继续优化仍须通过同级资源、100MHz 物理实现及完整输出门槛。
 
 ### 10.5 Round 8：最终验收与交付
 
-- [ ] 每次 csynth 对同级 baseline（LUT359869、FF198951、DSP1277、BRAM18K660、URAM28）
-  比较，重点查 SA=1024 DSP 和 singleton、新增 port conflict/II violation、高扇出及
+- [ ] 每次 csynth 优先对同级 R7（LUT352400、FF186464、DSP1266、BRAM18K661、URAM28）
+  比较，R6 保留为历史参考；重点查 SA=1024 DSP 和 singleton、新增 port conflict/II violation、高扇出及
   clone。超过 baseline 5% 必须解释来源后再决定实现；不能与 placed 数值交叉比较。
   综合超过首版 11m18s 的两倍时检查日志/CPU/报告进度，不按 warning 单独判死锁。
-- [ ] 100 MHz 物理验收必须 route error/overlap=0、WNS/WHS>=0；资源以上板 baseline 的
-  logic LUT219686、BRAM tile203.5 为参照。追求不回退，新增量必须证明必要；不能预设
+- [x] 本轮 100 MHz 物理验收通过：route error=0、WNS=+0.163ns、WHS=+0.010ns；资源以上板 R7 的
+  logic LUT212172、BRAM tile204、CLB96.27% 为参照。追求不回退，新增量必须证明必要；不能预设
   HLS 超资源会自动被 Vivado 拉回，也不能用升频代替 cycle 优化。
 - [ ] 回到 binary2 单图 full MODE_RUN，保留全部 counter，至少连续测 3 次；**每次
   RTL cycles <5000000，ARM 未取整延时也 <50 ms**，两种时钟换算一致，ERROR=0，
@@ -709,4 +1091,8 @@ MainCtrl、Conv 调用图和 memory layout 不变，默认无需修改 PARAM 数
   缓存污染、无跨图状态错误，输出保持 replay 一致。未过 gate 保留已上板基线，并把失败
   原因记录在本 workplan；普通实施细节不再逐条追加日志。
 
-**下一步先执行 Round 5 归因，再动 Round 6；本次仅更新计划，未修改硬件。**
+**当前：Round 7R 已通过 csynth、100MHz 实现及单图上板：50.97039ms、ERROR=0、板级 mask
+0/57600 mismatch，较 R7 节省 4.45%；R7 保留为历史退路。Vec 回退修复门槛通过，但 Vec/
+BLOCK5 后续预算、严格 <50ms、至少三次连续测量及 500 张板测仍未完成。此前 fullres CSim
+logits 0/1800、mask 0/57600，资源与 singleton 门槛通过；本轮记录未修改 HLS/App/脚本，
+PARAM/artifact、counter 及被冻结计算路径保持不变。下一步继续按 10.4.3/10.4.5 做局部收敛。**

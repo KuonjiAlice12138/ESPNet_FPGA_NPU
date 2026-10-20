@@ -130,6 +130,41 @@ static i32_t cached_c1_col(const act_vec_t cache[AVGPOOL_C1_CACHE_WORDS],
     return static_cast<i32_t>(value);
 }
 
+static void compute_c1_group_word(
+    const act_vec_t row0[AVGPOOL_C1_CACHE_WORDS],
+    const act_vec_t row1[AVGPOOL_C1_CACHE_WORDS],
+    const act_vec_t row2[AVGPOOL_C1_CACHE_WORDS],
+    u8_t byte0, u8_t left0, u8_t valid0,
+    u8_t byte1, u8_t left1, u8_t valid1,
+    u8_t byte2, u8_t left2, u8_t valid2,
+    const pool_q_t& qparam, int pixel_count, act_vec_t& packed) {
+#pragma HLS INLINE off
+    u8_t values[AVGPOOL_C1_GROUP_PIXELS];
+#pragma HLS ARRAY_PARTITION variable=values complete dim=1
+    for (int pix = 0; pix < AVGPOOL_C1_GROUP_PIXELS; ++pix) {
+#pragma HLS PIPELINE II=1
+        u8_t value = 0;
+        if (pix < pixel_count) {
+            i32_t sum = 0;
+            for (int kw = 0; kw < 3; ++kw) {
+#pragma HLS UNROLL
+                const int col = pix * 2 + kw;
+                sum += cached_c1_col(row0, byte0, left0, valid0, col) +
+                       cached_c1_col(row1, byte1, left1, valid1, col) +
+                       cached_c1_col(row2, byte2, left2, valid2, col);
+            }
+            const i8_t result = requant_pool_avg(round_div9(sum), qparam);
+            value.range(7, 0) = result.range(7, 0);
+        }
+        values[pix] = value;
+    }
+    packed = 0;
+    for (int pix = 0; pix < AVGPOOL_C1_GROUP_PIXELS; ++pix) {
+#pragma HLS UNROLL
+        packed.range(pix * 8 + 7, pix * 8) = values[pix];
+    }
+}
+
 static bool avgpool_unit_c1(const tensor_desc_t& src,
                             const tensor_desc_t& dst,
                             const pool_q_t& qparam) {
@@ -162,32 +197,36 @@ static bool avgpool_unit_c1(const tensor_desc_t& src,
                 !read_c1_group_cache_row(src, base_h + 2, base_w, row2, byte2, left2, valid2)) {
                 return false;
             }
+            const int remaining = static_cast<int>(dst.w.to_uint()) - ow_begin;
+            const int pixels = remaining < AVGPOOL_C1_GROUP_PIXELS
+                                   ? remaining : AVGPOOL_C1_GROUP_PIXELS;
+            act_vec_t group_word = 0;
+            compute_c1_group_word(row0, row1, row2,
+                                   byte0, left0, valid0, byte1, left1, valid1,
+                                   byte2, left2, valid2, qparam, pixels, group_word);
+            act_vec_t completed_word = 0;
+            bool completed = false;
             for (int pix = 0; pix < AVGPOOL_C1_GROUP_PIXELS; ++pix) {
-#pragma HLS PIPELINE off
-                if (ow_begin + pix >= static_cast<int>(dst.w.to_uint())) {
-                    break;
-                }
-                i32_t sum = 0;
-                for (int kw = 0; kw < 3; ++kw) {
-#pragma HLS UNROLL
-                    const int col = pix * 2 + kw;
-                    sum += cached_c1_col(row0, byte0, left0, valid0, col) +
-                           cached_c1_col(row1, byte1, left1, valid1, col) +
-                           cached_c1_col(row2, byte2, left2, valid2, col);
-                }
-                const i8_t value = requant_pool_avg(round_div9(sum), qparam);
-                // Packing persists across rows; only complete words touch memory.
+#pragma HLS PIPELINE II=1
+                if (pix >= pixels) { break; }
+                const u8_t value = group_word.range(7, 0);
+                group_word >>= 8;
+                // No shared-memory call in either small pipelined pixel loop.
                 out_word >>= 8;
-                out_word.range(255, 248) = static_cast<u8_t>(value);
+                out_word.range(255, 248) = value;
                 ++fill;
                 if (fill == AXI_WORD_BYTES) {
-                    if (!on_chip_memory_write_pool_bram_word(dst.bank_id, word_offset, out_word)) {
-                        return false;
-                    }
-                    word_offset += AXI_WORD_BYTES;
+                    completed_word = out_word;
+                    completed = true;
                     out_word = 0;
                     fill = 0;
                 }
+            }
+            if (completed) {
+                if (!on_chip_memory_write_pool_bram_word(dst.bank_id, word_offset, completed_word)) {
+                    return false;
+                }
+                word_offset += AXI_WORD_BYTES;
             }
         }
     }

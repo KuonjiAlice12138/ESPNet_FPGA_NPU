@@ -64,6 +64,10 @@ def function_body(source: str, name: str) -> str | None:
     if not match:
         return None
     open_pos = source.find("{", match.start())
+    return braced_body(source, open_pos)
+
+
+def braced_body(source: str, open_pos: int) -> str | None:
     depth = 0
     for pos in range(open_pos, len(source)):
         ch = source[pos]
@@ -654,20 +658,19 @@ def check_executor_gateways(
         "ppu_transform_conv_word",
         "ppu_write_compact_word",
         "ppu_apply_compact_affine_word",
-        "ppu_apply_block_affine_word",
-        "ppu_apply_block_add_affine_word",
+        "ppu_apply_block_word",
+        "ppu_load_block5_affine_bank",
         "ppu_init_block5_source_cursors",
         "ppu_read_block5_source_words",
         "ppu_compose_block5_l2_words",
         "ppu_compose_block5_l3_words",
-        "ppu_finalize_block5_emit_tiles",
+        "ppu_finalize_block5_emit_word",
         "ppu_finalize_block5_static_row",
     ):
         if function_body(ppu, token) is None:
             return fail(f"PPU-5 local datapath helper missing: {token}")
     for helper in (
-        "ppu_apply_block_affine_word",
-        "ppu_apply_block_add_affine_word",
+        "ppu_apply_block_word",
     ):
         helper_body = function_body(ppu, helper) or ""
         if "#pragma HLS UNROLL factor=4" not in helper_body:
@@ -691,6 +694,11 @@ def check_executor_gateways(
         "ppu_read_block5_compact_bytes",
         "ppu_read_block5_l2_source_words",
         "ppu_read_block5_l3_source_words",
+        "ppu_apply_block_affine_word",
+        "ppu_apply_block_add_affine_word",
+        "ppu_finalize_block5_emit_tiles",
+        "ppu_merge_compact_group",
+        "ppu_mask_compact_group",
     ):
         if function_body(ppu, token) is not None:
             return fail(f"PPU BLOCK5 runtime composer must not remain: {token}")
@@ -745,6 +753,21 @@ def check_executor_gateways(
     ):
         if count_call_sites(block5_row_body, helper) != 1:
             return fail(f"Round0717 BLOCK5 row owner must have one {helper} call site")
+    if "constexpr int PPU_BLOCK_LANES = 4" not in ppu:
+        return fail("H240 Round7 BLOCK5 arithmetic must retain four lanes")
+    block_apply = function_body(ppu, "ppu_apply_block_word") or ""
+    block_emit = function_body(ppu, "ppu_finalize_block5_emit_word") or ""
+    if count_call_sites(block_emit, "ppu_apply_block_word") != 1:
+        return fail("H240 Round7 BLOCK5 word service must use one arithmetic call site")
+    if count_call_sites(block_emit, "conv_store_write_row_contiguous_word") != 1:
+        return fail("H240 Round7 BLOCK5 word service must have one store tail")
+    if "param_dma_get_affine_qparam" in block_emit + block_apply:
+        return fail("H240 Round7 BLOCK5 word hot path must use the resident qparam bank")
+    if "add_i8(lhs, rhs, add_qparam)" not in block_apply:
+        return fail("H240 Round7 BLOCK5 residual add saturation boundary is missing")
+    for qbank in ("qmul", "qbias", "qshift"):
+        if f"variable={qbank} complete dim=1" not in block5_row_body:
+            return fail(f"H240 Round7 BLOCK5 {qbank} must be banked by arithmetic lane")
     if "vec_alu_apply_" in ppu:
         return fail("PPU-5 failed: ppu.cpp still calls or declares vec_alu_apply_*")
 
@@ -753,6 +776,10 @@ def check_executor_gateways(
         return fail("common fixed-affine path still calls generic vec_alu_apply_affine_only")
     if "vec_alu_apply_affine_block" not in fixed_affine_body:
         return fail("common fixed-affine path must use vec_alu_apply_affine_block")
+    if count_call_sites(fixed_affine_body, "conv_store_write_row_contiguous_word") != 1:
+        return fail("H240 Round7 Vec aligned/compact modes must share one store tail")
+    if "read_block_affine_source_tile" in vec_alu or "vec_can_use_aligned_full_tile" in vec_alu:
+        return fail("H240 Round7 Vec retains the replaced coordinate-address service")
     combined_vec_users = "\n".join([core, conv_engine, ppu, vec_alu])
     affine_block_lines = call_site_lines(combined_vec_users, "vec_alu_apply_affine_block")
     print("[MC-CHECK] AUDIT: Vec ALU arithmetic call-site audit:")
@@ -778,9 +805,11 @@ def check_executor_gateways(
     for token in (
         "vec_alu_load_affine_resident_bank",
         "i32_t qmul[TM][VEC_AFF_RESIDENT_BLOCKS]",
-        "const int c_blk = cblock_major ? outer : inner",
-        "const int h_i = cblock_major ? middle : row_h_i",
-        "const int w_i = cblock_major ? inner : middle",
+        "ap_uint<4> c_blk = cblock_major ? outer : 0",
+        "const int first_h = cblock_major ? 0 : row_h_i",
+        "tile_service_count",
+        "source_row0",
+        "vec_finish_compact_row",
     ):
         if token not in fixed_affine_body:
             return fail(f"Round4A resident-qparam/traversal structure missing: {token}")
@@ -789,6 +818,43 @@ def check_executor_gateways(
         return fail("Round4A fixed-affine hot loop is missing")
     if "param_dma_get_affine_qparam" in fixed_affine_body[outer_loop:]:
         return fail("Round4A affine qparam load remains inside the tile hot loop")
+    if count_call_sites(fixed_affine_body, "on_chip_memory_read_packed_span") != 1:
+        return fail("H240 Round7R Vec must have one physical source-reader call site")
+    source_selector = function_body(vec_alu, "vec_select_source_span") or ""
+    if not source_selector or "on_chip_memory_" in source_selector:
+        return fail("H240 Round7R source selector must only prepare scalar address metadata")
+    if "MAX_FM_H * MAX_FM_W + ROW_CONTIG_MAX_WORDS" in fixed_affine_body:
+        return fail("H240 Round7R Vec retains the oversized frame service loop")
+    stage_begin = fixed_affine_body.find("VEC_AFFINE_TILES:")
+    commit_begin = fixed_affine_body.find("VEC_COMMIT_WORDS:")
+    finish_begin = fixed_affine_body.find("if (row_contiguous && !vec_finish_compact_row(")
+    if not 0 <= stage_begin < finish_begin < commit_begin:
+        return fail("H240 Round7R Vec must finish row staging before its separate commit loop")
+    commit_body = fixed_affine_body[commit_begin:].split("aligned_row +=", 1)[0]
+    if "#pragma HLS PIPELINE II=1" not in commit_body or \
+       "for (ap_uint<9> word = 0; word < ROW_CONTIG_MAX_WORDS; ++word)" not in commit_body:
+        return fail("H240 Round7R Vec must use a bounded short word-commit pipeline")
+    if "s_shared_row_contig_words[tile.to_uint()] = out_packed;" not in fixed_affine_body or \
+       "commit_offset += commit_step;" not in commit_body:
+        return fail("H240 Round7R Vec must reuse one row buffer and an incremental write cursor")
+    span_begin = fixed_affine_body.find("conv_store_word_span_plan_ok(")
+    if span_begin < 0 or span_begin >= outer_loop or "const u64_t last_write_span" not in fixed_affine_body:
+        return fail("H240 Round7R Vec must prove the maximum destination span before execution")
+    if "(void)conv_store_write_row_contiguous_word(" not in commit_body or "return ERR_" in commit_body:
+        return fail("H240 Round7R Vec commit retains per-word status feedback")
+    span_plan = function_body(conv_store, "conv_store_word_span_plan_ok") or ""
+    if "const u64_t end_offset" not in span_plan or "on_chip_memory_" in span_plan:
+        return fail("H240 Round7R span proof must be scalar, overflow-safe and owned by conv_store")
+    for token in ("tile_service_count", "vec_select_source_span(",
+                  "vec_alu_apply_affine_block(", "vec_stage_compact_word(",
+                  "vec_finish_compact_row("):
+        if token in commit_body:
+            return fail(f"H240 Round7R Vec commit retains tile/pack control: {token}")
+    if "VEC_MAX_ROW_SERVICES" in vec_alu or "service_count = tile_service_count +" in fixed_affine_body:
+        return fail("H240 Round7R Vec retains the replaced mixed tile/commit loop")
+    if "affine_cache_generation == generation" not in block5_row_body or \
+       "affine_cache_next_row == abs_row" not in block5_row_body:
+        return fail("H240 Round7R BLOCK5 cache must reject PARAM reload/noncontiguous rows")
     affine_apply = function_body(vec_alu, "vec_alu_apply_affine_block") or ""
     affine_half = function_body(vec_alu, "vec_alu_apply_affine_half") or ""
     if "#pragma HLS INLINE" not in affine_apply:
@@ -864,14 +930,14 @@ def check_executor_gateways(
             return fail(f"PPU common compact-store tail missing bounded BLOCK5 layout: {token}")
     for token in (
         "ppu_consume_block5_final_row",
-        "ppu_finalize_block5_emit_tiles",
+        "ppu_finalize_block5_emit_word",
         "ppu_finalize_block5_static_row",
         "ppu_init_block5_source_cursors",
         "ppu_read_block5_source_words",
         "ppu_compose_block5_l2_words",
         "ppu_compose_block5_l3_words",
-        "ppu_apply_block_affine_word",
-        "ppu_apply_block_add_affine_word",
+        "ppu_apply_block_word",
+        "ppu_load_block5_affine_bank",
     ):
         if function_body(ppu, token) is None:
             return fail(f"PPU-5 fused BLOCK5 finalizer missing {token}")
@@ -895,7 +961,6 @@ def check_executor_gateways(
         )
 
     for token in (
-        "conv_store_write_aligned_tile",
         "conv_store_write_row_contiguous_word",
         "conv_store_row_contiguous_plan_ok",
     ):
@@ -912,7 +977,6 @@ def check_executor_gateways(
         if re.search(rf"\b{re.escape(low_level)}\s*\(", core):
             return fail(f"int8_core.cpp directly calls low-level store API: {low_level}")
     for token in (
-        "conv_store_write_aligned_tile",
         "conv_store_write_row_contiguous_word",
         "conv_store_row_contiguous_plan_ok",
     ):
@@ -965,6 +1029,14 @@ def check_p7_bans(sources: dict[str, str]) -> int:
     scratch = sources["scratch"]
     tb_text = sources["tb"]
     combined_hot = "\n".join([core, conv_engine, ppu, win_gen, param_dma, schedule, sources["config"], tb_text])
+    for token in ("conv_store_write_aligned_tile", "on_chip_memory_write_aligned_full_tile"):
+        if token in "\n".join([core, conv_engine, ppu, vec_alu, conv_store, memory]):
+            return fail(f"H240 Round7 retired aligned-store gateway remains: {token}")
+    span_body = function_body(memory, "on_chip_memory_read_packed_span") or ""
+    if count_call_sites(span_body, "read_tile_packed_word") != 1:
+        return fail("H240 Round7 address gateway must reuse the existing packed RAM reader")
+    if "on_chip_memory_write_input_axi_word" not in sources["frame_dma"]:
+        return fail("input DMA must retain its active input-write gateway")
 
     required_tokens = (
         (schedule, "struct conv_exec_desc_t", "missing conv_exec_desc_t"),
@@ -1214,196 +1286,136 @@ def check_csynth_hierarchy(report_root: Path) -> int:
 
 
 def check_round2_wingen_structure(win_gen: str, exporter: str) -> int:
-    banned = (
-        "find_cached_col",
-        "select_replacement_slot",
-        "update_3x3_column_cache",
-        "WINGEN_CACHE_COL_SLOTS][MAX_3X3_CACHE_CHUNKS",
-        "scheduled_narrow_3x3_window_row",
-        "scheduled_wide_3x3_window_row",
-        "prepare_narrow_issue_windows",
-        "update_wide_direct_cache",
-        "load_narrow_cache_column",
-        "load_wide_cache_column",
-        "s_narrow_col_tag",
-        "s_wide_col_tag",
-    )
-    for token in banned:
+    """Keep the bounded row DATAFLOW and compiled column-read contract."""
+    for token in (
+        "find_cached_col", "select_replacement_slot", "update_3x3_column_cache",
+        "scheduled_narrow_3x3_window_row", "scheduled_wide_3x3_window_row",
+        "s_narrow_col_tag", "s_wide_col_tag",
+    ):
         if token in win_gen:
-            return fail(f"Round2 WinGen legacy path remains: {token}")
-    required = (
-        "configure_window_row",
-        "window_row_loader",
-        "window_row_assembler",
-        "scheduled_3x3_window_row_pipeline",
-        "window_column_meta_t",
-        "window_load_word_t",
-        "narrow_3x3_window_t",
-        "s_narrow_row_bank0",
-        "s_narrow_row_bank1",
-        "s_narrow_row_bank2",
-        "window_row_assembler_read_narrow_window",
-    )
-    for token in required:
-        if token not in win_gen:
-            return fail(f"Round2 WinGen structure missing: {token}")
-
-    loader_body = function_body(win_gen, "window_row_loader") or ""
-    load_column_body = function_body(win_gen, "window_loader_emit_column") or ""
-    assembler_body = function_body(win_gen, "window_row_assembler") or ""
-    store_body = function_body(win_gen, "window_assembler_store_wide_word") or ""
-    pipeline_body = function_body(win_gen, "scheduled_3x3_window_row_pipeline") or ""
-    if "window_loader_emit_column" not in loader_body:
-        return fail("Round2 loader does not own the compiled column-read sequence")
-    if "read_packed_tile_from_row_cached" not in load_column_body:
-        return fail("Round2 loader bypasses the bounded packed-word reader")
-    if "s_wide_cache" in loader_body or "s_wide_cache" in load_column_body:
-        return fail("Round4B loader illegally accesses assembler-owned wide cache")
-    if "window_assembler_store_wide_word" not in assembler_body:
-        return fail("Round4B assembler does not own wide-cache updates")
-    if "s_wide_cache" not in store_body:
-        return fail("Round4B wide-cache store gateway is missing")
-    if "s_narrow_row_bank" in assembler_body or "s_narrow_row_bank" in store_body:
-        return fail("Round4B narrow row bank has more than one DATAFLOW owner")
-    if "on_chip_memory_read" in assembler_body or "on_chip_memory_read" in store_body:
-        return fail("Round2 assembler performs an illegal FMBUF read")
+            return fail(f"WinGen legacy runtime cache dispatch remains: {token}")
+    for name in (
+        "configure_window_row", "window_row_loader", "window_row_assembler",
+        "scheduled_3x3_window_row_pipeline", "window_loader_emit_delta_column",
+        "window_assembler_consume_delta_phase",
+    ):
+        if function_body(win_gen, name) is None:
+            return fail(f"Round6 WinGen function missing: {name}")
+    loader = function_body(win_gen, "window_row_loader") or ""
+    wide_load = function_body(win_gen, "window_loader_emit_column") or ""
+    delta_load = function_body(win_gen, "window_loader_emit_delta_column") or ""
+    assembler = function_body(win_gen, "window_row_assembler") or ""
+    wide_store = function_body(win_gen, "window_assembler_store_wide_word") or ""
+    delta_store = function_body(win_gen, "window_assembler_store_delta_word") or ""
+    for name in ("window_loader_emit_column", "window_loader_emit_delta_column"):
+        if name not in loader:
+            return fail(f"Compiled loader bypasses {name}")
+    for body in (wide_load, delta_load):
+        if "read_packed_tile_from_row_cached" not in body:
+            return fail("Column loader bypasses the bounded packed-word cursor")
+    if any(cache in loader + wide_load + delta_load for cache in ("s_wide_cache", "s_delta_cache")):
+        return fail("Loader illegally accesses assembler-owned window storage")
+    if "s_wide_cache" not in wide_store or "s_delta_cache" not in delta_store:
+        return fail("Assembler cache write gateways are incomplete")
+    if "on_chip_memory_read" in assembler + wide_store + delta_store:
+        return fail("Assembler performs an illegal FM-memory read")
+    pipeline = function_body(win_gen, "scheduled_3x3_window_row_pipeline") or ""
     for token in (
         "#pragma HLS DATAFLOW",
         "#pragma HLS STREAM variable=column_meta_stream depth=16",
         "#pragma HLS STREAM variable=load_word_stream depth=16",
-        "configure_window_row",
-        "window_row_loader",
-        "window_row_assembler",
+        "configure_window_row", "window_row_loader", "window_row_assembler",
     ):
-        if token not in pipeline_body:
-            return fail(f"Round2 bounded DATAFLOW region missing: {token}")
-
-    emit_body = function_body(win_gen, "emit_narrow_words_for_mode") or ""
-    if "s_narrow_cache_row" in emit_body:
-        return fail("narrow packer still reads the BRAM cache directly instead of the 9-word snapshot")
-    if "4 * dilation" not in exporter:
-        return fail("exporter does not compile dilation-aware cache_col_slots")
+        if token not in pipeline:
+            return fail(f"Bounded WinGen DATAFLOW missing: {token}")
     for token in (
-        "compile_window_loader_contract",
-        "loader_warmup_mask",
-        "loader_steady_mask",
+        "compile_window_loader_contract", "loader_warmup_mask",
+        "loader_steady_mask", "audit_window_transfer_contract",
+        "compile_window_transfer_protocol",
     ):
         if token not in exporter:
-            return fail(f"exporter is missing the Round2 loader contract: {token}")
+            return fail(f"Exporter transfer contract missing: {token}")
+    if "4 * dilation" not in exporter:
+        return fail("Exporter lacks dilation-aware cache slots")
     if "ARRAY_PARTITION variable=s_wide_cache.data complete dim=3" not in win_gen:
-        return fail("C131 wide cache is not banked by channel chunk")
+        return fail("Wide cache must remain banked by channel chunk")
     return 0
 
 
-def check_round0727_supply_structure(
-    win_gen: str,
-    memory: str,
-    conv_engine: str,
-) -> int:
-    """Gate H240 single-owner column rings and the bounded packed reader."""
+def check_round0727_supply_structure(win_gen: str, memory: str, conv_engine: str) -> int:
+    """Gate Round6 packed C1 and assembler-owned narrow deltas."""
     for legacy in (
-        "s_narrow_reuse_", "narrow_reuse_prepare_rows",
-        "read_packed_tile_from_reuse_row", "window_row_loader_narrow_reuse",
-        "c3_reuse_incremental", "stage_narrow_3x3_window_pair",
-        "s_narrow_cache_row", "on_chip_memory_read_packed_tile_from_row",
-        "build_staged_c3_word(", "build_staged_c19_word(", "build_staged_c131_word(",
+        "s_narrow_reuse_", "narrow_reuse_prepare_rows", "s_narrow_row_bank",
+        "narrow_row_bank_lane_read", "window_loader_update_narrow_run",
+        "window_loader_emit_narrow_cached_window", "window_row_loader_narrow_paired",
+        "window_row_loader_narrow_unpaired", "window_row_assembler_read_narrow_window",
+        "build_staged_c1_word(", "build_staged_c3_word(",
+        "build_staged_c19_word(", "build_staged_c131_word(",
     ):
         if legacy in win_gen:
-            return fail(f"H240 retired WinGen path remains: {legacy}")
-    for channels in (1, 17, 129):
+            return fail(f"Round6 retired WinGen path remains: {legacy}")
+    for channels in (12, 17, 25, 129):
         if function_body(win_gen, f"build_staged_c{channels}_word") is None:
-            return fail(f"H240 static C{channels} composer missing")
-    pipeline_body = function_body(win_gen, "scheduled_3x3_window_row_pipeline") or ""
-    top_loader = function_body(win_gen, "window_row_loader") or ""
-    narrow_loader = function_body(win_gen, "window_row_loader_narrow_paired") or ""
-    narrow_update = function_body(win_gen, "window_loader_update_narrow_run") or ""
-    narrow_emit = function_body(win_gen, "window_loader_emit_narrow_cached_window") or ""
-    bank_lane_read = function_body(win_gen, "narrow_row_bank_lane_read") or ""
-    if not all((pipeline_body, top_loader, narrow_loader, narrow_update, narrow_emit, bank_lane_read)):
-        return fail("H240 narrow column-ring hierarchy is incomplete")
-    for forbidden in ("window_loader_emit_column", "MAX_3X3_CACHE_CHUNKS", "column_meta_stream"):
-        if forbidden in narrow_loader:
-            return fail(f"H240 narrow loader carries wide/generic logic: {forbidden}")
-    for name in ("window_loader_update_narrow_run", "window_loader_emit_narrow_cached_window"):
-        if name not in narrow_loader:
-            return fail(f"H240 column-ring loader bypasses {name}")
-    if "s_narrow_row_bank" in (function_body(win_gen, "window_row_assembler") or ""):
-        return fail("H240 assembler illegally owns narrow BRAM")
-    for bank in ("s_narrow_row_bank0", "s_narrow_row_bank1", "s_narrow_row_bank2"):
-        if bank not in bank_lane_read:
-            return fail(f"H240 striped bank gateway missing: {bank}")
-    cached_read = function_body(win_gen, "read_packed_tile_from_row_cached") or ""
-    aligned_cache = function_body(win_gen, "read_aligned_word_cached") or ""
-    if "read_aligned_word_cached" not in cached_read:
-        return fail("H240 packed reader bypasses the bounded word cursor")
-    if "on_chip_memory_read_aligned_tensor_word" not in aligned_cache:
-        return fail("H240 word cursor bypasses the memory owner")
-    for name in ("window_row_loader_narrow_paired", "window_row_loader_narrow_unpaired",
-                 "window_row_loader_narrow_incremental_c12"):
-        if name not in top_loader:
-            return fail(f"H240 compiled narrow dispatch missing: {name}")
-    for bank in (
-        "s_narrow_row_bank0",
-        "s_narrow_row_bank1",
-        "s_narrow_row_bank2",
+            return fail(f"Static C{channels} composer missing")
+    c1 = function_body(win_gen, "scheduled_c1_packed_row") or ""
+    c1_load = function_body(win_gen, "c1_load_packed_source_row") or ""
+    entry = function_body(win_gen, "scheduled_window_generator_row") or ""
+    if not c1 or "scheduled_c1_packed_row" not in entry:
+        return fail("C1 packed-row path is not reached from the scheduled entry")
+    for token in (
+        "out_row != 0", "s_c1_last_row", "s_c1_source_base", "s_c1_source_bank",
+        "c1_load_packed_source_row<1>", "c1_load_packed_source_row<2>",
+        "act_stream0.write", "act_stream1.write",
+        "BIND_STORAGE variable=s_c1_rows type=ram_2p impl=lutram",
     ):
-        if not re.search(
-            rf"static\s+u64_t\s+{bank}\s*"
-            r"\[\s*WINGEN_NARROW_WORD_LANES\s*\]",
-            win_gen,
-        ):
-            return fail(
-                f"Round4B {bank} is not split into 64-bit physical stripes"
-            )
-        if (
-            f"ARRAY_PARTITION variable={bank} complete dim=1"
-            not in top_loader
-        ):
-            return fail(f"Round4B {bank} stripe dimension is not partitioned")
-        if (
-            f"BIND_STORAGE variable={bank} type=ram_1p impl=bram"
-            not in top_loader
-        ):
-            return fail(f"Round4B {bank} is not bound to single-port BRAM")
-        if (
-            f"BIND_STORAGE variable={bank} type=ram_2p"
-            in top_loader
-        ):
-            return fail(f"Round4B {bank} still uses the BRAM-expensive dual-port binding")
-    if "#pragma HLS STREAM variable=assembler_cfg_stream depth=3" not in pipeline_body:
-        return fail("Round4B assembler config FIFO must satisfy the HLS depth=3 guidance")
-    if (
-        "#pragma HLS BIND_STORAGE variable=assembler_cfg_stream "
-        "type=fifo impl=lutram"
-        not in pipeline_body
+        if token not in c1:
+            return fail(f"C1 KEEP1/reentry contract missing: {token}")
+    if "on_chip_memory_read_aligned_tensor_word" not in c1_load or ".range(255, 128) = 0" not in c1_load:
+        return fail("C1 raw-row reader must use aligned source words and clear local padding")
+    assembler = function_body(win_gen, "window_row_assembler") or ""
+    if "BIND_STORAGE variable=s_delta_cache.data type=ram_1p impl=bram" not in assembler:
+        return fail("Narrow delta cache must have one single-port BRAM owner")
+    if "ARRAY_PARTITION variable=s_delta_cache.data complete dim=1" not in assembler:
+        return fail("Narrow delta cache must be banked by kernel row")
+    if "window_assembler_consume_c12_incremental" not in assembler:
+        return fail("Existing C12 stride1/d1 fast path was lost")
+    if assembler.count("window_assembler_consume_delta_phase(") != 2:
+        return fail("Paired delta phases must be consumed and snapshotted in order")
+    phase = function_body(win_gen, "window_assembler_consume_delta_phase") or ""
+    for kw in range(3):
+        if f"window_assembler_snapshot_delta_column<{kw}>" not in phase:
+            return fail(f"Delta window lacks fixed column snapshot {kw}")
+    cursor = function_body(win_gen, "read_packed_tile_from_row_cached") or ""
+    aligned = function_body(win_gen, "read_aligned_word_cached") or ""
+    if "read_aligned_word_cached" not in cursor or "on_chip_memory_read_aligned_tensor_word" not in aligned:
+        return fail("Bounded packed reader bypasses the memory owner")
+    pipeline = function_body(win_gen, "scheduled_3x3_window_row_pipeline") or ""
+    for token in (
+        "#pragma HLS STREAM variable=assembler_cfg_stream depth=3",
+        "#pragma HLS BIND_STORAGE variable=assembler_cfg_stream type=fifo impl=lutram",
     ):
-        return fail("Round4B depth=3 assembler config FIFO must be forced to LUTRAM")
-
+        if token not in pipeline:
+            return fail(f"Assembler configuration FIFO contract missing: {token}")
     if function_body(memory, "on_chip_memory_read_aligned_tensor_word") is None:
-        return fail("Round0727 memory.cpp is missing the aligned tensor-word gateway")
-
-    post_body = function_body(conv_engine, "post_process_conv_row_to_buffer") or ""
-    if not re.search(r"POST_LANES_PER_CYCLE\s*=\s*16\s*;", post_body):
-        return fail("Round0910 postprocess is not matched to the 16-lane psum word")
+        return fail("Memory aligned tensor-word gateway is missing")
+    post = function_body(conv_engine, "post_process_conv_row_to_buffer") or ""
+    if not re.search(r"POST_LANES_PER_CYCLE\s*=\s*16\s*;", post):
+        return fail("POST must remain matched to its 16-lane psum word")
     return 0
 
 
-def check_round4r2_fallback_cfg(win_gen: str) -> int:
-    expected_cfg = {
-        "make_narrow_paired_issue_plan": "narrow_fallback_cfg_t",
-        "window_loader_update_narrow_run": "narrow_fallback_read_cfg_t",
-        "window_row_loader_narrow_paired": "narrow_fallback_cfg_t",
-        "window_row_loader_narrow_unpaired": "narrow_fallback_cfg_t",
-    }
-    for name, cfg_type in expected_cfg.items():
-        if not re.search(
-            rf"\b{name}\s*\(\s*const\s+{cfg_type}\s*&",
-            win_gen,
-        ):
-            return fail(f"Round4R-2 fallback still receives full row config: {name}")
-    loader_body = function_body(win_gen, "window_row_loader") or ""
-    if "make_narrow_fallback_cfg(cfg)" not in loader_body:
-        return fail("Round4R-2 fallback config must be created once at row dispatch")
+def check_round6_compiled_transfer_cfg(win_gen: str) -> int:
+    configure = function_body(win_gen, "configure_window_row") or ""
+    for token in (
+        "WINDOW_LOADER_ROW_REUSE_WORD", "WINDOW_TRANSFER_PROTOCOL_SHIFT",
+        "WINDOW_TRANSFER_PROTOCOL_MASK",
+    ):
+        if token not in configure:
+            return fail(f"WinGen dispatch must read the compiled protocol: {token}")
+    for legacy in ("select_narrow_transfer_protocol", "narrow_fallback_cfg_t",
+                   "narrow_fallback_read_cfg_t", "make_narrow_paired_issue_plan"):
+        if legacy in win_gen:
+            return fail(f"Runtime/legacy fallback control remains: {legacy}")
     return 0
 
 
@@ -1459,6 +1471,14 @@ def check_round4a_ppu_structure(ppu: str, conv_engine: str) -> int:
     for token in ("conv_stream.read()", "status ="):
         if token not in stream_consumer:
             return fail(f"fixed-rate streamed PPU contract missing {token}")
+    if count_call_sites(stream_consumer, "ppu_write_compact_word") != 1:
+        return fail("H240 compact consumer must share one full-word/tail memory commit")
+    for match in re.finditer(
+        r"\bfor\s*\([^{}]*\)\s*\{\s*#pragma HLS PIPELINE II=1\b", stream_consumer
+    ):
+        loop = braced_body(stream_consumer, stream_consumer.find("{", match.start())) or ""
+        if "ppu_write_compact_word(" in loop or "on_chip_memory_" in loop:
+            return fail("H240 compact pack pipeline must not contain a memory commit")
     if "return false" in stream_consumer or "return true" in stream_consumer:
         return fail("streamed PPU may not return before draining its fixed-rate input")
     for dynamic_shift in ("byte_base * 8U", "carry_bytes.to_uint() * 8U"):
@@ -1524,6 +1544,7 @@ def main() -> int:
         "param_dma": read(PARAM_DMA),
         "conv_store": read(CONV_STORE),
         "memory": read(MEMORY),
+        "frame_dma": read(SRC_DIR / "frame_dma.cpp"),
         "avgpool": read(AVGPOOL),
         "sa_core": read(SA_CORE),
         "upsample": read(UPSAMPLE),
@@ -1570,7 +1591,7 @@ def main() -> int:
         sources["conv_engine"],
     ) != 0:
         return 1
-    if check_round4r2_fallback_cfg(sources["win_gen"]) != 0:
+    if check_round6_compiled_transfer_cfg(sources["win_gen"]) != 0:
         return 1
     if check_round4r4_packed_reader(sources["memory"]) != 0:
         return 1

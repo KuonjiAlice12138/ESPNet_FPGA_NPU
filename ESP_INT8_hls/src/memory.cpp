@@ -389,6 +389,23 @@ bool on_chip_memory_read_packed_tile(const tensor_desc_t& desc,
     return read_tile_packed_word(desc.bank_id, word0_offset, byte0, read_count, packed);
 }
 
+bool on_chip_memory_read_packed_span(u8_t bank_id,
+                                      u32_t byte_offset,
+                                      u8_t byte_count,
+                                      axi_vec_t& packed) {
+#pragma HLS INLINE off
+#pragma HLS PIPELINE off
+    const unsigned count = byte_count.to_uint();
+    if (count == 0U || count > static_cast<unsigned>(AXI_WORD_BYTES)) {
+        packed = 0;
+        return false;
+    }
+    // One shared-RAM access when aligned, two when this small span straddles.
+    return read_tile_packed_word(
+        bank_id, byte_offset & static_cast<u32_t>(~(AXI_WORD_BYTES - 1)),
+        byte_offset.to_uint() & static_cast<unsigned>(AXI_WORD_BYTES - 1), count, packed);
+}
+
 bool on_chip_memory_read_aligned_full_tile(const tensor_desc_t& desc,
                                            i32_t h,
                                            i32_t w,
@@ -413,25 +430,6 @@ bool on_chip_memory_read_aligned_full_tile(const tensor_desc_t& desc,
         desc.base_offset +
         tensor_elem_offset(desc, static_cast<u16_t>(h), static_cast<u16_t>(w), c_begin);
     return read_bank_word(desc.bank_id, start_offset, packed);
-}
-
-bool on_chip_memory_write_aligned_full_tile(const tensor_desc_t& desc,
-                                            u16_t h,
-                                            u16_t w,
-                                            u16_t c_begin,
-                                            axi_vec_t packed) {
-#pragma HLS INLINE off
-#pragma HLS PIPELINE off
-    if (h >= desc.h || w >= desc.w ||
-        c_begin.to_uint() + static_cast<unsigned>(AXI_WORD_BYTES) > desc.c.to_uint()) {
-        return false;
-    }
-
-    const u32_t start_offset = desc.base_offset + tensor_elem_offset(desc, h, w, c_begin);
-    if ((start_offset.to_uint() & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U) {
-        return false;
-    }
-    return write_bank_word(desc.bank_id, start_offset, packed);
 }
 
 bool on_chip_memory_write_fmbuf_abs_word(u8_t bank_id,
