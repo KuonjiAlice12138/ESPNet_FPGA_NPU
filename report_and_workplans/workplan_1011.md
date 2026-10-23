@@ -1074,25 +1074,109 @@ BLOCK5 减少 12.11%，未损失被冻结路径的性能。Vec 不仅消除了 R
 现有两个预算若均兑现且其他 Stage 不变，总周期为 4943289（49.43289ms）；这是条件预算，
 不是性能预测或已验收结果。继续优化仍须通过同级资源、100MHz 物理实现及完整输出门槛。
 
+#### 10.4.6 Round 8 综合检查：资源下降，可以推进实现
+
+2026-10-21 顶层报告生成于 20:10:51，全部综合约 10m25s，峰值内存 3.762GB，未出现
+搜索失控。预处理源码已包含本轮 Vec 空循环跳过、窄状态/共同暂存写尾及 BLOCK5 有界整数
+算术，不是误读 R7R 旧报告。同级 HLS 资源比较如下：
+
+| 指标 | 已上板 R7R | 本轮 Round 8 | 变化 |
+|---|---:|---:|---:|
+| 顶层 LUT | 352151 | 343789 | -8362（-2.37%） |
+| 顶层 FF | 180503 | 178344 | -2159（-1.20%） |
+| DSP / BRAM18K / URAM | 1269 / 661 / 28 | 1269 / 661 / 28 | 不变 |
+| Vec affine LUT | 33399 | 29319 | -12.22% |
+| BLOCK5 finalizer LUT | 25376 | 21094 | -16.87% |
+
+Vec pair/tail/commit 的实际 II 均为 1；commit 仍为 depth=2、6.735ns。生成 RTL 已在
+pair/tail 无有效工作时跳过对应子模块调用，不只是源码条件成立。BLOCK5 算术子模块固定
+调用延时从 12 降为 11 cycles，final tile iteration 从 16..18 降为 15..17；局部估计周期
+从 7.131ns 降为 6.990ns。Vec 仍为 7.093ns，顶层仍为 7.300ns；没有新增时钟预算或 II
+违反 warning。逐层 RTL 实例计数确认 Conv、WinGen、SA、POST、PPU consumer、BLOCK5
+finalizer、Vec affine/commit 均各一份，SA=1024 DSP。结构检查通过，报告审计 0 blocker；
+已有 DATAFLOW/PIPELINE off 提示仍保留，不能把它们等同于本轮新增故障。
+
+本轮已有 fullres CSim：logits 0/1800、mask 0/57600 mismatch、last_error=0；有界整数
+算术 647318 个测试通过，alias/边界/系数缓存重载测试通过。**建议先推进 100MHz 实现，
+不再盲改。** HLS LUT 仍比器件容量高约 0.74%，R7R 物理 CLB 已达 96.17%，因此逻辑减少
+不等于 routing/setup/hold 必过；物理验收须依据本轮实现报告，不能沿用 R7R 的时序。
+
+性能方向有正向局部证据，但仍不能宣布 <50ms：BLOCK5 每次算术调用少 1 cycle，按 21600
+个 final word 仅对应约 0.216ms 的算术服务节省，不能替代整个 Stage 的实测；Vec 还须计入
+条件分发、pack 和共同写尾的实际开销。已上板基线仍为 50.97039ms。实现通过后再测整网与
+Vec/BLOCK5 Stage；至少 3 次连续满足 PL<5000000、ARM 未取整延时<50ms、ERROR=0 和
+输出 0 mismatch，才通过最终性能门槛。
+
+**2026-10-21 本轮实现验收通过。** post-route phys-opt 报告生成于 22:02:29，100MHz
+下 WNS=+0.585ns、WHS=+0.010ns，TNS/THS=0；389310 条可绕线网络全部合法布线，错误为 0。
+Placed logic/total LUT=203653/221366、FF=173049、BRAM tile=204、DSP=1292、URAM=28，
+CLB=40642/42660（95.27%）。相对 R7R，逻辑与 CLB 占用下降，setup 裕度提高，hold 不变。
+`platform_h240_1021` 的 XSA/bitstream 与本轮实现 hash 一致，已安装 Vec/BLOCK5 RTL 与
+Round 8 综合逐字节一致；地址及 counter 连线保持正确。该结果仅通过物理门槛，尚无本轮
+板级周期与输出结果，不据此宣称 <50ms。硬件文件 hash 与上板要求见 App `src/README.txt`。
+
+#### 10.4.7 Round 8 上板结果：单次实测 49.8544ms，突破 50ms
+
+App=`INT8-BOARD-20261021-P7-H240W240-GRAY-R8-B2`，平台=`platform_h240_1021`。
+240x240 灰度 binary2、PARAM v4/75 UOP/16 EXEC 保持不变，Conv capability=1，ERROR=0。
+PL 为 **4985440 cycles = 49.854400ms**；ARM 为
+**1661804/33333000 = 49.854618546ms**，两者相差 0.219us（4.38ppm）。终端显示的
+50ms 是整数四舍五入，不能据此认为仍未低于 50ms。本次 PL/ARM 均严格低于门槛，但
+PL 仅有 **14560 cycles（0.14560ms，门槛的 0.2912%）** 裕度，不能据一次结果宣称稳定达标。
+
+| Stage | R7R cycles | Round 8 cycles | Round 8 ms | 占比 | 变化 cycles |
+|---|---:|---:|---:|---:|---:|
+| Conv row datapath | 3418908 | 3418908 | 34.18908 | 68.58% | 0 |
+| PPU row（含上采样） | 289114 | 289114 | 2.89114 | 5.80% | 0 |
+| BLOCK5 final | 679846 | 658246 | 6.58246 | 13.20% | -21600 |
+| Vec | 523904 | 433904 | 4.33904 | 8.70% | -90000 |
+| Pool | 135617 | 135617 | 1.35617 | 2.72% | 0 |
+| 其他 | 49650 | 49651 | 0.49651 | 1.00% | +1 |
+| **TOTAL** | **5097039** | **4985440** | **49.85440** | **100%** | **-111599** |
+
+其他为 IDLE=275、FRAME_LOAD=14037、MAIN_CTRL=923、WEIGHT_LOAD=34416，其余 Stage=0。
+整网较 R7R 节省 **111599 cycles（1.11599ms，2.19%）**；Vec 减少 17.18%，BLOCK5 减少
+3.18%。BLOCK5 节省的 21600 cycles 与 21600 个 final word 每次算术调用缩短 1 cycle
+一致；Vec 收益是本轮控制/packing 局部改动的合计，不将其进一步拆成未经独立测量的贡献。
+Conv、PPU row、Pool 及 Conv 内 WIN/SA/POST 各状态计数与 R7R 完全相同，说明被冻结
+计算路径未出现周期回退。三个 Conv owner 各自总和均为 3418908，彼此重叠不能相加；
+SA emit/wait 和 POST staging/commit 仍含等待，不能据这些比例宣称已进入 compute-bound。
+
+实读 SD 核验：`P2G.BIN`（143040 bytes）、`I2G.BIN`（57600 bytes）的 SHA256 与 frozen
+R6 artifact 一致；`O2G.BIN` 为 57600 bytes，与 `golden_fullres_mask.bin`
+**0/57600 mismatch**，invalid=0、c0=4105、c1=53495，SHA256 为
+`88bc39cb00f9f6056d76ed85f74b69c86ff4808e6f868d40f6f4e6203ce426ce`。
+同图输出与 R7R/R7 一致，因此同图 PA/mIoU 仍为 97.8722%/87.2564%，不是本轮重新完成了
+整验证集评估。板级未导出 logits；此前 CSim 的 logits 0/1800 不能冒充板级验证结果。
+
+**下一步先验收，不继续盲改 HLS。** Vec<=450000 已通过；BLOCK5<=600000 仍差 58246
+cycles，作为后续工作预算保留，不误标完成，也不为追局部预算重新引入跨行 overlap 大改。
+先在相同平台、参数、输入和全部 counter 保留的条件下连续测试至少 3 次，记录 PL cycles、
+ARM ticks、ERROR 及输出一致性，确认每次 PL/ARM 均严格 <50ms；再执行 500 张验证集，
+核查跨图缓存状态与精度。当前单图功能/性能可用点应保留，完成上述门槛前不宣称最终交付。
+
 ### 10.5 Round 8：最终验收与交付
 
-- [ ] 每次 csynth 优先对同级 R7（LUT352400、FF186464、DSP1266、BRAM18K661、URAM28）
-  比较，R6 保留为历史参考；重点查 SA=1024 DSP 和 singleton、新增 port conflict/II violation、高扇出及
-  clone。超过 baseline 5% 必须解释来源后再决定实现；不能与 placed 数值交叉比较。
-  综合超过首版 11m18s 的两倍时检查日志/CPU/报告进度，不按 warning 单独判死锁。
-- [x] 本轮 100 MHz 物理验收通过：route error=0、WNS=+0.163ns、WHS=+0.010ns；资源以上板 R7 的
-  logic LUT212172、BRAM tile204、CLB96.27% 为参照。追求不回退，新增量必须证明必要；不能预设
-  HLS 超资源会自动被 Vivado 拉回，也不能用升频代替 cycle 优化。
-- [ ] 回到 binary2 单图 full MODE_RUN，保留全部 counter，至少连续测 3 次；**每次
+- [x] Round 8 同级综合审查通过，详见 10.4.6：资源下降，SA=1024 DSP，singleton 保持，
+  无新增时钟预算或 II 违反。本轮综合 10m25s，未出现搜索失控。后续每次仍须与同级 R7/R7R
+  报告比较，超过 baseline 5% 必须解释来源，不与 placed 数值混比；超过首版 11m18s 两倍
+  时依据日志/CPU/报告进度判断，不按 warning 单独判死锁。
+- [x] Round 8 已通过 100MHz 物理验收：route error=0、WNS=+0.585ns、WHS=+0.010ns；
+  logic LUT203653、BRAM tile204、CLB95.27%。以上板 R7R 的 WNS=+0.163ns、WHS=+0.010ns、
+  logic LUT208173、BRAM tile204、CLB96.17% 为基线，本轮未回退。频率保持 100MHz，
+  不能以时序裕度或资源下降代替板级 cycle 验收。
+- [x] Round 8 单次 binary2 full MODE_RUN：PL=49.854400ms、ARM=49.854618546ms，
+  ERROR=0，板级 mask 0/57600 mismatch；Vec<=450000 通过，BLOCK5<=600000 预算尚未达到。
+- [ ] 保留全部 counter，至少连续测 3 次；**每次
   RTL cycles <5000000，ARM 未取整延时也 <50 ms**，两种时钟换算一致，ERROR=0，
-  输出 0 mismatch，才宣称
-  <50 ms。保持 SD/INIT/cache/UART 不计入，不删 counter 获得不可比的数字。
+  输出 0 mismatch，才通过稳定 <50ms 的验收。保持 SD/INIT/cache/UART 不计入，
+  不删 counter 获得不可比的数字。
 - [ ] 最后完成第 6.2 节的 500 张板级精度/延时验证，首张与本次输入相同；确认无旧行
   缓存污染、无跨图状态错误，输出保持 replay 一致。未过 gate 保留已上板基线，并把失败
   原因记录在本 workplan；普通实施细节不再逐条追加日志。
 
-**当前：Round 7R 已通过 csynth、100MHz 实现及单图上板：50.97039ms、ERROR=0、板级 mask
-0/57600 mismatch，较 R7 节省 4.45%；R7 保留为历史退路。Vec 回退修复门槛通过，但 Vec/
-BLOCK5 后续预算、严格 <50ms、至少三次连续测量及 500 张板测仍未完成。此前 fullres CSim
-logits 0/1800、mask 0/57600，资源与 singleton 门槛通过；本轮记录未修改 HLS/App/脚本，
-PARAM/artifact、counter 及被冻结计算路径保持不变。下一步继续按 10.4.3/10.4.5 做局部收敛。**
+**当前：Round 8 已通过 fullres CSim、资源/singleton/关键 II 综合门槛、100MHz 物理实现，
+以及单次板级性能/输出核验：49.8544ms、ERROR=0、mask 0/57600 mismatch，较 R7R 提升
+2.19%。Vec 工作预算已通过；BLOCK5 工作预算、至少三次连续测量及 500 张板测仍未完成。
+已上板退路为 H240W240-1020 的 Round 7R。用户已手动完成 App build 与本次板测，
+PARAM/artifact、counter 及被冻结路径保持不变；下一步先补验收，本次仅更新 workplan。**

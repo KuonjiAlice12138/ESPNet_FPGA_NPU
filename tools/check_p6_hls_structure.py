@@ -763,8 +763,10 @@ def check_executor_gateways(
         return fail("H240 Round7 BLOCK5 word service must have one store tail")
     if "param_dma_get_affine_qparam" in block_emit + block_apply:
         return fail("H240 Round7 BLOCK5 word hot path must use the resident qparam bank")
-    if "add_i8(lhs, rhs, add_qparam)" not in block_apply:
+    if "add_i8_bounded(lhs, rhs, add_qparam)" not in block_apply:
         return fail("H240 Round7 BLOCK5 residual add saturation boundary is missing")
+    if "affine_i8_to_i8_bounded(" not in block_apply:
+        return fail("H240 Round8 BLOCK5 must use the exact bounded affine primitive")
     for qbank in ("qmul", "qbias", "qshift"):
         if f"variable={qbank} complete dim=1" not in block5_row_body:
             return fail(f"H240 Round7 BLOCK5 {qbank} must be banked by arithmetic lane")
@@ -852,6 +854,18 @@ def check_executor_gateways(
             return fail(f"H240 Round7R Vec commit retains tile/pack control: {token}")
     if "VEC_MAX_ROW_SERVICES" in vec_alu or "service_count = tile_service_count +" in fixed_affine_body:
         return fail("H240 Round7R Vec retains the replaced mixed tile/commit loop")
+    compact_stage = function_body(vec_alu, "vec_stage_compact_word") or ""
+    if "if (pair_count != 0U)" not in compact_stage or "if (tail_count != 0U)" not in compact_stage:
+        return fail("H240 Round8 Vec must bypass empty pair/tail pipeline calls")
+    if compact_stage.count("s_shared_row_contig_words[") != 1 or "if (pending_valid)" not in compact_stage:
+        return fail("H240 Round8 Vec packetizer must have one local staging write tail")
+    pack_loops, staging_tail = compact_stage.split("if (pending_valid)", 1)
+    if "s_shared_row_contig_words[" in pack_loops or "word_index.to_uint() >= row_word_count" not in staging_tail:
+        return fail("H240 Round8 Vec pack loops must be memory-free with a checked staging tail")
+    for token in ("ap_uint<2> packed_carry_bytes", "ap_uint<3> packed_group_slot",
+                  "ap_uint<9> packed_word_idx", "u32_t packed_carry"):
+        if token not in fixed_affine_body:
+            return fail(f"H240 Round8 Vec bounded packetizer state missing: {token}")
     if "affine_cache_generation == generation" not in block5_row_body or \
        "affine_cache_next_row == abs_row" not in block5_row_body:
         return fail("H240 Round7R BLOCK5 cache must reject PARAM reload/noncontiguous rows")
@@ -867,8 +881,10 @@ def check_executor_gateways(
         return fail("Round4A affine half loop is not pipelined at II=1")
     if "vec_alu_apply_affine_half" not in affine_apply:
         return fail("Round4A affine block does not use the 16-lane half primitive")
-    if "vec_affine_i8_to_i8_narrow" not in affine_half:
+    if "affine_i8_to_i8_bounded(" not in affine_half:
         return fail("Round4A affine half still carries the generic 64-bit requant datapath")
+    if "vec_round_shift_affine_narrow" in vec_alu or "vec_affine_i8_to_i8_narrow" in vec_alu:
+        return fail("H240 Round8 Vec retains the replaced local rounding implementation")
     if "vec_alu_apply_affine_group" in vec_alu:
         return fail("Round4A legacy 8-lane affine group helper remains")
     if re.search(r"valid_c[^\n]*(?:==|!=)[^\n]*(?:131|256)", fixed_affine_body):

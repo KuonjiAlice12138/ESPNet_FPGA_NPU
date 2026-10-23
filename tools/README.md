@@ -6,9 +6,9 @@ Model training and hardware-constrained QAT tools live in `D:/ESPNet`.
 
 ## Artifact Contract
 
-Round 6/7 HLS uses `hw_artifacts/binary2_int8_h240w240_gray_r6_v4`.
+Round 6/7/8 HLS uses `hw_artifacts/binary2_int8_h240w240_gray_r6_v4`.
 The initial board release remains `hw_artifacts/binary2_int8_h240w240_gray_v4`;
-its PARAM must not be used with Round 6/7 HLS. The v4 record layout is unchanged,
+its PARAM must not be used with Round 6/7/8 HLS. The v4 record layout is unchanged,
 but schedule word 9 now explicitly selects C1 packed-row reuse and narrow-channel
 column transfer. Round 6 INIT rejects the retired narrow transfer protocol.
 Weights, qparams, input and numerical golden remain identical to the baseline.
@@ -20,9 +20,9 @@ pool tensors remain tightly packed.
 
 The Python tools can still inspect the preserved H256W512 binary2/cityscapes20
 releases. Those artifacts are **not compatible with the current H240/C1 HLS IP**,
-despite both using PARAM v4. The App selects Round 7R `platform_h240_1020` and runs
+despite both using PARAM v4. The App selects Round 8 `platform_h240_1021` and runs
 the H240 grayscale single image using `P2G.BIN` / `I2G.BIN` / `O2G.BIN`.
-Round 7R reuses the Round 6 artifact without re-exporting or changing golden data.
+Round 8 reuses the Round 6 artifact without re-exporting or changing golden data.
 Rebuild App manually after aligning its platform configuration. SD boot also requires a newly packaged
 `BOOT.BIN`; `ESP_INT8_app/src/boot_h240.bif` fixes the platform/bitstream/ELF paths.
 

@@ -102,6 +102,76 @@ static std::int8_t as_i8(std::uint8_t value) {
   return static_cast<std::int8_t>(value);
 }
 
+static bool check_bounded_int8_math() {
+  using namespace esp_int8;
+  const std::int32_t coeffs[] = {-2147483647 - 1, -65537, -1, 0, 1, 65537, 2147483647};
+  const std::int32_t biases[] = {-2147483647 - 1, -1, 0, 1, 2147483647};
+  const int edges[] = {-128, -127, -65, -1, 0, 1, 63, 126, 127};
+  unsigned cases = 0;
+  for (int value = -128; value <= 127; ++value) {
+    for (std::int32_t mul : coeffs) {
+      for (std::int32_t bias : biases) {
+        for (unsigned shift = 0; shift <= 31; ++shift) {
+          for (unsigned act = 0; act < 2; ++act) {
+            const i8_t got = affine_i8_to_i8_bounded(static_cast<i8_t>(value),
+                static_cast<i32_t>(mul), static_cast<i32_t>(bias),
+                static_cast<u8_t>(shift), static_cast<u8_t>(act));
+            const i8_t expected = affine_i8_to_i8(static_cast<i8_t>(value),
+                static_cast<i32_t>(mul), static_cast<i32_t>(bias),
+                static_cast<u8_t>(shift), static_cast<u8_t>(act));
+            if (got != expected) {
+              std::printf("[FAIL] bounded affine value=%d mul=%d bias=%d shift=%u act=%u\n",
+                          value, mul, bias, shift, act);
+              return false;
+            }
+            ++cases;
+          }
+        }
+      }
+    }
+  }
+  for (int lhs : edges) {
+    for (int rhs : edges) {
+      for (std::int32_t mul : coeffs) {
+        for (unsigned shift = 0; shift <= 31; ++shift) {
+          for (unsigned mode = 0; mode < 4; ++mode) {
+            add_q_t q = add_q_t();
+            q.mult = mul;
+            q.shift = shift;
+            q.requant_bypass = mode & 1U;
+            q.act_type = (mode >> 1U) & 1U;
+            if (add_i8_bounded(static_cast<i8_t>(lhs), static_cast<i8_t>(rhs), q) !=
+                add_i8(static_cast<i8_t>(lhs), static_cast<i8_t>(rhs), q)) {
+              std::printf("[FAIL] bounded add lhs=%d rhs=%d mul=%d shift=%u mode=%u\n",
+                          lhs, rhs, mul, shift, mode);
+              return false;
+            }
+            ++cases;
+          }
+        }
+      }
+    }
+  }
+  for (unsigned shift = 1; shift <= 31; ++shift) {
+    const std::int64_t unit = std::int64_t(1) << shift;
+    for (int multiple = -3; multiple <= 3; ++multiple) {
+      for (int delta = -1; delta <= 1; ++delta) {
+        const std::int64_t value = multiple * unit + unit / 2 + delta;
+        const i32_t expected = round_shift(static_cast<i64_t>(value), static_cast<u8_t>(shift));
+        if (round_shift_bounded<40>(static_cast<ap_int<40>>(value), static_cast<u8_t>(shift)) != expected ||
+            round_shift_bounded<41>(static_cast<ap_int<41>>(value), static_cast<u8_t>(shift)) != expected) {
+          std::printf("[FAIL] bounded rounding half-tie shift=%u multiple=%d delta=%d\n",
+                      shift, multiple, delta);
+          return false;
+        }
+        cases += 2;
+      }
+    }
+  }
+  std::printf("[PASS] bounded INT8 math: %u signed/half-tie/shift/INT32-wrap/add-boundary cases\n", cases);
+  return true;
+}
+
 static bool check_vec_span_plans() {
   using namespace esp_int8;
   struct SpanCase { unsigned bank; std::uint64_t first; unsigned step; unsigned count; bool valid; };
@@ -708,7 +778,8 @@ static void count_labels(const std::vector<std::uint8_t>& bytes,
 int main() {
   static constexpr int MAX_ALLOWED_MASK_MISMATCHES = 0;
   static_assert(ESP_INT8_CSIM_CLASS_COUNT == 2, "H240 grayscale release is binary2");
-  if (!check_compact_packing() || !check_binary_interpolation() || !check_vec_span_plans()) { return 1; }
+  if (!check_bounded_int8_math() || !check_compact_packing() ||
+      !check_binary_interpolation() || !check_vec_span_plans()) { return 1; }
   const char* artifact_dir = "D:/ESP_INT8/hw_artifacts/binary2_int8_h240w240_gray_r6_v4";
   if (const char* selected = std::getenv("ESP_INT8_CSIM_ARTIFACT_DIR")) {
     artifact_dir = selected;

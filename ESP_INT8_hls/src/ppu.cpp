@@ -836,8 +836,8 @@ static void ppu_apply_block_word(
       lhs.range(7, 0) = lhs_cursor.range(lane * 8 + 7, lane * 8);
       rhs.range(7, 0) = rhs_cursor.range(lane * 8 + 7, lane * 8);
       // Saturation at the add boundary is part of the exported INT8 contract.
-      const i8_t value = has_residual ? add_i8(lhs, rhs, add_qparam) : lhs;
-      const i8_t transformed = affine_i8_to_i8(
+      const i8_t value = has_residual ? add_i8_bounded(lhs, rhs, add_qparam) : lhs;
+      const i8_t transformed = affine_i8_to_i8_bounded(
           value, qmul[lane][index], qbias[lane][index], qshift[lane][index], act_type);
       result.range(lane * 8 + 7, lane * 8) = transformed.range(7, 0);
     }

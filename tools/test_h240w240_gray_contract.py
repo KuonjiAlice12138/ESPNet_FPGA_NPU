@@ -428,6 +428,59 @@ class GrayRound7RSourceTests(unittest.TestCase):
         self.assertIn("ppu_apply_add_word(", preadd)
 
 
+class GrayRound8SourceTests(unittest.TestCase):
+    root = Path(__file__).resolve().parents[1] / "ESP_INT8_hls"
+
+    def test_vec_skips_empty_pack_loops_and_has_one_staging_tail(self):
+        source = (self.root / "src/vec_alu_engine.cpp").read_text(encoding="utf-8-sig")
+        stage = structure.function_body(source, "vec_stage_compact_word")
+        self.assertIn("if (pair_count != 0U)", stage)
+        self.assertIn("if (tail_count != 0U)", stage)
+        self.assertIn("VEC_PACK_PAIRS:", stage)
+        self.assertIn("VEC_PACK_TAIL:", stage)
+        self.assertEqual(stage.count("s_shared_row_contig_words["), 1)
+        loops, tail = stage.split("if (pending_valid)", 1)
+        self.assertNotIn("s_shared_row_contig_words[", loops)
+        self.assertIn("word_index.to_uint() >= row_word_count", tail)
+        self.assertIn("pending_word", tail)
+        self.assertNotIn("on_chip_memory_", stage)
+
+    def test_vec_pack_state_uses_proven_small_ranges(self):
+        source = (self.root / "src/vec_alu_engine.cpp").read_text(encoding="utf-8-sig")
+        self.assertIn("ap_uint<2> packed_carry_bytes", source)
+        self.assertIn("ap_uint<3> packed_group_slot", source)
+        self.assertIn("ap_uint<9> packed_word_idx", source)
+        self.assertIn("u32_t packed_carry", source)
+        self.assertNotIn("unsigned packed_group_slot", source)
+        self.assertNotIn("unsigned packed_word_idx", source)
+
+    def test_vec_and_block5_share_exact_bounded_rounding(self):
+        q = (self.root / "include/npu_q.hpp").read_text(encoding="utf-8-sig")
+        vec = (self.root / "src/vec_alu_engine.cpp").read_text(encoding="utf-8-sig")
+        ppu = (self.root / "src/ppu.cpp").read_text(encoding="utf-8-sig")
+        rounding = structure.function_body(q, "round_shift_bounded") or ""
+        self.assertIn("ap_int<Width + 1>", rounding)
+        self.assertIn("static_cast<i32_t>", rounding)
+        self.assertNotIn("i64_t", rounding)
+        self.assertIn("round_shift_bounded<40>", q)
+        self.assertIn("round_shift_bounded<41>", q)
+        self.assertIn("affine_i8_to_i8_bounded(",
+                      structure.function_body(vec, "vec_alu_apply_affine_half"))
+        block = structure.function_body(ppu, "ppu_apply_block_word")
+        self.assertIn("add_i8_bounded(lhs, rhs, add_qparam)", block)
+        self.assertIn("affine_i8_to_i8_bounded(", block)
+        self.assertIn("#pragma HLS PIPELINE II=1", block)
+        for retired in ("vec_round_shift_affine_narrow", "vec_affine_i8_to_i8_narrow",
+                        "vec_aff_round_t", "vec_aff_acc_t"):
+            self.assertNotIn(retired, vec)
+
+    def test_round8_validation_runs_only_the_final_full_frame(self):
+        script = (self.root / "run_csim_1011_round6.tcl").read_text(encoding="utf-8-sig")
+        self.assertIn("{6 7 7r 8}", script)
+        self.assertIn("if {$round in {7 7r 8}} {set tests {full}}", script)
+        self.assertIn("if {$round in {7 7r 8} && $tests ne \"full\"}", script)
+
+
 class GrayHlsContractTests(unittest.TestCase):
     root = Path(__file__).resolve().parents[1] / "ESP_INT8_hls"
 

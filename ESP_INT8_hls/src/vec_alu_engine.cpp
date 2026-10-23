@@ -34,45 +34,7 @@ static_assert(VEC_MAX_ROW_TILES < 2048, "Vec tile counter is 11 bits");
 static_assert(ROW_CONTIG_MAX_WORDS < 512, "Vec commit counter is 9 bits");
 static_assert(MAX_FM_W <= ROW_CONTIG_MAX_WORDS, "Aligned Vec row fits the shared buffer");
 
-using vec_aff_acc_t = ap_int<40>;
-using vec_aff_round_t = ap_int<41>;
 using vec_aff_half_t = ap_uint<VEC_AFF_HALF_LANES * 8>;
-
-static i32_t vec_round_shift_affine_narrow(vec_aff_acc_t value,
-                                           u8_t shift) {
-#pragma HLS INLINE
-  if (shift == 0) {
-    return static_cast<i32_t>(value);
-  }
-  // PARAM v4 constrains affine shifts to [0, 31]. One guard bit covers
-  // the signed rounding correction without carrying a 64-bit shifter.
-  const unsigned shift_u = shift.to_uint();
-  const vec_aff_round_t extended = static_cast<vec_aff_round_t>(value);
-  const vec_aff_round_t bias =
-      static_cast<vec_aff_round_t>(1) << (shift_u - 1U);
-  if (value >= 0) {
-    return static_cast<i32_t>((extended + bias) >> shift_u);
-  }
-  const vec_aff_round_t scale =
-      static_cast<vec_aff_round_t>(1) << shift_u;
-  return static_cast<i32_t>(
-      ((extended - bias) + scale - 1) >> shift_u);
-}
-
-static i8_t vec_affine_i8_to_i8_narrow(i8_t value,
-                                        i32_t mul,
-                                        i32_t bias,
-                                        u8_t shift,
-                                        u8_t act_type) {
-#pragma HLS INLINE
-  const vec_aff_acc_t product =
-      static_cast<vec_aff_acc_t>(value * mul);
-  const vec_aff_acc_t scaled =
-      product + static_cast<vec_aff_acc_t>(bias);
-  return apply_act(
-      clamp_i8(vec_round_shift_affine_narrow(scaled, shift)),
-      act_type);
-}
 
 static vec_aff_half_t vec_alu_apply_affine_half(
     const vec_aff_half_t& in_half,
@@ -93,7 +55,7 @@ static vec_aff_half_t vec_alu_apply_affine_half(
       i8_t in_value = 0;
       in_value.range(7, 0) =
           in_half.range(local_lane * 8 + 7, local_lane * 8);
-      out_value = vec_affine_i8_to_i8_narrow(
+      out_value = affine_i8_to_i8_bounded(
           in_value,
           qmul[lane][qblock],
           qbias[lane][qblock],
@@ -335,10 +297,10 @@ static axi_vec_t vec_pack_compact_groups(const vec_affine_group_buffer_t& groups
 
 static bool vec_append_compact_group(u32_t input_group,
                                      unsigned valid_bytes,
-                                     u64_t& carry,
-                                     unsigned& carry_bytes,
+                                     u32_t& carry,
+                                     ap_uint<2>& carry_bytes,
                                      vec_affine_group_buffer_t& groups,
-                                     unsigned& group_slot,
+                                     ap_uint<3>& group_slot,
                                      axi_vec_t& completed_word) {
 #pragma HLS INLINE
   u32_t masked_group = input_group;
@@ -352,42 +314,42 @@ static bool vec_append_compact_group(u32_t input_group,
 
   u64_t merged = carry;
   const u64_t incoming = static_cast<u64_t>(masked_group);
-  switch (carry_bytes) {
+  switch (carry_bytes.to_uint()) {
     case 0: merged |= incoming; break;
     case 1: merged |= incoming << 8; break;
     case 2: merged |= incoming << 16; break;
     default: merged |= incoming << 24; break;
   }
 
-  const unsigned total_bytes = carry_bytes + valid_bytes;
+  const unsigned total_bytes = carry_bytes.to_uint() + valid_bytes;
   if (total_bytes < 4U) {
     carry = merged;
     carry_bytes = total_bytes;
     return false;
   }
 
-  vec_set_compact_group(groups, group_slot, static_cast<u32_t>(merged.range(31, 0)));
-  carry = merged >> 32;
+  vec_set_compact_group(groups, group_slot.to_uint(), static_cast<u32_t>(merged.range(31, 0)));
+  carry = static_cast<u32_t>(merged >> 32);
   carry_bytes = total_bytes - 4U;
+  const bool completed = group_slot == 7;
   ++group_slot;
-  if (group_slot != 8U) {
+  if (!completed) {
     return false;
   }
   completed_word = vec_pack_compact_groups(groups);
-  group_slot = 0U;
   return true;
 }
 
 static bool vec_append_compact_group_pair(u64_t input_pair,
-                                          u64_t& carry,
-                                          unsigned carry_bytes,
+                                          u32_t& carry,
+                                          ap_uint<2> carry_bytes,
                                           vec_affine_group_buffer_t& groups,
-                                          unsigned& group_slot,
+                                          ap_uint<3>& group_slot,
                                           axi_vec_t& completed_word) {
 #pragma HLS INLINE
-  ap_uint<96> merged = static_cast<ap_uint<96>>(carry);
-  const ap_uint<96> incoming = static_cast<ap_uint<96>>(input_pair);
-  switch (carry_bytes) {
+  ap_uint<88> merged = static_cast<ap_uint<88>>(carry);
+  const ap_uint<88> incoming = static_cast<ap_uint<88>>(input_pair);
+  switch (carry_bytes.to_uint()) {
     case 0: merged |= incoming; break;
     case 1: merged |= incoming << 8; break;
     case 2: merged |= incoming << 16; break;
@@ -396,22 +358,22 @@ static bool vec_append_compact_group_pair(u64_t input_pair,
 
   const u32_t out_group0 = static_cast<u32_t>(merged.range(31, 0));
   const u32_t out_group1 = static_cast<u32_t>(merged.range(63, 32));
-  carry = static_cast<u64_t>(merged >> 64);
+  carry = static_cast<u32_t>(merged >> 64);
 
   bool completed = false;
-  vec_set_compact_group(groups, group_slot, out_group0);
+  vec_set_compact_group(groups, group_slot.to_uint(), out_group0);
+  const bool completed0 = group_slot == 7;
   ++group_slot;
-  if (group_slot == 8U) {
+  if (completed0) {
     completed_word = vec_pack_compact_groups(groups);
-    group_slot = 0U;
     completed = true;
   }
 
-  vec_set_compact_group(groups, group_slot, out_group1);
+  vec_set_compact_group(groups, group_slot.to_uint(), out_group1);
+  const bool completed1 = group_slot == 7;
   ++group_slot;
-  if (group_slot == 8U) {
+  if (completed1) {
     completed_word = vec_pack_compact_groups(groups);
-    group_slot = 0U;
     completed = true;
   }
   return completed;
@@ -419,60 +381,76 @@ static bool vec_append_compact_group_pair(u64_t input_pair,
 
 static bool vec_stage_compact_word(const act_vec_t& out_packed,
                                     u8_t lanes,
-                                    u64_t& carry, unsigned& carry_bytes,
+                                    u32_t& carry, ap_uint<2>& carry_bytes,
                                     vec_affine_group_buffer_t& groups,
-                                    unsigned& slot, unsigned& word_index,
+                                    ap_uint<3>& slot, ap_uint<9>& word_index,
                                     unsigned row_word_count) {
 #pragma HLS INLINE
   const unsigned lane_count = lanes.to_uint();
+  if (lane_count == 0U || lane_count > static_cast<unsigned>(TM)) { return false; }
+  // At most 31 pending bytes plus one <=32-byte tile can complete one word.
+  axi_vec_t pending_word = 0;
+  bool pending_valid = false;
   const unsigned pair_count = lane_count / 8U;
-  for (int pair = 0; pair < TM / 8; ++pair) {
+  if (pair_count != 0U) {
+    VEC_PACK_PAIRS:
+    for (int pair = 0; pair < TM / 8; ++pair) {
 #pragma HLS PIPELINE II=1
-    if (pair >= static_cast<int>(pair_count)) { break; }
-    axi_vec_t completed = 0;
-    if (vec_append_compact_group_pair(vec_extract_affine_group_pair(out_packed, pair),
-                                      carry, carry_bytes, groups, slot, completed)) {
-      if (word_index >= row_word_count) { return false; }
-      s_shared_row_contig_words[word_index++] = completed;
+      if (pair >= static_cast<int>(pair_count)) { break; }
+      axi_vec_t completed = 0;
+      if (vec_append_compact_group_pair(vec_extract_affine_group_pair(out_packed, pair),
+                                        carry, carry_bytes, groups, slot, completed)) {
+        pending_word = completed;
+        pending_valid = true;
+      }
     }
   }
   const unsigned paired_bytes = pair_count * 8U;
   const unsigned tail_count = (lane_count - paired_bytes + 3U) / 4U;
-  for (int tail = 0; tail < 2; ++tail) {
+  if (tail_count != 0U) {
+    VEC_PACK_TAIL:
+    for (int tail = 0; tail < 2; ++tail) {
 #pragma HLS PIPELINE II=1
-    if (tail >= static_cast<int>(tail_count)) { break; }
-    const unsigned consumed = paired_bytes + static_cast<unsigned>(tail) * 4U;
-    const unsigned bytes = lane_count - consumed < 4U ? lane_count - consumed : 4U;
-    axi_vec_t completed = 0;
-    if (vec_append_compact_group(
-            vec_extract_affine_group(out_packed, static_cast<int>(pair_count * 2U) + tail),
-            bytes, carry, carry_bytes, groups, slot, completed)) {
-      if (word_index >= row_word_count) { return false; }
-      s_shared_row_contig_words[word_index++] = completed;
+      if (tail >= static_cast<int>(tail_count)) { break; }
+      const unsigned consumed = paired_bytes + static_cast<unsigned>(tail) * 4U;
+      const unsigned bytes = lane_count - consumed < 4U ? lane_count - consumed : 4U;
+      axi_vec_t completed = 0;
+      if (vec_append_compact_group(
+              vec_extract_affine_group(out_packed, static_cast<int>(pair_count * 2U) + tail),
+              bytes, carry, carry_bytes, groups, slot, completed)) {
+        pending_word = completed;
+        pending_valid = true;
+      }
     }
+  }
+  if (pending_valid) {
+    if (word_index.to_uint() >= row_word_count) { return false; }
+    s_shared_row_contig_words[word_index.to_uint()] = pending_word;
+    ++word_index;
   }
   return true;
 }
 
-static bool vec_finish_compact_row(u64_t carry, unsigned carry_bytes,
+static bool vec_finish_compact_row(u32_t carry, ap_uint<2> carry_bytes,
                                     vec_affine_group_buffer_t& groups,
-                                    unsigned slot, unsigned& word_index,
+                                    unsigned slot, ap_uint<9>& word_index,
                                     unsigned row_word_count) {
 #pragma HLS INLINE
   if (carry_bytes != 0U) {
     vec_set_compact_group(groups, slot++, static_cast<u32_t>(carry));
   }
   if (slot != 0U) {
-    if (word_index >= row_word_count) { return false; }
+    if (word_index.to_uint() >= row_word_count) { return false; }
     for (int index = 0; index < TM / 4; ++index) {
 #pragma HLS UNROLL
       if (static_cast<unsigned>(index) >= slot) {
         vec_set_compact_group(groups, index, 0);
       }
     }
-    s_shared_row_contig_words[word_index++] = vec_pack_compact_groups(groups);
+    s_shared_row_contig_words[word_index.to_uint()] = vec_pack_compact_groups(groups);
+    ++word_index;
   }
-  return word_index == row_word_count;
+  return word_index.to_uint() == row_word_count;
 }
 
 static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
@@ -578,10 +556,10 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
       u32_t aligned_pixel = aligned_row;
       ap_uint<4> c_blk = cblock_major ? outer : 0;
       vec_affine_group_buffer_t packed_groups;
-      u64_t packed_carry = 0;
-      unsigned packed_carry_bytes = 0U;
-      unsigned packed_group_slot = 0U;
-      unsigned packed_word_idx = 0U;
+      u32_t packed_carry = 0;
+      ap_uint<2> packed_carry_bytes = 0;
+      ap_uint<3> packed_group_slot = 0;
+      ap_uint<9> packed_word_idx = 0;
 
       // Stage a compact row or one aligned channel-block row before any writeback.
       VEC_AFFINE_TILES:
@@ -626,7 +604,7 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
         }
       }
       if (row_contiguous && !vec_finish_compact_row(
-              packed_carry, packed_carry_bytes, packed_groups, packed_group_slot,
+              packed_carry, packed_carry_bytes, packed_groups, packed_group_slot.to_uint(),
               packed_word_idx, static_cast<unsigned>(row_word_count))) {
         return ERR_BANK_OVERFLOW;
       }

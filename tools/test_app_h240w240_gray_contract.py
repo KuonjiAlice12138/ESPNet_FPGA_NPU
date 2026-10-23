@@ -67,10 +67,10 @@ class GraySingleAppContract(unittest.TestCase):
 
     def test_build_identifies_h240_platform_and_retains_timer_units(self):
         self.assertEqual(macro("INT8_APP_BUILD_TAG"),
-                         '"INT8-BOARD-20261020-P7-H240W240-GRAY-R7R-B2"')
-        self.assertIn(r"platform_h240_1020\export\platform_h240_1020", APP_YAML)
-        self.assertIn("Platform: platform_h240_1020", README)
-        self.assertIn("WNS=+0.163 ns", README)
+                         '"INT8-BOARD-20261021-P7-H240W240-GRAY-R8-B2"')
+        self.assertIn(r"platform_h240_1021\export\platform_h240_1021", APP_YAML)
+        self.assertIn("Platform: platform_h240_1021", README)
+        self.assertIn("WNS=+0.585 ns", README)
         self.assertIn("WHS=+0.010 ns", README)
         self.assertIn("routing errors=0", README)
         self.assertEqual(macro("INT8_APP_PL_TARGET_HZ"), "100000000ULL")
@@ -80,17 +80,17 @@ class GraySingleAppContract(unittest.TestCase):
         launch_path = ROOT / "ESP_INT8_app" / "_ide" / "launch.json"
         if launch_path.exists():
             launch = launch_path.read_text(encoding="utf-8")
-            self.assertIn("platform_h240_1020", launch)
+            self.assertIn("platform_h240_1021", launch)
             for retired in ("platform_1014", "platform_h240_1012", "platform_h240_1019",
-                            "platform_r5a_0928"):
+                            "platform_h240_1020", "platform_r5a_0928"):
                 self.assertNotIn(retired, launch)
             configs = json.loads(launch)["configurations"]
             for config in configs:
                 setup = config["targetSetup"]
-                self.assertIn("platform_h240_1020", setup["bitstreamFile"])
+                self.assertIn("platform_h240_1021", setup["bitstreamFile"])
                 init = setup["zuInitialization"]
-                self.assertIn("platform_h240_1020", init["usingFSBL"]["fsblFile"])
-                self.assertIn("platform_h240_1020", init["usingPsuInit"]["psuInitTclFile"])
+                self.assertIn("platform_h240_1021", init["usingFSBL"]["fsblFile"])
+                self.assertIn("platform_h240_1021", init["usingPsuInit"]["psuInitTclFile"])
         else:
             self.assertIn("Create a new Run/Debug configuration", README)
 
@@ -98,16 +98,17 @@ class GraySingleAppContract(unittest.TestCase):
         component = json.loads(
             (ROOT / "ESP_INT8_app" / "vitis-comp.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(component["platform"], "platform_h240_1020")
+        self.assertEqual(component["platform"], "platform_h240_1021")
         self.assertEqual(component["domain"], "standalone_psu_cortexa53_0")
         bif = (ROOT / "ESP_INT8_app" / "src" / "boot_h240.bif").read_text(
             encoding="utf-8"
         )
-        self.assertIn("platform_h240_1020/export/platform_h240_1020/sw/boot/fsbl.elf", bif)
-        self.assertIn("platform_h240_1020/hw/sdt/ESP_INT8_hwplat.bit", bif)
+        self.assertIn("platform_h240_1021/export/platform_h240_1021/sw/boot/fsbl.elf", bif)
+        self.assertIn("platform_h240_1021/hw/sdt/ESP_INT8_hwplat.bit", bif)
         self.assertIn("ESP_INT8_app/build/ESP_INT8_app.elf", bif)
         self.assertNotIn("platform_h240_1012", bif)
         self.assertNotIn("platform_h240_1019", bif)
+        self.assertNotIn("platform_h240_1020", bif)
 
     def test_release_selects_round6_transfer_protocol_artifact(self):
         artifact = ROOT / "hw_artifacts" / "binary2_int8_h240w240_gray_r6_v4"

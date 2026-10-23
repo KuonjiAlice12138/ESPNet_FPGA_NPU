@@ -3,7 +3,7 @@
 
 #include "xil_types.h"
 
-#define INT8_APP_BUILD_TAG "INT8-BOARD-20261020-P7-H240W240-GRAY-R7R-B2"
+#define INT8_APP_BUILD_TAG "INT8-BOARD-20261021-P7-H240W240-GRAY-R8-B2"
 #define INT8_APP_DEPLOYMENT_NAME "binary2"
 #define INT8_APP_EXPECTED_CLASS_COUNT 2U
 
@@ -51,7 +51,7 @@
 
 #define INT8_APP_ENABLE_EXEC_PREFIX_PROFILE 0U
 #define INT8_APP_EXEC_PREFIX_COUNT 16U
-/* H240 Round 7R runs one complete grayscale network, not an EXEC prefix. */
+/* H240 Round 8 runs one complete grayscale network, not an EXEC prefix. */
 #define INT8_APP_EXEC_PREFIX_REFERENCE_FULL_RTL_CYCLES 0ULL
 #define INT8_APP_EXEC_PREFIX_TARGET_MAX_RTL_CYCLES 0ULL
 

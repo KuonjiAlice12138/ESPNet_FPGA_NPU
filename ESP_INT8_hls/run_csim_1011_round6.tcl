@@ -5,13 +5,13 @@ set round 6
 if {[info exists ::env(ESP_INT8_CSIM_ROUND)]} {
     set round $::env(ESP_INT8_CSIM_ROUND)
 }
-if {$round ni {6 7 7r}} {error "Unknown H240 validation round: $round"}
+if {$round ni {6 7 7r 8}} {error "Unknown H240 validation round: $round"}
 set tests {focus full}
-if {$round in {7 7r}} {set tests {full}}
+if {$round in {7 7r 8}} {set tests {full}}
 if {[info exists ::env(ESP_INT8_ROUND6_TEST)]} {
     set tests [list $::env(ESP_INT8_ROUND6_TEST)]
 }
-if {$round in {7 7r} && $tests ne "full"} {error "Round7/7R runs only the final full-frame CSim"}
+if {$round in {7 7r 8} && $tests ne "full"} {error "Round7/7R/8 runs only the final full-frame CSim"}
 set handle [open [file join $root hls_config.cfg] r]
 set cfg [read $handle]
 close $handle
