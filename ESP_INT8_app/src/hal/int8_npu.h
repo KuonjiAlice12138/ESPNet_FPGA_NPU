@@ -64,9 +64,10 @@ int int8_npu_read_exec_plan_entry(const u8 *param_blob, u32 param_bytes,
                                   u32 index, Int8ExecPlanEntry *entry);
 int int8_npu_run_init(Int8NpuContext *ctx, UINTPTR param_addr, u32 uop_count,
                       u32 timeout_polls);
+u32 int8_npu_source_bytes(u32 src_mode);
 int int8_npu_run_infer(Int8NpuContext *ctx, UINTPTR input_addr,
                        UINTPTR output_addr, UINTPTR param_addr, u32 uop_count,
-                       u32 timeout_polls);
+                       u32 src_mode, u32 timeout_polls);
 void int8_npu_dump_regs(const Int8NpuContext *ctx, const char *tag);
 u32 int8_npu_read_ap_ctrl(const Int8NpuContext *ctx);
 

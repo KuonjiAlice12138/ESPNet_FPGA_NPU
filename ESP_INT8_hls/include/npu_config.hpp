@@ -40,6 +40,22 @@ constexpr int FULLRES_MASK_C = 1;
 
 constexpr int INPUT_FRAME_BYTES = INPUT_FRAME_H * INPUT_FRAME_W * INPUT_FRAME_C;
 constexpr int INPUT_FRAME_AXI_WORDS = (INPUT_FRAME_BYTES + AXI_WORD_BYTES - 1) / AXI_WORD_BYTES;
+// External source geometry is independent of the encoder's feature-memory size.
+constexpr std::uint32_t INPUT_SRC_NATIVE = 0;
+constexpr std::uint32_t INPUT_SRC_H256W512 = 1;
+constexpr std::uint32_t INPUT_SRC_H512W1024 = 2;
+constexpr int INPUT_SOURCE_MAX_BYTES = 512 * 1024;
+constexpr int INPUT_SOURCE_MAX_AXI_WORDS = INPUT_SOURCE_MAX_BYTES / AXI_WORD_BYTES;
+constexpr int INPUT_RESIZE_LANES = 4;
+constexpr int INPUT_RESIZE_DENOM = 480;
+constexpr int INPUT_RESIZE_SMALL_INITIAL_INDEX = 0;
+constexpr int INPUT_RESIZE_SMALL_INITIAL_ERROR = 256;
+constexpr int INPUT_RESIZE_SMALL_BASE_STEP = 1;
+constexpr int INPUT_RESIZE_SMALL_ERROR_STEP = 32;
+constexpr int INPUT_RESIZE_LARGE_INITIAL_INDEX = 1;
+constexpr int INPUT_RESIZE_LARGE_INITIAL_ERROR = 32;
+constexpr int INPUT_RESIZE_LARGE_BASE_STEP = 2;
+constexpr int INPUT_RESIZE_LARGE_ERROR_STEP = 64;
 constexpr int ENCODER_LOGITS_MAX_BYTES = ENCODER_OUT_H * ENCODER_OUT_W * MAX_CLASS_C;
 constexpr int ENCODER_LOGITS_BYTES = ENCODER_OUT_H * ENCODER_OUT_W * ENCODER_OUT_C;
 constexpr int FULLRES_MASK_BYTES = FULLRES_MASK_H * FULLRES_MASK_W * FULLRES_MASK_C;
@@ -52,6 +68,12 @@ static_assert(INPUT_FRAME_W == ENCODER_OUT_W * UPSAMPLE_SCALE,
               "Input/logits width must match the fixed upsample scale");
 static_assert(INPUT_FRAME_AXI_WORDS == 1800,
               "H240W240 C1 input must occupy 1800 AXI words");
+static_assert(INPUT_SOURCE_MAX_AXI_WORDS == 16384 && INPUT_FRAME_C == 1,
+              "Input resize supports at most H512W1024 C1 signed bytes");
+static_assert(INPUT_FRAME_H == 240 && INPUT_FRAME_W == 240 &&
+                  INPUT_FRAME_W % INPUT_RESIZE_LANES == 0 &&
+                  INPUT_FRAME_BYTES % AXI_WORD_BYTES == 0,
+              "Input resize requires a tightly packed H240W240 output without tail padding");
 static_assert(OUTPUT_FRAME_AXI_WORDS == 1800,
               "H240W240 mask must occupy 1800 AXI words");
 

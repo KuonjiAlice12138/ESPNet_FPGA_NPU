@@ -11,8 +11,13 @@
 #include "xstatus.h"
 
 #if (INT8_APP_ENABLE_EXEC_PREFIX_PROFILE + INT8_APP_ENABLE_VAL_SET_TEST + \
-     INT8_APP_ENABLE_DUAL_VAL_SET_TEST + INT8_APP_ENABLE_DUAL_SINGLE_TEST) > 1
-#error "select only one prefix, validation-set, or dual-single test mode"
+     INT8_APP_ENABLE_DUAL_VAL_SET_TEST + INT8_APP_ENABLE_DUAL_SINGLE_TEST + \
+     INT8_APP_ENABLE_INPUT_SOURCE_TEST) > 1
+#error "select only one input-source, prefix, validation-set, or dual-single test mode"
+#endif
+
+#if INT8_APP_ENABLE_INPUT_SOURCE_TEST && INT8_APP_SOURCE_TEST_MODE > INT8_INPUT_SRC_H512W1024
+#error "input-source test mode must be native, H256W512, or H512W1024"
 #endif
 
 static inline u64 read_timer_counter(void)
@@ -71,7 +76,7 @@ static void print_timer_selftest(void)
                    "PASS" : "WARN");
 }
 
-static u8 g_input[INT8_INPUT_BYTES] __attribute__((aligned(64)));
+static u8 g_input[INT8_INPUT_CAPACITY_BYTES] __attribute__((aligned(64)));
 static u8 g_output[INT8_OUTPUT_BYTES] __attribute__((aligned(64)));
 static u8 g_param[INT8_PARAM_HW_MAX_BYTES] __attribute__((aligned(64)));
 
@@ -272,14 +277,19 @@ static void print_exec_prefix_rows(const ExecPrefixProfile *current,
                current->current_stage, current->status);
 }
 
-static int run_infer_once(Int8NpuContext *npu, u32 uop_count,
+static int run_infer_once(Int8NpuContext *npu, u32 uop_count, u32 src_mode,
                           u64 *cycles, u32 dump_stage_csv)
 {
     u64 start;
     u64 end;
+    const u32 input_bytes = int8_npu_source_bytes(src_mode);
+
+    if (input_bytes == 0U || input_bytes > sizeof(g_input)) {
+        return XST_FAILURE;
+    }
 
     memset(g_output, 0, sizeof(g_output));
-    Xil_DCacheFlushRange((UINTPTR)g_input, INT8_INPUT_BYTES);
+    Xil_DCacheFlushRange((UINTPTR)g_input, input_bytes);
     Xil_DCacheFlushRange((UINTPTR)g_output, INT8_OUTPUT_BYTES);
 
     stage_counter_clear();
@@ -288,7 +298,7 @@ static int run_infer_once(Int8NpuContext *npu, u32 uop_count,
 
     start = read_timer_counter();
     if (int8_npu_run_infer(npu, (UINTPTR)g_input, (UINTPTR)g_output,
-                           (UINTPTR)g_param, uop_count,
+                           (UINTPTR)g_param, uop_count, src_mode,
                            INT8_NPU_TIMEOUT_POLLS) != XST_SUCCESS) {
         stage_counter_freeze(1U);
         stage_counter_enable(0U);
@@ -311,10 +321,10 @@ static int run_infer_once(Int8NpuContext *npu, u32 uop_count,
     return XST_SUCCESS;
 }
 
-static int run_full_infer_once(Int8NpuContext *npu, u32 uop_count,
+static int run_full_infer_once(Int8NpuContext *npu, u32 uop_count, u32 src_mode,
                                u64 *cycles, u32 dump_stage_csv)
 {
-    return run_infer_once(npu, uop_count, cycles, dump_stage_csv);
+    return run_infer_once(npu, uop_count, src_mode, cycles, dump_stage_csv);
 }
 
 static int validate_output_classes(const char *profile_name, u32 expected_classes)
@@ -473,7 +483,7 @@ static int run_exec_prefix_profile(Int8NpuContext *npu)
             xil_printf("APP: prefix MODE_INIT failed: %s\r\n", param_file);
             return XST_FAILURE;
         }
-        if (run_infer_once(npu, header.uop_count, &current.arm_ticks, 0U) !=
+        if (run_infer_once(npu, header.uop_count, INT8_INPUT_SRC_NATIVE, &current.arm_ticks, 0U) !=
             XST_SUCCESS) {
             xil_printf("APP: prefix MODE_RUN failed: %s\r\n", param_file);
             return XST_FAILURE;
@@ -549,16 +559,24 @@ static int run_exec_prefix_profile(Int8NpuContext *npu)
 static int run_single_image(Int8NpuContext *npu, u32 uop_count,
                             const char *profile_name, u32 expected_classes,
                             const char *input_file, const char *output_file,
-                            u64 *arm_ticks)
+                            u32 src_mode, u64 *arm_ticks)
 {
     u32 input_size = 0U;
     u64 cycles = 0ULL;
+    const u32 input_bytes = int8_npu_source_bytes(src_mode);
     const u32 conv_profile_cap =
         (stage_counter_has_conv_profile() != 0) ? 1U : 0U;
 
     s_perf_count = 0U;
+    if (input_bytes == 0U || input_bytes > sizeof(g_input)) {
+        xil_printf("APP: unsupported input source mode=%u\r\n", src_mode);
+        return XST_FAILURE;
+    }
     xil_printf("\r\nAPP: SINGLE_PROFILE_BEGIN profile=%s classes=%u\r\n",
                profile_name, expected_classes);
+    xil_printf("APP: input source mode=%u bytes=%u encoder=%ux%ux%u output=%ux%u\r\n",
+               src_mode, input_bytes, INT8_APP_INPUT_H, INT8_APP_INPUT_W,
+               INT8_APP_INPUT_C, INT8_APP_OUTPUT_H, INT8_APP_OUTPUT_W);
     xil_printf("APP: conv profile capability=%u required=%u\r\n",
                conv_profile_cap, INT8_APP_REQUIRE_CONV_PROFILE);
     if (INT8_APP_REQUIRE_CONV_PROFILE && conv_profile_cap == 0U) {
@@ -583,21 +601,22 @@ static int run_single_image(Int8NpuContext *npu, u32 uop_count,
 #endif
     }
 
-    xil_printf("APP: single perf input=%s\r\n", input_file);
-    if (SD_LoadFileToMemory(input_file, (UINTPTR)g_input, INT8_INPUT_BYTES,
+    xil_printf("APP: single perf input=%s src_mode=%u bytes=%u\r\n",
+               input_file, src_mode, input_bytes);
+    if (SD_LoadFileToMemory(input_file, (UINTPTR)g_input, input_bytes,
                             &input_size) != XST_SUCCESS) {
         xil_printf("APP: load input failed\r\n");
         return XST_FAILURE;
     }
-    if (input_size != INT8_INPUT_BYTES) {
+    if (input_size != input_bytes) {
         xil_printf("APP: bad input size=%u expected=%u\r\n", input_size,
-                   INT8_INPUT_BYTES);
+                   input_bytes);
         return XST_FAILURE;
     }
 
     xil_printf("APP: single full MODE_RUN timing start profile=%s\r\n",
                profile_name);
-    if (run_full_infer_once(npu, uop_count, &cycles, 1U) != XST_SUCCESS) {
+    if (run_full_infer_once(npu, uop_count, src_mode, &cycles, 1U) != XST_SUCCESS) {
         xil_printf("APP: MODE_RUN failed\r\n");
         return XST_FAILURE;
     }
@@ -685,7 +704,7 @@ static int run_val_set(Int8NpuContext *npu, u32 uop_count,
             return XST_FAILURE;
         }
 
-        if (run_full_infer_once(npu, uop_count, &cycles,
+        if (run_full_infer_once(npu, uop_count, INT8_INPUT_SRC_NATIVE, &cycles,
                                 (processed == 0U) ? 1U : 0U) != XST_SUCCESS) {
             xil_printf("APP: VALSET MODE_RUN failed index=%u file=%s\r\n",
                        index, input_file);
@@ -725,6 +744,53 @@ static int run_val_set(Int8NpuContext *npu, u32 uop_count,
                timer_ticks_to_ms(min_cycles), timer_ticks_to_ms(max_cycles));
     xil_printf("APP: run host eval_val_hw_masks_fullres on %sxxxx.BIN files\r\n",
                output_prefix);
+    return XST_SUCCESS;
+}
+
+static int run_input_source_tests(Int8NpuContext *npu, u32 uop_count)
+{
+    static const struct {
+        u32 mode;
+        const char *name;
+        const char *input;
+        const char *output;
+    } cases[] = {
+        {INT8_INPUT_SRC_NATIVE, "binary2_native", INT8_INPUT_FILE, INT8_OUTPUT_FILE},
+        {INT8_INPUT_SRC_H256W512, "binary2_h256w512",
+         INT8_APP_SOURCE256_INPUT_FILE, INT8_APP_SOURCE256_OUTPUT_FILE},
+        {INT8_INPUT_SRC_H512W1024, "binary2_h512w1024",
+         INT8_APP_SOURCE512_INPUT_FILE, INT8_APP_SOURCE512_OUTPUT_FILE},
+    };
+    u64 ticks[3] = {0ULL, 0ULL, 0ULL};
+    u64 rtl_cycles[3] = {0ULL, 0ULL, 0ULL};
+    u64 load_cycles[3] = {0ULL, 0ULL, 0ULL};
+    u32 index;
+
+    for (index = 0U; index < 3U; ++index) {
+        if (cases[index].mode != INT8_APP_SOURCE_TEST_MODE) {
+            continue;
+        }
+        if (run_single_image(npu, uop_count, cases[index].name,
+                              INT8_APP_EXPECTED_CLASS_COUNT, cases[index].input,
+                              cases[index].output, cases[index].mode,
+                              &ticks[index]) != XST_SUCCESS) {
+            return XST_FAILURE;
+        }
+        rtl_cycles[index] = stage_counter_read_total();
+        load_cycles[index] = stage_counter_read_stage(2U);
+    }
+    xil_printf("INPUT_SOURCE_SUMMARY_BEGIN\r\n");
+    xil_printf("src_mode,input_bytes,arm_ticks,arm_ms,rtl_cycles,frame_load,output\r\n");
+    for (index = 0U; index < 3U; ++index) {
+        if (cases[index].mode != INT8_APP_SOURCE_TEST_MODE) {
+            continue;
+        }
+        xil_printf("%u,%u,%llu,%llu,%llu,%llu,%s\r\n", cases[index].mode,
+                   int8_npu_source_bytes(cases[index].mode), ticks[index],
+                   timer_ticks_to_ms(ticks[index]), rtl_cycles[index],
+                   load_cycles[index], cases[index].output);
+    }
+    xil_printf("INPUT_SOURCE_SUMMARY_END\r\n");
     return XST_SUCCESS;
 }
 
@@ -794,7 +860,7 @@ static int run_dual_single_image(Int8NpuContext *npu)
         binary_status = run_single_image(
             npu, header.uop_count, "binary2", INT8_APP_BINARY_CLASS_COUNT,
             INT8_APP_BINARY_SINGLE_INPUT_FILE,
-            INT8_APP_BINARY_SINGLE_OUTPUT_FILE, &binary_ticks);
+            INT8_APP_BINARY_SINGLE_OUTPUT_FILE, INT8_INPUT_SRC_NATIVE, &binary_ticks);
         binary_rtl = stage_counter_read_total();
     } else {
         xil_printf("APP: binary2 init failed; continue with cityscapes20\r\n");
@@ -806,7 +872,7 @@ static int run_dual_single_image(Int8NpuContext *npu)
             npu, header.uop_count, "cityscapes20",
             INT8_APP_CLASS20_CLASS_COUNT,
             INT8_APP_CLASS20_SINGLE_INPUT_FILE,
-            INT8_APP_CLASS20_SINGLE_OUTPUT_FILE, &class20_ticks);
+            INT8_APP_CLASS20_SINGLE_OUTPUT_FILE, INT8_INPUT_SRC_NATIVE, &class20_ticks);
         class20_rtl = stage_counter_read_total();
     } else {
         xil_printf("APP: cityscapes20 init failed\r\n");
@@ -875,7 +941,7 @@ int main(void)
 #endif
 
     xil_printf("\r\nESP INT8 app %s\r\n", INT8_APP_BUILD_TAG);
-    print_addr("input", (UINTPTR)g_input, INT8_INPUT_BYTES);
+    print_addr("input", (UINTPTR)g_input, INT8_INPUT_CAPACITY_BYTES);
     print_addr("output", (UINTPTR)g_output, INT8_OUTPUT_BYTES);
     print_addr("param", (UINTPTR)g_param, INT8_PARAM_HW_MAX_BYTES);
     print_timer_selftest();
@@ -900,12 +966,14 @@ int main(void)
         return XST_FAILURE;
     }
 
-#if INT8_APP_ENABLE_VAL_SET_TEST
+#if INT8_APP_ENABLE_INPUT_SOURCE_TEST
+    return run_input_source_tests(&npu, header.uop_count);
+#elif INT8_APP_ENABLE_VAL_SET_TEST
 #if INT8_APP_ENABLE_SINGLE_PERF_BEFORE_VAL
     if (run_single_image(&npu, header.uop_count, INT8_APP_DEPLOYMENT_NAME,
                           INT8_APP_EXPECTED_CLASS_COUNT,
                           INT8_APP_SINGLE_PERF_INPUT_FILE,
-                          INT8_APP_SINGLE_PERF_OUTPUT_FILE, NULL) != XST_SUCCESS) {
+                          INT8_APP_SINGLE_PERF_OUTPUT_FILE, INT8_INPUT_SRC_NATIVE, NULL) != XST_SUCCESS) {
         xil_printf("APP: single perf before valset failed\r\n");
         return XST_FAILURE;
     }
@@ -918,7 +986,7 @@ int main(void)
     return run_single_image(&npu, header.uop_count, INT8_APP_DEPLOYMENT_NAME,
                              INT8_APP_EXPECTED_CLASS_COUNT,
                              INT8_APP_SINGLE_PERF_INPUT_FILE,
-                             INT8_APP_SINGLE_PERF_OUTPUT_FILE, NULL);
+                             INT8_APP_SINGLE_PERF_OUTPUT_FILE, INT8_INPUT_SRC_NATIVE, NULL);
 #endif
 #endif
 }

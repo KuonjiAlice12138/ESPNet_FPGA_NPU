@@ -14,7 +14,7 @@ bool param_dma_ready();
 bool param_dma_is_schedule_blob();
 bool param_dma_get_pool_qparam(u8_t param_id, pool_q_t& qparam);
 bool param_dma_get_fixed_exec_desc(u8_t id, fixed_exec_desc_t& desc);
-void frame_dma_load(const axi_vec_t* gmem_frame_in);
+void frame_dma_load(const axi_vec_t* gmem_frame_in, std::uint32_t src_mode);
 bool avgpool_unit_checked(const tensor_desc_t& src,
                           const tensor_desc_t& dst,
                           const pool_q_t& qparam,
@@ -285,6 +285,7 @@ static bool csim_stop_before_logical_uop(unsigned uop_id) {
 static error_code_t core_mode_run(const axi_vec_t* gmem_frame_in,
                                   axi_vec_t* gmem_frame_out,
                                   u32_t expected_uop_count,
+                                  std::uint32_t src_mode,
                                   volatile u8_t& prof_stage_id,
                                   volatile u8_t& prof_pc,
                                   volatile u8_t& prof_issue_kind,
@@ -292,6 +293,16 @@ static error_code_t core_mode_run(const axi_vec_t* gmem_frame_in,
                                   volatile u8_t& prof_conv_sa_state,
                                   volatile u8_t& prof_conv_post_state) {
 #pragma HLS INLINE off
+#ifndef __SYNTHESIS__
+  s_csim_last_uop = 0;
+  s_csim_last_error = ERR_NONE;
+#endif
+  if (src_mode > INPUT_SRC_H512W1024) {
+#ifndef __SYNTHESIS__
+    s_csim_last_error = ERR_INVALID_MODE;
+#endif
+    return ERR_INVALID_MODE;
+  }
   if (!s_param_ready) {
 #ifndef __SYNTHESIS__
     s_csim_last_error = ERR_BAD_BLOB;
@@ -315,7 +326,7 @@ static error_code_t core_mode_run(const axi_vec_t* gmem_frame_in,
 
   reset_scratch_state();
   npu_profile_set_stage(prof_stage_id, PROF_STAGE_FRAME_LOAD);
-  frame_dma_load(gmem_frame_in);
+  frame_dma_load(gmem_frame_in, src_mode);
 
   npu_profile_set_stage(prof_stage_id, PROF_STAGE_MAIN_CTRL);
   const error_code_t err = main_ctrl_run(gmem_frame_out,
@@ -336,8 +347,8 @@ static error_code_t core_mode_run(const axi_vec_t* gmem_frame_in,
 
 }  // namespace esp_int8
 
-static_assert(esp_int8::INPUT_FRAME_AXI_WORDS == 1800,
-              "Update gmem_frame_in m_axi depth when INPUT_FRAME_AXI_WORDS changes.");
+static_assert(esp_int8::INPUT_SOURCE_MAX_AXI_WORDS == 16384,
+              "Update gmem_frame_in m_axi depth when INPUT_SOURCE_MAX_AXI_WORDS changes.");
 static_assert(esp_int8::OUTPUT_FRAME_AXI_WORDS == 1800,
               "Update gmem_frame_out m_axi depth when OUTPUT_FRAME_AXI_WORDS changes.");
 
@@ -352,13 +363,15 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
                               volatile esp_int8::u8_t& prof_issue_kind,
                               volatile esp_int8::u8_t& prof_conv_win_state,
                               volatile esp_int8::u8_t& prof_conv_sa_state,
-                              volatile esp_int8::u8_t& prof_conv_post_state) {
+                              volatile esp_int8::u8_t& prof_conv_post_state,
+                              std::uint32_t src_mode) {
 #ifdef ESP_INT8_COSIM_LITE
-#pragma HLS INTERFACE ap_memory port=gmem_frame_in depth=1800
+#pragma HLS INTERFACE ap_memory port=gmem_frame_in depth=16384
 #pragma HLS INTERFACE ap_memory port=gmem_frame_out depth=1800
 #pragma HLS INTERFACE ap_memory port=gmem_param depth=8192
 #pragma HLS INTERFACE ap_none port=mode
 #pragma HLS INTERFACE ap_none port=uop_count
+#pragma HLS INTERFACE ap_none port=src_mode
 #pragma HLS INTERFACE ap_vld port=prof_stage_id register
 #pragma HLS INTERFACE ap_none port=prof_active register
 #pragma HLS INTERFACE ap_none port=prof_pc register
@@ -368,7 +381,7 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
 #pragma HLS INTERFACE ap_none port=prof_conv_post_state register
 #pragma HLS INTERFACE ap_ctrl_hs port=return
 #else
-#pragma HLS INTERFACE m_axi port=gmem_frame_in offset=slave bundle=gmem0 depth=1800 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS INTERFACE m_axi port=gmem_frame_in offset=slave bundle=gmem0 depth=16384 max_read_burst_length=64 num_read_outstanding=4
 #pragma HLS INTERFACE m_axi port=gmem_frame_out offset=slave bundle=gmem1 depth=1800 max_write_burst_length=64 num_write_outstanding=4
 #pragma HLS INTERFACE m_axi port=gmem_param offset=slave bundle=gmem2 depth=8192 max_read_burst_length=64 num_read_outstanding=4
 #pragma HLS INTERFACE ap_vld port=prof_stage_id register
@@ -383,10 +396,12 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
 #pragma HLS INTERFACE s_axilite port=gmem_param bundle=control
 #pragma HLS INTERFACE s_axilite port=mode bundle=control
 #pragma HLS INTERFACE s_axilite port=uop_count bundle=control
+#pragma HLS INTERFACE s_axilite port=src_mode bundle=control
 #pragma HLS INTERFACE s_axilite port=return bundle=control
 #endif
 
   const std::uint32_t mode_runtime = esp_int8::runtime_mode(mode);
+  const std::uint32_t frame_src_mode = src_mode;
   const esp_int8::u32_t expected_uop_count = esp_int8::runtime_expected_uop_count(uop_count);
   esp_int8::npu_profile_reset_conv_states(prof_conv_win_state,
                                           prof_conv_sa_state,
@@ -411,6 +426,7 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
             esp_int8::core_mode_run(gmem_frame_in,
                                     gmem_frame_out,
                                     expected_uop_count,
+                                    frame_src_mode,
                                     prof_stage_id,
                                     prof_pc,
                                     prof_issue_kind,

@@ -7,6 +7,10 @@
 #include "xparameters.h"
 #include "xstatus.h"
 
+#ifndef XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_SRC_MODE_DATA
+#error "Regenerate the platform/BSP from the input-resize IP with src_mode before building this App"
+#endif
+
 #if defined(XPAR_NPU_STAGE_COUNTER_0_S00_AXI_BASEADDR)
 #define INT8_STAGE_COUNTER_BASEADDR XPAR_NPU_STAGE_COUNTER_0_S00_AXI_BASEADDR
 #define INT8_STAGE_COUNTER_PRESENT 1
@@ -509,6 +513,7 @@ void int8_npu_dump_regs(const Int8NpuContext *ctx, const char *tag)
     u32 isr;
     u32 mode;
     u32 uop_count;
+    u32 src_mode;
     u64 input_addr;
     u64 output_addr;
     u64 param_addr;
@@ -526,6 +531,8 @@ void int8_npu_dump_regs(const Int8NpuContext *ctx, const char *tag)
         (XEspnet_encoder_int8_core *)&ctx->ip);
     uop_count = XEspnet_encoder_int8_core_Get_uop_count(
         (XEspnet_encoder_int8_core *)&ctx->ip);
+    src_mode = XEspnet_encoder_int8_core_Get_src_mode(
+        (XEspnet_encoder_int8_core *)&ctx->ip);
     input_addr = XEspnet_encoder_int8_core_Get_gmem_frame_in(
         (XEspnet_encoder_int8_core *)&ctx->ip);
     output_addr = XEspnet_encoder_int8_core_Get_gmem_frame_out(
@@ -534,8 +541,8 @@ void int8_npu_dump_regs(const Int8NpuContext *ctx, const char *tag)
         (XEspnet_encoder_int8_core *)&ctx->ip);
 
     xil_printf("NPU: regs %s ap=0x%08x ier=0x%08x isr=0x%08x "
-               "mode=0x%08x uops=0x%08x\r\n",
-               tag, ap_ctrl, ier, isr, mode, uop_count);
+               "mode=0x%08x uops=0x%08x src_mode=%u\r\n",
+               tag, ap_ctrl, ier, isr, mode, uop_count, src_mode);
     xil_printf("NPU: regs %s ", tag);
     print_u64_arg("in", input_addr);
     print_u64_arg("out", output_addr);
@@ -752,11 +759,21 @@ static int wait_done(Int8NpuContext *ctx, u32 timeout_polls, const char *tag)
     return XST_FAILURE;
 }
 
-static int run_once(Int8NpuContext *ctx, u32 mode, UINTPTR input_addr,
+u32 int8_npu_source_bytes(u32 src_mode)
+{
+    switch (src_mode) {
+    case INT8_INPUT_SRC_NATIVE: return INT8_INPUT_BYTES;
+    case INT8_INPUT_SRC_H256W512: return 256U * 512U;
+    case INT8_INPUT_SRC_H512W1024: return 512U * 1024U;
+    default: return 0U;
+    }
+}
+
+static int run_once(Int8NpuContext *ctx, u32 mode, u32 src_mode, UINTPTR input_addr,
                     UINTPTR output_addr, UINTPTR param_addr, u32 uop_count,
                     u32 timeout_polls, const char *tag)
 {
-    if (ctx == NULL) {
+    if (ctx == NULL || int8_npu_source_bytes(src_mode) == 0U) {
         return XST_FAILURE;
     }
     if (!XEspnet_encoder_int8_core_IsReady(&ctx->ip)) {
@@ -770,6 +787,11 @@ static int run_once(Int8NpuContext *ctx, u32 mode, UINTPTR input_addr,
     XEspnet_encoder_int8_core_Set_gmem_param(&ctx->ip, (u64)param_addr);
     XEspnet_encoder_int8_core_Set_mode(&ctx->ip, mode);
     XEspnet_encoder_int8_core_Set_uop_count(&ctx->ip, uop_count);
+    XEspnet_encoder_int8_core_Set_src_mode(&ctx->ip, src_mode);
+    if (XEspnet_encoder_int8_core_Get_src_mode(&ctx->ip) != src_mode) {
+        xil_printf("NPU: src_mode readback failed; check the BSP/bitstream pair\r\n");
+        return XST_FAILURE;
+    }
 
 #if !INT8_APP_QUIET_PERF
     xil_printf("NPU: start %s mode=0x%08x uops=0x%08x\r\n", tag, mode,
@@ -784,18 +806,19 @@ static int run_once(Int8NpuContext *ctx, u32 mode, UINTPTR input_addr,
 int int8_npu_run_init(Int8NpuContext *ctx, UINTPTR param_addr, u32 uop_count,
                       u32 timeout_polls)
 {
-    return run_once(ctx, INT8_NPU_MODE_INIT, (UINTPTR)0U, (UINTPTR)0U,
+    return run_once(ctx, INT8_NPU_MODE_INIT, INT8_INPUT_SRC_NATIVE, (UINTPTR)0U, (UINTPTR)0U,
                     param_addr, uop_count, timeout_polls, "MODE_INIT");
 }
 
 int int8_npu_run_infer(Int8NpuContext *ctx, UINTPTR input_addr,
                        UINTPTR output_addr, UINTPTR param_addr, u32 uop_count,
-                       u32 timeout_polls)
+                       u32 src_mode, u32 timeout_polls)
 {
     if (input_addr == (UINTPTR)0U || output_addr == (UINTPTR)0U ||
-        param_addr == (UINTPTR)0U) {
+        param_addr == (UINTPTR)0U ||
+        ((input_addr | output_addr | param_addr) & (UINTPTR)63U) != 0U) {
         return XST_FAILURE;
     }
-    return run_once(ctx, INT8_NPU_MODE_RUN, input_addr, output_addr, param_addr,
+    return run_once(ctx, INT8_NPU_MODE_RUN, src_mode, input_addr, output_addr, param_addr,
                     uop_count, timeout_polls, "MODE_RUN");
 }

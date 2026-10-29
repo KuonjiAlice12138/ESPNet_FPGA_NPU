@@ -15,13 +15,15 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
                               volatile esp_int8::u8_t& prof_issue_kind,
                               volatile esp_int8::u8_t& prof_conv_win_state,
                               volatile esp_int8::u8_t& prof_conv_sa_state,
-                              volatile esp_int8::u8_t& prof_conv_post_state);
+                              volatile esp_int8::u8_t& prof_conv_post_state,
+                              std::uint32_t src_mode);
 
 inline void call_espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
                                           esp_int8::axi_vec_t* gmem_frame_out,
                                           const esp_int8::axi_vec_t* gmem_param,
                                           std::uint32_t mode,
-                                          std::uint32_t uop_count) {
+                                          std::uint32_t uop_count,
+                                          std::uint32_t src_mode = esp_int8::INPUT_SRC_NATIVE) {
   static volatile esp_int8::u8_t prof_stage_id = 0;
   static volatile ap_uint<1> prof_active = 0;
   static volatile esp_int8::u8_t prof_pc = 0;
@@ -40,5 +42,6 @@ inline void call_espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_
                            prof_issue_kind,
                            prof_conv_win_state,
                            prof_conv_sa_state,
-                           prof_conv_post_state);
+                           prof_conv_post_state,
+                           src_mode);
 }

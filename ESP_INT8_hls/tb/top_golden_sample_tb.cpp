@@ -16,6 +16,7 @@ namespace esp_int8 {
 bool param_dma_ready();
 unsigned csim_last_uop();
 unsigned csim_last_error();
+void frame_dma_load(const axi_vec_t* gmem_frame_in, std::uint32_t src_mode);
 bool on_chip_memory_read_fmbuf_abs_word(u8_t bank, u32_t offset, axi_vec_t& word);
 bool on_chip_memory_write_fmbuf_abs_word(u8_t bank, u32_t offset, axi_vec_t word);
 bool param_dma_get_affine_qparam(u8_t param_id, u8_t block, aff_q_t& qparam);
@@ -752,31 +753,105 @@ static bool check_binary_interpolation() {
   return true;
 }
 
-static void count_labels(const std::vector<std::uint8_t>& bytes,
-                         int& zeros,
-                         int& ones,
-                         int& others,
-                         int& aa) {
-  zeros = 0;
-  ones = 0;
-  others = 0;
-  aa = 0;
-  for (std::uint8_t value : bytes) {
-    if (value == 0U) {
-      ++zeros;
-    } else if (value == 1U) {
-      ++ones;
-    } else {
-      ++others;
-      if (value == 0xaaU) {
-        ++aa;
-      }
+static bool check_source_mode_case(const char* name, std::uint32_t src_mode,
+                                    const std::vector<std::uint8_t>& source,
+                                    const std::vector<std::uint8_t>& preprocessed,
+                                    const std::vector<std::uint8_t>& golden_logits,
+                                    const std::vector<std::uint8_t>& published_mask,
+                                    esp_int8::axi_vec_t* frame_in,
+                                    esp_int8::axi_vec_t* frame_out,
+                                    esp_int8::axi_vec_t* param) {
+  using namespace esp_int8;
+  const std::size_t source_bytes = src_mode == INPUT_SRC_NATIVE ? INPUT_FRAME_BYTES
+      : (src_mode == INPUT_SRC_H256W512 ? 256U * 512U : 512U * 1024U);
+  if (src_mode > INPUT_SRC_H512W1024 || source.size() != source_bytes ||
+      preprocessed.size() != INPUT_FRAME_BYTES || golden_logits.size() != ENCODER_LOGITS_BYTES ||
+      published_mask.size() != OUTPUT_FRAME_BYTES ||
+      published_mask != make_fullres_mask_golden(golden_logits, ESP_INT8_CSIM_CLASS_COUNT)) {
+    std::printf("[FAIL] %s malformed source/golden tensor contract\n", name);
+    return false;
+  }
+  pack_bytes(source, frame_in, INPUT_SOURCE_MAX_AXI_WORDS);
+  // Inspect the real DMA output before Conv/Pool reuses feature memory.
+  frame_dma_load(frame_in, src_mode);
+  unsigned input_mismatches = 0;
+  for (int word_idx = 0; word_idx < INPUT_FRAME_AXI_WORDS; ++word_idx) {
+    axi_vec_t word;
+    if (!on_chip_memory_read_fmbuf_abs_word(static_cast<u8_t>(static_cast<unsigned>(BANK_FMEM0)),
+                                            word_idx * AXI_WORD_BYTES, word)) {
+      return false;
+    }
+    for (int lane = 0; lane < AXI_WORD_BYTES; ++lane) {
+      input_mismatches += get_byte(word, lane) != preprocessed[word_idx * AXI_WORD_BYTES + lane];
     }
   }
+  if (input_mismatches != 0) {
+    std::printf("[FAIL] %s input selection mismatches=%u/%d\n", name, input_mismatches, INPUT_FRAME_BYTES);
+    return false;
+  }
+  for (int i = 0; i < OUTPUT_FRAME_AXI_WORDS; ++i) {
+    frame_out[i] = ~static_cast<axi_vec_t>(0);
+  }
+  std::remove("csim_u72_lowres_logits.bin");
+  std::printf("[TB] MODE_RUN %s src_mode=%u source_bytes=%zu\n", name, src_mode, source.size());
+  call_espnet_encoder_int8_core(frame_in, frame_out, param,
+                                MODE_RUN, UOP_COUNT_ENCODER, src_mode);
+  if (csim_last_error() != 0U) {
+    std::printf("[FAIL] %s last_uop=%u last_error=%u\n", name, csim_last_uop(), csim_last_error());
+    return false;
+  }
+  std::vector<std::uint8_t> logits;
+  if (!read_binary("csim_u72_lowres_logits.bin", logits) || logits.size() != golden_logits.size()) {
+    std::printf("[FAIL] %s missing fresh HWC logits dump\n", name);
+    return false;
+  }
+  std::vector<std::uint8_t> output(OUTPUT_FRAME_BYTES);
+  unsigned logits_mismatches = 0, mask_mismatches = 0, invalid = 0;
+  for (std::size_t i = 0; i < logits.size(); ++i) {
+    logits_mismatches += logits[i] != golden_logits[i];
+  }
+  for (std::size_t i = 0; i < output.size(); ++i) {
+    output[i] = get_byte(frame_out[i / AXI_WORD_BYTES], i % AXI_WORD_BYTES);
+    mask_mismatches += output[i] != published_mask[i];
+    invalid += output[i] >= ESP_INT8_CSIM_CLASS_COUNT;
+  }
+  const std::string suffix = src_mode == INPUT_SRC_NATIVE ? "" : "_s" + std::to_string(src_mode);
+  if (!write_binary(("hls_output_mask" + suffix + ".bin").c_str(), output) ||
+      !write_binary(("hls_output_logits" + suffix + ".bin").c_str(), logits)) {
+    return false;
+  }
+  std::printf("INPUT_SOURCE_RESULT %s mode=%u input=%u/%d logits=%u/%zu mask=%u/%zu invalid=%u last_error=%u\n",
+              name, src_mode, input_mismatches, INPUT_FRAME_BYTES,
+              logits_mismatches, logits.size(), mask_mismatches, output.size(), invalid, csim_last_error());
+  return logits_mismatches == 0 && mask_mismatches == 0 && invalid == 0;
+}
+
+static bool check_invalid_source_mode(esp_int8::axi_vec_t* frame_out,
+                                       esp_int8::axi_vec_t* param) {
+  using namespace esp_int8;
+  const axi_vec_t guard = ~static_cast<axi_vec_t>(0);
+  for (unsigned bad_mode : {3U, 0xffffffffU}) {
+    for (int i = 0; i < OUTPUT_FRAME_AXI_WORDS; ++i) { frame_out[i] = guard; }
+    if (!on_chip_memory_write_fmbuf_abs_word(static_cast<u8_t>(static_cast<unsigned>(BANK_FMEM0)),
+                                               0, guard)) { return false; }
+    call_espnet_encoder_int8_core(nullptr, frame_out, param, MODE_RUN, UOP_COUNT_ENCODER, bad_mode);
+    axi_vec_t actual;
+    if (csim_last_error() != static_cast<unsigned>(ERR_INVALID_MODE) || csim_last_uop() != 0U ||
+        !on_chip_memory_read_fmbuf_abs_word(static_cast<u8_t>(static_cast<unsigned>(BANK_FMEM0)), 0, actual) ||
+        actual != guard) {
+      std::printf("[FAIL] invalid source mode=%u started a DMA/EXEC\n", bad_mode);
+      return false;
+    }
+    for (int i = 0; i < OUTPUT_FRAME_AXI_WORDS; ++i) {
+      if (frame_out[i] != guard) { return false; }
+    }
+  }
+  std::printf("[PASS] invalid source modes rejected before DMA, memory/output guards preserved\n");
+  return true;
 }
 
 int main() {
-  static constexpr int MAX_ALLOWED_MASK_MISMATCHES = 0;
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
   static_assert(ESP_INT8_CSIM_CLASS_COUNT == 2, "H240 grayscale release is binary2");
   if (!check_bounded_int8_math() || !check_compact_packing() ||
       !check_binary_interpolation() || !check_vec_span_plans()) { return 1; }
@@ -789,7 +864,6 @@ int main() {
   const std::string input_path = std::string(artifact_dir) + "/input_q.bin";
   const std::string golden_logits_path =
       std::string(artifact_dir) + "/golden_output_q.bin";
-  const char* hls_output_path = "hls_output_mask.bin";
 
   std::vector<std::uint8_t> param_bytes;
   std::vector<std::uint8_t> input_bytes;
@@ -820,7 +894,7 @@ int main() {
 
   const std::size_t param_words =
       (param_bytes.size() + esp_int8::AXI_WORD_BYTES - 1U) / esp_int8::AXI_WORD_BYTES;
-  static esp_int8::axi_vec_t frame_in[esp_int8::INPUT_FRAME_AXI_WORDS];
+  static esp_int8::axi_vec_t frame_in[esp_int8::INPUT_SOURCE_MAX_AXI_WORDS];
   static esp_int8::axi_vec_t frame_out[esp_int8::OUTPUT_FRAME_AXI_WORDS];
   static esp_int8::axi_vec_t param[8192];
 
@@ -829,14 +903,7 @@ int main() {
     return 1;
   }
 
-  pack_bytes(input_bytes, frame_in, esp_int8::INPUT_FRAME_AXI_WORDS);
   pack_bytes(param_bytes, param, 8192U);
-  for (int i = 0; i < esp_int8::OUTPUT_FRAME_AXI_WORDS; ++i) {
-    frame_out[i] = ~static_cast<esp_int8::axi_vec_t>(0);
-    for (int lane = 0; lane < esp_int8::AXI_WORD_BYTES; ++lane) {
-      set_byte(frame_out[i], lane, 0xaaU);
-    }
-  }
 
   call_espnet_encoder_int8_core(frame_in, frame_out, param,
                                 esp_int8::MODE_INIT,
@@ -850,104 +917,8 @@ int main() {
     std::printf("[FAIL] current PARAM rejected by INIT\n");
     return 1;
   }
-  call_espnet_encoder_int8_core(frame_in, frame_out, param,
-                                esp_int8::MODE_RUN,
-                                esp_int8::UOP_COUNT_ENCODER);
-  std::printf("top golden diag: after MODE_RUN last_uop=%u last_error=%u\n",
-              esp_int8::csim_last_uop(),
-              esp_int8::csim_last_error());
-  if (esp_int8::csim_last_error() != 0U) {
-    std::printf("[FAIL] MODE_RUN returned an error\n");
-    return 1;
-  }
-
-  std::vector<std::uint8_t> hls_output(golden_mask.size());
-  for (std::size_t i = 0; i < hls_output.size(); ++i) {
-    hls_output[i] = get_byte(frame_out[i / esp_int8::AXI_WORD_BYTES],
-                             static_cast<int>(i % esp_int8::AXI_WORD_BYTES));
-  }
-  if (!write_binary(hls_output_path, hls_output)) {
-    return 1;
-  }
-
-  std::vector<std::uint8_t> hls_lowres_logits;
-  if (!read_binary("csim_u72_lowres_logits.bin", hls_lowres_logits) ||
-      hls_lowres_logits.size() != golden_logits.size()) {
-    std::printf("[FAIL] missing or malformed HLS lowres logits side dump\n");
-    return 1;
-  }
-  const std::vector<std::uint8_t> upsample_reference_mask =
-      make_fullres_mask_golden(hls_lowres_logits, ESP_INT8_CSIM_CLASS_COUNT);
-
-  int golden_zeros = 0;
-  int golden_ones = 0;
-  int golden_others = 0;
-  int golden_aa = 0;
-  int output_zeros = 0;
-  int output_ones = 0;
-  int output_others = 0;
-  int output_aa = 0;
-  count_labels(golden_mask, golden_zeros, golden_ones, golden_others, golden_aa);
-  count_labels(hls_output, output_zeros, output_ones, output_others, output_aa);
-  std::printf("top golden diag: golden zero=%d one=%d other=%d\n",
-              golden_zeros,
-              golden_ones,
-              golden_others);
-  std::printf("top golden diag: output zero=%d one=%d other=%d aa=%d\n",
-              output_zeros,
-              output_ones,
-              output_others,
-              output_aa);
-
-  int mismatches = 0;
-  int lowres_mismatches = 0;
-  int upsample_mismatches = 0;
-  int invalid_labels = 0;
-  for (std::size_t i = 0; i < golden_logits.size(); ++i) {
-    if (hls_lowres_logits[i] != golden_logits[i]) {
-      ++lowres_mismatches;
-    }
-  }
-  for (std::size_t i = 0; i < golden_mask.size(); ++i) {
-    const std::uint8_t got = hls_output[i];
-    const std::uint8_t expected = golden_mask[i];
-    if (got >= static_cast<std::uint8_t>(ESP_INT8_CSIM_CLASS_COUNT)) {
-      ++invalid_labels;
-    }
-    if (got != expected) {
-      if (mismatches < 32) {
-        std::printf("[DIFF] fullres mask mismatch byte=%zu got=%u expected=%u\n",
-                    i,
-                    static_cast<unsigned>(got),
-                    static_cast<unsigned>(expected));
-      }
-      ++mismatches;
-    }
-    if (got != upsample_reference_mask[i]) {
-      ++upsample_mismatches;
-    }
-  }
-
-  std::printf("wrote HLS output: %s bytes=%zu\n", hls_output_path, hls_output.size());
-  std::printf("top fullres golden mask stats: mismatches=%d/%zu invalid_labels=%d\n",
-              mismatches,
-              golden_mask.size(),
-              invalid_labels);
-  std::printf("top replay logits stats: mismatches=%d/%zu\n",
-              lowres_mismatches,
-              golden_logits.size());
-  std::printf("top upsample stats: mismatches=%d/%zu\n",
-              upsample_mismatches,
-              hls_output.size());
-  if (lowres_mismatches != 0 ||
-      upsample_mismatches != 0 ||
-      mismatches > MAX_ALLOWED_MASK_MISMATCHES ||
-      invalid_labels != 0) {
-    std::printf("[FAIL] replay logits=%d fullres=%d upsample=%d invalid=%d\n",
-                lowres_mismatches,
-                mismatches,
-                upsample_mismatches,
-                invalid_labels);
+  if (!check_source_mode_case("native", esp_int8::INPUT_SRC_NATIVE, input_bytes, input_bytes,
+                               golden_logits, published_mask, frame_in, frame_out, param)) {
     return 1;
   }
 
@@ -1015,8 +986,30 @@ int main() {
     std::printf("[FAIL] BLOCK5 coefficient cache invalidation\n");
     return 1;
   }
+  const char* reference_dir = "D:/ESPNet/resolution_h240w240_gray/input_resize_1023";
+  if (const char* selected = std::getenv("ESP_INT8_CSIM_INPUT_REFERENCE_DIR")) {
+    reference_dir = selected;
+  }
+  for (unsigned src_mode : {esp_int8::INPUT_SRC_H256W512, esp_int8::INPUT_SRC_H512W1024}) {
+    const std::string side = src_mode == esp_int8::INPUT_SRC_H256W512 ? "256" : "512";
+    std::vector<std::uint8_t> source, preprocessed, logits, mask;
+    const std::string base(reference_dir);
+    if (!read_binary((base + "/selected_int8_reference/I" + side + "Q.BIN").c_str(), source) ||
+        !read_binary((base + "/selected_reference/Q" + side + ".BIN").c_str(), preprocessed) ||
+        !read_binary((base + "/selected_int8_reference/L" + side + ".BIN").c_str(), logits) ||
+        !read_binary((base + "/selected_int8_reference/M" + side + ".BIN").c_str(), mask) ||
+        !check_source_mode_case(side.c_str(), src_mode, source, preprocessed, logits, mask,
+                                  frame_in, frame_out, param)) {
+      return 1;
+    }
+  }
+  if (!check_invalid_source_mode(frame_out, param) ||
+      !check_source_mode_case("reentry_native", esp_int8::INPUT_SRC_NATIVE, input_bytes, input_bytes,
+                                golden_logits, published_mask, frame_in, frame_out, param)) {
+    return 1;
+  }
   std::printf("[PASS] replay logits/mask are bit-exact, final AXI word covered, old geometry rejected\n");
 
-  std::printf("top_golden_sample_tb finished: mismatches=%d\n", mismatches);
+  std::printf("top_golden_sample_tb finished: all source modes and re-entry, 0 mismatches\n");
   return 0;
 }

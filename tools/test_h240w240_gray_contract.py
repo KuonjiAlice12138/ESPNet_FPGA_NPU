@@ -500,8 +500,84 @@ class GrayHlsContractTests(unittest.TestCase):
                             ("ENCODER_OUT_W", 30)):
             self.assertIn(f"constexpr int {name} = {value};", config)
         top = (self.root / "src/int8_core.cpp").read_text(encoding="utf-8-sig")
-        self.assertIn("bundle=gmem0 depth=1800", top)
+        self.assertIn("bundle=gmem0 depth=16384", top)
         self.assertIn("bundle=gmem1 depth=1800", top)
+
+    def test_high_resolution_source_does_not_expand_model_memory(self):
+        config = (self.root / "include/npu_config.hpp").read_text(encoding="utf-8-sig")
+        for text in ("INPUT_SOURCE_MAX_BYTES = 512 * 1024",
+                     "INPUT_RESIZE_LANES = 4", "INPUT_RESIZE_DENOM = 480",
+                     "INPUT_SRC_NATIVE = 0", "INPUT_SRC_H256W512 = 1",
+                     "INPUT_SRC_H512W1024 = 2"):
+            self.assertIn(text, config)
+        top = (self.root / "src/int8_core.cpp").read_text(encoding="utf-8-sig")
+        body = structure.function_body(top, "core_mode_run")
+        self.assertLess(body.index("src_mode > INPUT_SRC_H512W1024"),
+                        body.index("frame_dma_load("))
+        self.assertIn("return ERR_INVALID_MODE;", body)
+        self.assertIn("s_csim_last_error = ERR_NONE", body)
+        self.assertIn("s_axilite port=src_mode bundle=control", top)
+        self.assertIn("const std::uint32_t frame_src_mode = src_mode;", top)
+        self.assertIn("frame_dma_load(gmem_frame_in, src_mode)", body)
+
+    def test_input_resize_has_one_forward_pipeline_and_one_ram_writer(self):
+        source = (self.root / "src/frame_dma.cpp").read_text(encoding="utf-8-sig")
+        pipeline = structure.function_body(source, "frame_dma_load")
+        for text in ("#pragma HLS DATAFLOW", "frame_dma_read_source(",
+                     "frame_dma_select_pack(", "frame_dma_write_input("):
+            self.assertIn(text, pipeline)
+        self.assertNotIn("return", pipeline)
+        self.assertEqual(source.count("on_chip_memory_write_input_axi_word("), 2)
+        self.assertNotIn("ARRAY_PARTITION", source)
+        for retired in ("quant_lut", "make_quant", "bilinear", "float ", "double "):
+            self.assertNotIn(retired, source)
+        writer = structure.function_body(source, "frame_dma_write_input")
+        self.assertIn("INPUT_FRAME_AXI_WORDS", writer)
+        selector = structure.function_body(source, "frame_dma_select_pack")
+        self.assertIn("packed.range(255, 224)", selector)
+
+    def test_input_resize_highres_fifo_has_one_read_site(self):
+        source = (self.root / "src/frame_dma.cpp").read_text(encoding="utf-8-sig")
+        selector = structure.function_body(source, "frame_dma_select_pack")
+        highres = selector.split("} else {", 1)[1]
+        self.assertEqual(highres.count("source_words.read()"), 1,
+                         "Row initialization and refill must not compete for the FIFO")
+        self.assertNotIn("for (int row", highres)
+        self.assertNotIn("DEPENDENCE", highres)
+
+    def test_input_resize_has_no_wide_or_horizontal_variable_window(self):
+        source = (self.root / "src/frame_dma.cpp").read_text(encoding="utf-8-sig")
+        selector = structure.function_body(source, "frame_dma_select_pack")
+        for token in ("src_x", "x_error", "cached_word", "byte_shift",
+                      "ap_uint<512>", "span >>"):
+            self.assertNotIn(token, selector)
+        self.assertIn("frame_dma_compact_block(", selector)
+        self.assertIn("INPUT_FRAME_W / 15", selector)
+        self.assertIn("#pragma HLS PIPELINE II=1", selector)
+        compact = structure.function_body(source, "frame_dma_compact_block")
+        self.assertIsNotNone(compact)
+        self.assertIn("#pragma HLS UNROLL", compact)
+        self.assertNotIn("source_words", compact)
+        self.assertNotIn("on_chip_memory_", compact)
+
+    def test_input_source_top_validation_uses_separate_references_and_reentry(self):
+        tb = (self.root / "tb/top_golden_sample_tb.cpp").read_text(encoding="utf-8-sig")
+        self.assertIn("ESP_INT8_CSIM_INPUT_REFERENCE_DIR", tb)
+        case = structure.function_body(tb, "check_source_mode_case")
+        for text in ("frame_dma_load(frame_in, src_mode)", "csim_last_error()",
+                     "golden_logits", "published_mask", "input_mismatches"):
+            self.assertIn(text, case)
+        self.assertIn("INPUT_SOURCE_MAX_AXI_WORDS", case)
+        self.assertIn("check_invalid_source_mode", tb)
+        for text in ("/selected_int8_reference/I", "/selected_reference/Q",
+                     "/selected_int8_reference/L", "/selected_int8_reference/M"):
+            self.assertIn(text, tb)
+        self.assertIn("reentry_native", tb)
+        script = (self.root / "run_csim_input_resize.tcl").read_text(encoding="utf-8-sig")
+        self.assertIn("--validate-prequant-manifest", script)
+        self.assertIn("top_golden_sample_tb.cpp", script)
+        self.assertEqual(script.count("csim_design"), 1)
+        self.assertNotIn("csynth_design", script)
 
     def test_tensor_stride_decodes_compiler_row_padding_flag(self):
         types = (self.root / "include/npu_types.hpp").read_text(encoding="utf-8-sig")

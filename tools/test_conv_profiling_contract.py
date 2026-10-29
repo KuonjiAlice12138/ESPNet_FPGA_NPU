@@ -142,7 +142,7 @@ class ConvProfilingContractTests(unittest.TestCase):
         body = main[start:main.index("\nstatic int ", start + 1)]
         self.assertIn("stage_counter_has_conv_profile()", body)
         self.assertIn("validate_output_classes(profile_name, expected_classes)", body)
-        self.assertIn("run_full_infer_once(npu, uop_count, &cycles, 1U)", body)
+        self.assertIn("run_full_infer_once(npu, uop_count, src_mode, &cycles, 1U)", body)
         self.assertIn("s_perf_count = 0U;", body)
         self.assertIn("stage_counter_read_stage(12U)", body)
         self.assertLess(body.index("stage_counter_has_conv_profile()"),
@@ -150,9 +150,9 @@ class ConvProfilingContractTests(unittest.TestCase):
         self.assertLess(body.index("SD_SaveMemoryToFile("),
                         body.index("validate_output_classes(profile_name, expected_classes)"))
 
-    def test_dual_single_mode_uses_separate_short_names(self) -> None:
+    def test_optional_dual_single_mode_uses_separate_short_names(self) -> None:
         cfg = read_repo("ESP_INT8_app/src/app_config.h")
-        self.assertRegex(cfg, r"#define INT8_APP_ENABLE_DUAL_SINGLE_TEST 1U")
+        self.assertRegex(cfg, r"#define INT8_APP_ENABLE_DUAL_SINGLE_TEST [01]U")
         for mode in ("EXEC_PREFIX_PROFILE", "VAL_SET_TEST", "DUAL_VAL_SET_TEST"):
             self.assertRegex(cfg, rf"#define INT8_APP_ENABLE_{mode} 0U")
         names = []
