@@ -16,9 +16,12 @@
 #error "select only one input-source, prefix, validation-set, or dual-single test mode"
 #endif
 
-#if INT8_APP_ENABLE_INPUT_SOURCE_TEST && INT8_APP_SOURCE_TEST_MODE > INT8_INPUT_SRC_H512W1024
-#error "input-source test mode must be native, H256W512, or H512W1024"
+#if INT8_APP_ENABLE_INPUT_SOURCE_TEST && INT8_APP_SOURCE_TEST_MODE > INT8_INPUT_SRC_H512W512
+#error "input-source test mode must be native, H256W512, H512W1024, or H512W512"
 #endif
+
+_Static_assert(INT8_INPUT_BYTES == 57600U && INT8_OUTPUT_BYTES == 262144U,
+               "H240 encoder / MASK512 output require matching new hardware");
 
 static inline u64 read_timer_counter(void)
 {
@@ -760,13 +763,16 @@ static int run_input_source_tests(Int8NpuContext *npu, u32 uop_count)
          INT8_APP_SOURCE256_INPUT_FILE, INT8_APP_SOURCE256_OUTPUT_FILE},
         {INT8_INPUT_SRC_H512W1024, "binary2_h512w1024",
          INT8_APP_SOURCE512_INPUT_FILE, INT8_APP_SOURCE512_OUTPUT_FILE},
+        {INT8_INPUT_SRC_H512W512, "binary2_h512w512",
+         INT8_APP_SOURCE_SQUARE_INPUT_FILE, INT8_APP_SOURCE_SQUARE_OUTPUT_FILE},
     };
-    u64 ticks[3] = {0ULL, 0ULL, 0ULL};
-    u64 rtl_cycles[3] = {0ULL, 0ULL, 0ULL};
-    u64 load_cycles[3] = {0ULL, 0ULL, 0ULL};
+    enum { SOURCE_CASE_COUNT = sizeof(cases) / sizeof(cases[0]) };
+    u64 ticks[SOURCE_CASE_COUNT] = {0ULL};
+    u64 rtl_cycles[SOURCE_CASE_COUNT] = {0ULL};
+    u64 load_cycles[SOURCE_CASE_COUNT] = {0ULL};
     u32 index;
 
-    for (index = 0U; index < 3U; ++index) {
+    for (index = 0U; index < SOURCE_CASE_COUNT; ++index) {
         if (cases[index].mode != INT8_APP_SOURCE_TEST_MODE) {
             continue;
         }
@@ -781,7 +787,7 @@ static int run_input_source_tests(Int8NpuContext *npu, u32 uop_count)
     }
     xil_printf("INPUT_SOURCE_SUMMARY_BEGIN\r\n");
     xil_printf("src_mode,input_bytes,arm_ticks,arm_ms,rtl_cycles,frame_load,output\r\n");
-    for (index = 0U; index < 3U; ++index) {
+    for (index = 0U; index < SOURCE_CASE_COUNT; ++index) {
         if (cases[index].mode != INT8_APP_SOURCE_TEST_MODE) {
             continue;
         }

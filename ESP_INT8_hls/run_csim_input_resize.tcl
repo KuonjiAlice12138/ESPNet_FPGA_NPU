@@ -1,12 +1,12 @@
-# Input-extension validation only; production cfg and synthesis remain manual.
+# Source/output-extension validation only; production cfg and synthesis remain manual.
 set root [file dirname [file normalize [info script]]]
 set test full
 if {[info exists ::env(ESP_INT8_INPUT_RESIZE_TEST)]} {set test $::env(ESP_INT8_INPUT_RESIZE_TEST)}
-if {$test ni {unit full}} {error "Input resize test must be unit or full"}
-set study D:/ESPNet/resolution_h240w240_gray/input_resize_1023
-puts [exec D:/ESPNet/.venv/Scripts/python.exe -B [file join $study input_resize_1023.py] \
-    --validate-prequant-manifest [file join $study selected_int8_reference RESIZEQ.json]]
-open_project -reset [file join $root hls_work_input_resize_$test]
+if {$test ni {unit mask240 full}} {error "Resize test must be unit, mask240, or full"}
+set study D:/ESPNet/resolution_h240w240_gray/output_restore_1104
+puts [exec D:/ESPNet/.venv/Scripts/python.exe -B [file join $study output_restore_1104.py] \
+    --validate-results [file join $study results_500.json]]
+open_project -reset [file join $root hls_work_output_restore_$test]
 if {$test eq "unit"} {
     add_files [file join $root src frame_dma.cpp]
     add_files [file join $root src memory.cpp]
@@ -15,16 +15,22 @@ if {$test eq "unit"} {
 } else {
     set ::env(ESP_INT8_CSIM_ARTIFACT_DIR) \
         [file join [file dirname $root] hw_artifacts binary2_int8_h240w240_gray_r6_v4]
-    set ::env(ESP_INT8_CSIM_INPUT_REFERENCE_DIR) $study
+    set ::env(ESP_INT8_CSIM_OUTPUT_REFERENCE_DIR) [file join $study selected_reference]
+    unset -nocomplain ::env(ESP_INT8_CSIM_UNITS_ONLY)
+    set flags "-DESP_INT8_CSIM_DUMP_LOWRES_LOGITS_SIDE"
+    if {$test eq "mask240"} {
+        append flags " -DESP_INT8_MASK_SIZE=240"
+        set ::env(ESP_INT8_CSIM_UNITS_ONLY) 1
+    }
     set handle [open [file join $root hls_config.cfg] r]
     set cfg [read $handle]
     close $handle
     foreach line [split $cfg "\n"] {
         if {[regexp {^syn.file=(.+)$} [string trim $line] -> path]} {
-            add_files -cflags "-DESP_INT8_CSIM_DUMP_LOWRES_LOGITS_SIDE" [file join $root $path]
+            add_files -cflags $flags [file join $root $path]
         }
     }
-    add_files -tb -cflags "-DESP_INT8_CSIM_DUMP_LOWRES_LOGITS_SIDE" \
+    add_files -tb -cflags $flags \
         [file join $root tb top_golden_sample_tb.cpp]
     set_top espnet_encoder_int8_core
 }

@@ -28,14 +28,16 @@ static void frame_dma_read_source(const axi_vec_t* gmem_frame_in,
             source_words.write(gmem_frame_in[word_idx]);
         }
     } else {
-        const bool large = src_mode == INPUT_SRC_H512W1024;
+        const bool large = src_mode != INPUT_SRC_H256W512;
         const int roi_words = large ? 16 : 8;
+        const int pitch_shift = src_mode == INPUT_SRC_H512W1024 ? 5 : 4;
+        const int roi_word_offset = src_mode == INPUT_SRC_H512W512 ? 0 : (large ? 8 : 4);
         ap_uint<10> src_y = large ? INPUT_RESIZE_LARGE_INITIAL_INDEX : INPUT_RESIZE_SMALL_INITIAL_INDEX;
         ap_uint<10> y_error = large ? INPUT_RESIZE_LARGE_INITIAL_ERROR : INPUT_RESIZE_SMALL_INITIAL_ERROR;
         for (int row = 0; row < INPUT_FRAME_H; ++row) {
 #pragma HLS PIPELINE off
             const ap_uint<14> row_base =
-                (static_cast<ap_uint<14>>(src_y) << (large ? 5 : 4)) + (large ? 8 : 4);
+                (static_cast<ap_uint<14>>(src_y) << pitch_shift) + roi_word_offset;
             // One contiguous, aligned ROI burst per selected source row.
             for (int word_idx = 0; word_idx < roi_words; ++word_idx) {
 #pragma HLS PIPELINE II=1
@@ -73,7 +75,7 @@ static void frame_dma_select_pack(hls::stream<axi_vec_t>& source_words,
             packed_words.write(source_words.read());
         }
     } else {
-        const bool large = src_mode == INPUT_SRC_H512W1024;
+        const bool large = src_mode != INPUT_SRC_H256W512;
         constexpr int service_count = INPUT_FRAME_H * (INPUT_FRAME_W / 15) * 4;
         static_assert(INPUT_FRAME_W % 15 == 0 && INPUT_RESIZE_LANES == 4,
                       "Input compaction requires whole 15-pixel blocks and four-byte groups");

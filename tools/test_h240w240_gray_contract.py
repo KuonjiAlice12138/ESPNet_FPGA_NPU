@@ -501,18 +501,36 @@ class GrayHlsContractTests(unittest.TestCase):
             self.assertIn(f"constexpr int {name} = {value};", config)
         top = (self.root / "src/int8_core.cpp").read_text(encoding="utf-8-sig")
         self.assertIn("bundle=gmem0 depth=16384", top)
-        self.assertIn("bundle=gmem1 depth=1800", top)
+        self.assertIn("bundle=gmem1 depth=8192", top)
+
+    def test_high_resolution_mask_is_compile_time_and_not_encoder_geometry(self):
+        config = (self.root / "include/npu_config.hpp").read_text(encoding="utf-8-sig")
+        self.assertIn("#define ESP_INT8_MASK_SIZE 512", config)
+        self.assertIn("FULLRES_MASK_H = ESP_INT8_MASK_SIZE", config)
+        self.assertIn("FULLRES_MASK_W = ESP_INT8_MASK_SIZE", config)
+        self.assertIn("INPUT_SRC_H512W512 = 3", config)
+        up = (self.root / "src/upsample_unit.cpp").read_text(encoding="utf-8-sig")
+        self.assertIn("s_next_output_y", up)
+        self.assertIn("MASK_SEGMENT_MAX", up)
+        self.assertIn("MASK_INITIAL", up)
+        self.assertEqual(up.count("gmem_frame_out[s_mask_word_index++] ="), 1)
+        for retired in ("interpolate_binary_segment", "ap_uint<64>", "labels[UPSAMPLE_SCALE]",
+                        "emit_case", "emit_fullres_rows"):
+            self.assertNotIn(retired, up)
+        dma = (self.root / "src/frame_dma.cpp").read_text(encoding="utf-8-sig")
+        self.assertIn("INPUT_SRC_H512W512", dma)
+        self.assertEqual(dma.count("#pragma HLS DATAFLOW"), 1)
 
     def test_high_resolution_source_does_not_expand_model_memory(self):
         config = (self.root / "include/npu_config.hpp").read_text(encoding="utf-8-sig")
         for text in ("INPUT_SOURCE_MAX_BYTES = 512 * 1024",
                      "INPUT_RESIZE_LANES = 4", "INPUT_RESIZE_DENOM = 480",
                      "INPUT_SRC_NATIVE = 0", "INPUT_SRC_H256W512 = 1",
-                     "INPUT_SRC_H512W1024 = 2"):
+                     "INPUT_SRC_H512W1024 = 2", "INPUT_SRC_H512W512 = 3"):
             self.assertIn(text, config)
         top = (self.root / "src/int8_core.cpp").read_text(encoding="utf-8-sig")
         body = structure.function_body(top, "core_mode_run")
-        self.assertLess(body.index("src_mode > INPUT_SRC_H512W1024"),
+        self.assertLess(body.index("src_mode > INPUT_SRC_H512W512"),
                         body.index("frame_dma_load("))
         self.assertIn("return ERR_INVALID_MODE;", body)
         self.assertIn("s_csim_last_error = ERR_NONE", body)
@@ -560,21 +578,22 @@ class GrayHlsContractTests(unittest.TestCase):
         self.assertNotIn("source_words", compact)
         self.assertNotIn("on_chip_memory_", compact)
 
-    def test_input_source_top_validation_uses_separate_references_and_reentry(self):
+    def test_input_source_top_validation_uses_one_frozen_square_full_run(self):
         tb = (self.root / "tb/top_golden_sample_tb.cpp").read_text(encoding="utf-8-sig")
-        self.assertIn("ESP_INT8_CSIM_INPUT_REFERENCE_DIR", tb)
+        self.assertIn("ESP_INT8_CSIM_OUTPUT_REFERENCE_DIR", tb)
         case = structure.function_body(tb, "check_source_mode_case")
         for text in ("frame_dma_load(frame_in, src_mode)", "csim_last_error()",
                      "golden_logits", "published_mask", "input_mismatches"):
             self.assertIn(text, case)
         self.assertIn("INPUT_SOURCE_MAX_AXI_WORDS", case)
         self.assertIn("check_invalid_source_mode", tb)
-        for text in ("/selected_int8_reference/I", "/selected_reference/Q",
-                     "/selected_int8_reference/L", "/selected_int8_reference/M"):
+        for text in ("/I512S.BIN", "/Q240.BIN", "/L30.BIN", "/M512.BIN"):
             self.assertIn(text, tb)
-        self.assertIn("reentry_native", tb)
+        self.assertEqual(tb.count('check_source_mode_case("square512"'), 1)
+        self.assertIn("{4U, 0xffffffffU}", tb)
+        self.assertIn("ESP_INT8_CSIM_UNITS_ONLY", tb)
         script = (self.root / "run_csim_input_resize.tcl").read_text(encoding="utf-8-sig")
-        self.assertIn("--validate-prequant-manifest", script)
+        self.assertIn("--validate-results", script)
         self.assertIn("top_golden_sample_tb.cpp", script)
         self.assertEqual(script.count("csim_design"), 1)
         self.assertNotIn("csynth_design", script)

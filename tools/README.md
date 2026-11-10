@@ -1,7 +1,14 @@
 # ESP INT8 Tools
 
-Current HLS branch: `feature/h240w240-gray-int8`, binary2 INT8, grayscale
-240x240 input, 30x30 logits, 240x240 output mask, PARAM v4.
+Current source branch: `feature/h240-mask512`, binary2 INT8, grayscale
+240x240 encoder input, 30x30 logits, PARAM v4. `workplan_1104` extends source
+mode 3 to a tightly packed 512x512 square and outputs a direct 512x512 mask.
+External signed-INT8 inputs retain native240, 256x512 and 512x1024 central-ROI
+semantics. Output size is compile-time fixed, with a 240 regression configuration.
+The initial 512-mask release passed csynth, 100 MHz implementation and one mode-3
+board test: 54.12012 ms, 0/262144 mask mismatches. Repeated frames/mode switching
+and full-validation-set board testing remain pending. Do not use the old
+240-output platform with the new App.
 Model training and hardware-constrained QAT tools live in `D:/ESPNet`.
 
 ## Artifact Contract
@@ -11,20 +18,31 @@ The initial board release remains `hw_artifacts/binary2_int8_h240w240_gray_v4`;
 its PARAM must not be used with Round 6/7/8 HLS. The v4 record layout is unchanged,
 but schedule word 9 now explicitly selects C1 packed-row reuse and narrow-channel
 column transfer. Round 6 INIT rejects the retired narrow transfer protocol.
-Weights, qparams, input and numerical golden remain identical to the baseline.
-`INPUTQ.BIN` and the full-resolution mask are each 57,600 bytes;
-low-resolution HWC INT8 logits are 1,800 bytes. The manifest records grayscale
+Weights, qparams and encoder numerics remain identical to the baseline.
+The artifact's native `INPUTQ.BIN` and historical 240 mask are each 57,600 bytes;
+the new 262144-byte 512 mask uses the separate output-restore reference set.
+Low-resolution HWC INT8 logits are 1,800 bytes. The manifest records grayscale
 normalization, center-square crop, checkpoint/cache hashes and tensor geometry.
 Intermediate compact rows carry an explicit 32-byte row-padding flag; input and
 pool tensors remain tightly packed.
 
 The Python tools can still inspect the preserved H256W512 binary2/cityscapes20
 releases. Those artifacts are **not compatible with the current H240/C1 HLS IP**,
-despite both using PARAM v4. The App selects Round 8 `platform_h240_1021` and runs
-the H240 grayscale single image using `P2G.BIN` / `I2G.BIN` / `O2G.BIN`.
+despite both using PARAM v4. The previous board release used
+`platform_h240_resize_1025`, `I512Q.BIN` / `O512Q.BIN` and source mode 2.
+The updated App selects `platform_1109` and mode 3, with
+`I512S.BIN` / `O512S.BIN` (262144 bytes each). New hardware implementation and
+platform binding are verified; App build/launch and SD preparation remain manual.
 Round 8 reuses the Round 6 artifact without re-exporting or changing golden data.
 Rebuild App manually after aligning its platform configuration. SD boot also requires a newly packaged
 `BOOT.BIN`; `ESP_INT8_app/src/boot_h240.bif` fixes the platform/bitstream/ELF paths.
+
+For the new geometry, run `ESP_INT8_hls/run_csim_input_resize.tcl` through
+`vitis-run --mode hls --tcl`. `ESP_INT8_INPUT_RESIZE_TEST=unit` runs all four
+input layouts locally, `mask240` runs the old output regression without a full
+network inference, and `full` runs the only final top mode-3 inference with
+frozen `output_restore_1104/selected_reference` input/logits/mask and guards.
+The runner does not alter the production cfg or start csynth.
 
 ## Compile and Validate
 
@@ -69,6 +87,16 @@ For evaluation, explicitly supply the current artifact, cache, output paths and
 classify concurrent activity in the same Conv interval and must not be summed.
 HLS maximum latency is not a replacement for board cycle measurements.
 
+Independent output-mask geometry is explicit: `fullres_mask_from_logits(...,
+mask_shape=(512, 512))`, or `--mask-height 512 --mask-width 512` in the evaluators.
+The encoder `geometry` must stay 240x240/30x30; do not fake a 512 encoder.
+Manifests may declare `mask_shape` and `target_encoding=cityscapes_train_ids`
+for raw annotations. Already mapped `.npy` targets retain their separate label
+semantics. High-resolution targets are read from original annotation PNGs,
+center-cropped and half-pixel nearest-sampled, never enlarged from 240 labels.
+The isolated 500-image study, references and reproduction commands are in
+`D:/ESPNet/resolution_h240w240_gray/output_restore_1104/README.md`.
+
 ## Checks
 
 ```powershell
@@ -85,21 +113,19 @@ configuration, not the old dual-model test. They do not imply that old RGB paths
 in the new hardware. `testdata/rtl_stage_0910.csv` is a frozen historical board
 measurement, not a performance measurement for the grayscale IP.
 
-Full-resolution CSim is configured by `ESP_INT8_hls/hls_config.cfg` and writes
-`csim_u72_lowres_logits.bin` and `hls_output_mask.bin` under the chosen CSim
-work directory. Its TB defaults to the Round 6 candidate. To run the dedicated
-Round 7 final validation without changing the production cfg, use this from `ESP_INT8_hls`:
+The production `ESP_INT8_hls/hls_config.cfg` keeps the original top and source list.
+Its TB now defaults to the frozen square-source study and performs one full mode-3
+inference. It writes `csim_u72_lowres_logits.bin`, `hls_output_logits_s3.bin` and
+`hls_output_mask_s3.bin` under the chosen CSim work directory. From `ESP_INT8_hls`:
 
 ```powershell
-$env:ESP_INT8_CSIM_ROUND = '7'
-$env:ESP_INT8_ROUND6_TEST = 'full'
-& 'D:/Xilinx/2025.1/Vitis/bin/vitis-run.bat' --mode hls --tcl run_csim_1011_round6.tcl
+$env:ESP_INT8_INPUT_RESIZE_TEST = 'full'
+& 'D:/Xilinx/2025.1/Vitis/bin/vitis-run.bat' --mode hls --tcl run_csim_input_resize.tcl
 ```
 
-The same Tcl script retains Round 6 focus/full validation when
-`ESP_INT8_CSIM_ROUND` is unset or `6`. Round 7 runs in a separate work directory.
-The full-frame TB also checks compact tails/error draining and exact binary
-bilinear edge, tie and cross-frame behavior within that single CSim run.
+Set the test to `unit` for DMA checks or `mask240` for the old 240-mask regression
+without a network run. The full TB also checks compact tails/error draining,
+bilinear extrema/ties/segment boundaries, row readiness, guards and reset.
 
 Synthesis, packaging, implementation and app build remain manual. CSim validates
 functional/token contracts, not RTL FIFO liveness or measured cycle savings.

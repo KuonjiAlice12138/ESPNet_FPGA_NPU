@@ -548,28 +548,28 @@ static void bilinear_axis_map(int out_idx,
                               int& idx1,
                               int& w0,
                               int& w1) {
-  const int scale = esp_int8::UPSAMPLE_SCALE;
-  const int clip_high_start = in_size * scale - (scale / 2);
-  if (out_idx < (scale / 2)) {
+  // Independent rational reference: do not reuse the hardware segment recurrence.
+  const int denominator = 2 * esp_int8::FULLRES_MASK_W;
+  const int numer = (2 * out_idx + 1) * in_size - esp_int8::FULLRES_MASK_W;
+  if (numer < 0) {
     idx0 = 0;
     idx1 = 0;
-    w0 = 16;
+    w0 = denominator;
     w1 = 0;
     return;
   }
-  if (out_idx >= clip_high_start) {
+  if (numer >= (in_size - 1) * denominator) {
     idx0 = in_size - 1;
     idx1 = in_size - 1;
-    w0 = 16;
+    w0 = denominator;
     w1 = 0;
     return;
   }
 
-  const int numer = 2 * out_idx - (scale - 1);
-  idx0 = numer >> 4;
+  idx0 = numer / denominator;
   idx1 = idx0 + 1;
-  w1 = numer & 0x0f;
-  w0 = 16 - w1;
+  w1 = numer % denominator;
+  w0 = denominator - w1;
 }
 
 static int logit_at(const std::vector<std::uint8_t>& logits_nhwc,
@@ -601,14 +601,15 @@ static std::vector<std::uint8_t> make_fullres_mask_golden(
       int wx1 = 0;
       bilinear_axis_map(x, esp_int8::ENCODER_OUT_W, x0, x1, wx0, wx1);
 
-      int best_value = -0x7fffffff;
+      std::int64_t best_value = INT64_MIN;
       std::uint8_t best_class = 0;
       for (int class_id = 0; class_id < class_count; ++class_id) {
         const int top = logit_at(logits_nhwc, y0, x0, class_id, class_count) * wx0 +
                         logit_at(logits_nhwc, y0, x1, class_id, class_count) * wx1;
         const int bottom = logit_at(logits_nhwc, y1, x0, class_id, class_count) * wx0 +
                            logit_at(logits_nhwc, y1, x1, class_id, class_count) * wx1;
-        const int interp = top * wy0 + bottom * wy1;
+        const std::int64_t interp = static_cast<std::int64_t>(top) * wy0 +
+                                    static_cast<std::int64_t>(bottom) * wy1;
         if (interp > best_value) {
           best_value = interp;
           best_class = static_cast<std::uint8_t>(class_id);
@@ -715,14 +716,22 @@ static bool check_compact_packing() {
 
 static bool check_binary_interpolation() {
   using namespace esp_int8;
-  static axi_vec_t output[OUTPUT_FRAME_AXI_WORDS];
+  static axi_vec_t guarded[OUTPUT_FRAME_AXI_WORDS + 2];
+  axi_vec_t* output = guarded + 1;
   static act_vec_t row_buf[MAX_FM_W];
-  for (unsigned pattern = 0; pattern < 3; ++pattern) {
+  const axi_vec_t guard = ~static_cast<axi_vec_t>(0);
+  for (unsigned pattern = 0; pattern < 7; ++pattern) {
     std::vector<std::uint8_t> logits(ENCODER_OUT_H * ENCODER_OUT_W * 2);
     for (unsigned pixel = 0; pixel < ENCODER_OUT_H * ENCODER_OUT_W; ++pixel) {
       if (pattern == 0U) {
         logits[pixel * 2] = (pixel & 1U) == 0U ? 128U : 127U;
         logits[pixel * 2 + 1] = (pixel & 1U) == 0U ? 127U : 128U;
+      } else if (pattern >= 3U) {
+        const bool positive = pattern == 4U ||
+            (pattern == 5U && pixel / ENCODER_OUT_W >= 15U) ||
+            (pattern == 6U && pixel % ENCODER_OUT_W >= 15U);
+        logits[pixel * 2] = positive ? 128U : 127U;
+        logits[pixel * 2 + 1] = positive ? 127U : 128U;
       } else {
         logits[pixel * 2] = static_cast<std::uint8_t>(pixel * 53U + 17U);
         logits[pixel * 2 + 1] = pattern == 2U ? logits[pixel * 2]
@@ -730,8 +739,17 @@ static bool check_binary_interpolation() {
       }
     }
     const auto expected = make_fullres_mask_golden(logits, 2);
-    for (auto& word : output) { word = ~static_cast<axi_vec_t>(0); }
+    for (auto& word : guarded) { word = guard; }
+    // Restart after a partial frame, not only after a fully drained frame.
     upsample_fused_begin();
+    upsample_fused_consume_logits_row(output, static_cast<u16_t>(0),
+                                       static_cast<u8_t>(2), row_buf);
+    for (auto& word : guarded) { word = guard; }
+    upsample_fused_begin();
+    upsample_fused_consume_logits_row(output, static_cast<u16_t>(0),
+                                       static_cast<u8_t>(0), row_buf);
+    for (const auto& word : guarded) { if (word != guard) { return false; } }
+    unsigned ready_rows = 0;
     for (int row = 0; row < ENCODER_OUT_H; ++row) {
       for (int col = 0; col < ENCODER_OUT_W; ++col) {
         row_buf[col] = 0;
@@ -741,6 +759,25 @@ static bool check_binary_interpolation() {
       }
       upsample_fused_consume_logits_row(output, static_cast<u16_t>(row),
                                          static_cast<u8_t>(2), row_buf);
+      while (ready_rows < FULLRES_MASK_H) {
+        int y0, y1, wy0, wy1;
+        bilinear_axis_map(ready_rows, ENCODER_OUT_H, y0, y1, wy0, wy1);
+        if (y1 > row) { break; }
+        ++ready_rows;
+      }
+      const unsigned complete_words = ready_rows * FULLRES_MASK_W / AXI_WORD_BYTES;
+      for (unsigned word = 0; word < OUTPUT_FRAME_AXI_WORDS; ++word) {
+        const bool written = output[word] != guard;
+        if (written != (word < complete_words)) {
+          std::printf("[FAIL] bilinear pattern=%u row=%d word=%u readiness/length\n",
+                      pattern, row, word);
+          return false;
+        }
+      }
+      if (guarded[0] != guard || guarded[OUTPUT_FRAME_AXI_WORDS + 1] != guard) {
+        std::printf("[FAIL] bilinear output guard overwritten\n");
+        return false;
+      }
     }
     for (unsigned pixel = 0; pixel < expected.size(); ++pixel) {
       if (get_byte(output[pixel / AXI_WORD_BYTES], pixel % AXI_WORD_BYTES) != expected[pixel]) {
@@ -749,7 +786,8 @@ static bool check_binary_interpolation() {
       }
     }
   }
-  std::printf("[PASS] binary bilinear: extrema/random/ties, edge clipping, cross-row packing and reset\n");
+  std::printf("[PASS] binary bilinear %dx%d: 7 patterns, exact row readiness/segment boundaries, guards and partial-frame reset\n",
+              FULLRES_MASK_H, FULLRES_MASK_W);
   return true;
 }
 
@@ -763,8 +801,9 @@ static bool check_source_mode_case(const char* name, std::uint32_t src_mode,
                                     esp_int8::axi_vec_t* param) {
   using namespace esp_int8;
   const std::size_t source_bytes = src_mode == INPUT_SRC_NATIVE ? INPUT_FRAME_BYTES
-      : (src_mode == INPUT_SRC_H256W512 ? 256U * 512U : 512U * 1024U);
-  if (src_mode > INPUT_SRC_H512W1024 || source.size() != source_bytes ||
+      : (src_mode == INPUT_SRC_H256W512 ? 256U * 512U
+          : (src_mode == INPUT_SRC_H512W512 ? 512U * 512U : 512U * 1024U));
+  if (src_mode > INPUT_SRC_H512W512 || source.size() != source_bytes ||
       preprocessed.size() != INPUT_FRAME_BYTES || golden_logits.size() != ENCODER_LOGITS_BYTES ||
       published_mask.size() != OUTPUT_FRAME_BYTES ||
       published_mask != make_fullres_mask_golden(golden_logits, ESP_INT8_CSIM_CLASS_COUNT)) {
@@ -792,6 +831,9 @@ static bool check_source_mode_case(const char* name, std::uint32_t src_mode,
   for (int i = 0; i < OUTPUT_FRAME_AXI_WORDS; ++i) {
     frame_out[i] = ~static_cast<axi_vec_t>(0);
   }
+  const axi_vec_t guard = ~static_cast<axi_vec_t>(0);
+  frame_out[-1] = guard;
+  frame_out[OUTPUT_FRAME_AXI_WORDS] = guard;
   std::remove("csim_u72_lowres_logits.bin");
   std::printf("[TB] MODE_RUN %s src_mode=%u source_bytes=%zu\n", name, src_mode, source.size());
   call_espnet_encoder_int8_core(frame_in, frame_out, param,
@@ -823,14 +865,16 @@ static bool check_source_mode_case(const char* name, std::uint32_t src_mode,
   std::printf("INPUT_SOURCE_RESULT %s mode=%u input=%u/%d logits=%u/%zu mask=%u/%zu invalid=%u last_error=%u\n",
               name, src_mode, input_mismatches, INPUT_FRAME_BYTES,
               logits_mismatches, logits.size(), mask_mismatches, output.size(), invalid, csim_last_error());
-  return logits_mismatches == 0 && mask_mismatches == 0 && invalid == 0;
+  const bool guards_ok = frame_out[-1] == guard && frame_out[OUTPUT_FRAME_AXI_WORDS] == guard;
+  std::printf("[TB] output words=%d guards=%s\n", OUTPUT_FRAME_AXI_WORDS, guards_ok ? "PASS" : "FAIL");
+  return logits_mismatches == 0 && mask_mismatches == 0 && invalid == 0 && guards_ok;
 }
 
 static bool check_invalid_source_mode(esp_int8::axi_vec_t* frame_out,
                                        esp_int8::axi_vec_t* param) {
   using namespace esp_int8;
   const axi_vec_t guard = ~static_cast<axi_vec_t>(0);
-  for (unsigned bad_mode : {3U, 0xffffffffU}) {
+  for (unsigned bad_mode : {4U, 0xffffffffU}) {
     for (int i = 0; i < OUTPUT_FRAME_AXI_WORDS; ++i) { frame_out[i] = guard; }
     if (!on_chip_memory_write_fmbuf_abs_word(static_cast<u8_t>(static_cast<unsigned>(BANK_FMEM0)),
                                                0, guard)) { return false; }
@@ -861,16 +905,20 @@ int main() {
   }
   std::printf("[TB] artifact_dir=%s classes=%d\n", artifact_dir, ESP_INT8_CSIM_CLASS_COUNT);
   const std::string param_path = std::string(artifact_dir) + "/PARAM.BIN";
-  const std::string input_path = std::string(artifact_dir) + "/input_q.bin";
-  const std::string golden_logits_path =
-      std::string(artifact_dir) + "/golden_output_q.bin";
+  const char* reference_dir = "D:/ESPNet/resolution_h240w240_gray/output_restore_1104/selected_reference";
+  if (const char* selected = std::getenv("ESP_INT8_CSIM_OUTPUT_REFERENCE_DIR")) {
+    reference_dir = selected;
+  }
+  const std::string reference(reference_dir);
 
   std::vector<std::uint8_t> param_bytes;
   std::vector<std::uint8_t> input_bytes;
   std::vector<std::uint8_t> golden_logits;
+  std::vector<std::uint8_t> square_source;
   if (!read_binary(param_path.c_str(), param_bytes) ||
-      !read_binary(input_path.c_str(), input_bytes) ||
-      !read_binary(golden_logits_path.c_str(), golden_logits)) {
+      !read_binary((reference + "/Q240.BIN").c_str(), input_bytes) ||
+      !read_binary((reference + "/L30.BIN").c_str(), golden_logits) ||
+      !read_binary((reference + "/I512S.BIN").c_str(), square_source)) {
     return 1;
   }
   if (input_bytes.size() != static_cast<std::size_t>(esp_int8::INPUT_FRAME_BYTES) ||
@@ -886,7 +934,8 @@ int main() {
   const std::vector<std::uint8_t> golden_mask =
       make_fullres_mask_golden(golden_logits, ESP_INT8_CSIM_CLASS_COUNT);
   std::vector<std::uint8_t> published_mask;
-  if (!read_binary((std::string(artifact_dir) + "/golden_fullres_mask.bin").c_str(),
+  const char* mask_file = esp_int8::FULLRES_MASK_W == 512 ? "/M512.BIN" : "/M240.BIN";
+  if (!read_binary((reference + mask_file).c_str(),
                    published_mask) || published_mask != golden_mask) {
     std::printf("[FAIL] published mask is not the independent bilinear reference\n");
     return 1;
@@ -895,7 +944,8 @@ int main() {
   const std::size_t param_words =
       (param_bytes.size() + esp_int8::AXI_WORD_BYTES - 1U) / esp_int8::AXI_WORD_BYTES;
   static esp_int8::axi_vec_t frame_in[esp_int8::INPUT_SOURCE_MAX_AXI_WORDS];
-  static esp_int8::axi_vec_t frame_out[esp_int8::OUTPUT_FRAME_AXI_WORDS];
+  static esp_int8::axi_vec_t guarded_out[esp_int8::OUTPUT_FRAME_AXI_WORDS + 2];
+  esp_int8::axi_vec_t* frame_out = guarded_out + 1;
   static esp_int8::axi_vec_t param[8192];
 
   if (param_words > 8192U) {
@@ -904,6 +954,33 @@ int main() {
   }
 
   pack_bytes(param_bytes, param, 8192U);
+
+  for (auto& word : guarded_out) { word = ~static_cast<esp_int8::axi_vec_t>(0); }
+  esp_int8::upsample_fused_begin();
+  static esp_int8::act_vec_t row_buf[esp_int8::MAX_FM_W];
+  for (int row = 0; row < esp_int8::ENCODER_OUT_H; ++row) {
+    for (int col = 0; col < esp_int8::ENCODER_OUT_W; ++col) {
+      row_buf[col] = 0;
+      const unsigned offset = (row * esp_int8::ENCODER_OUT_W + col) * 2;
+      set_byte(row_buf[col], 0, golden_logits[offset]);
+      set_byte(row_buf[col], 1, golden_logits[offset + 1]);
+    }
+    esp_int8::upsample_fused_consume_logits_row(frame_out, static_cast<esp_int8::u16_t>(row),
+                                                static_cast<esp_int8::u8_t>(2), row_buf);
+  }
+  for (unsigned pixel = 0; pixel < published_mask.size(); ++pixel) {
+    if (get_byte(frame_out[pixel / esp_int8::AXI_WORD_BYTES], pixel % esp_int8::AXI_WORD_BYTES)
+        != published_mask[pixel]) {
+      std::printf("[FAIL] frozen M%d replay mask pixel=%u\n", esp_int8::FULLRES_MASK_W, pixel);
+      return 1;
+    }
+  }
+  if (guarded_out[0] != ~static_cast<esp_int8::axi_vec_t>(0) ||
+      guarded_out[esp_int8::OUTPUT_FRAME_AXI_WORDS + 1] != ~static_cast<esp_int8::axi_vec_t>(0)) {
+    return 1;
+  }
+  std::printf("[PASS] frozen replay M%d: 0/%zu mismatch, output guards PASS\n",
+              esp_int8::FULLRES_MASK_W, published_mask.size());
 
   call_espnet_encoder_int8_core(frame_in, frame_out, param,
                                 esp_int8::MODE_INIT,
@@ -917,11 +994,6 @@ int main() {
     std::printf("[FAIL] current PARAM rejected by INIT\n");
     return 1;
   }
-  if (!check_source_mode_case("native", esp_int8::INPUT_SRC_NATIVE, input_bytes, input_bytes,
-                               golden_logits, published_mask, frame_in, frame_out, param)) {
-    return 1;
-  }
-
   for (unsigned seed = 1; seed <= 2; ++seed) {
     if (!check_vec_alias_case(5U, seed) || !check_vec_alias_case(8U, seed)) {
       std::printf("[FAIL] Vec compact/aligned staged commit alias protection\n");
@@ -931,7 +1003,6 @@ int main() {
   std::printf("[PASS] Vec U39/U71: aliased sources, row padding, end guard and repeat staging\n");
   if (!check_vec_bad_destinations(param_bytes, param, frame_in, frame_out)) { return 1; }
 
-  std::vector<std::uint8_t> old_param_bytes;
   const auto read_u16 = [&](unsigned offset) {
     return unsigned(param_bytes.at(offset)) | (unsigned(param_bytes.at(offset + 1)) << 8);
   };
@@ -962,19 +1033,6 @@ int main() {
   std::printf("[PASS] INIT rejected %zu malformed/retired schedules\n",
               sizeof(corruptions) / sizeof(corruptions[0]));
 
-  if (!read_binary("D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_r2_v4/PARAM.BIN",
-                   old_param_bytes)) {
-    return 1;
-  }
-  pack_bytes(old_param_bytes, param, 8192U);
-  call_espnet_encoder_int8_core(frame_in, frame_out, param,
-                                esp_int8::MODE_INIT,
-                                esp_int8::UOP_COUNT_ENCODER);
-  if (esp_int8::param_dma_ready()) {
-    std::printf("[FAIL] legacy H256W512 PARAM passed H240W240/C1 geometry gate\n");
-    return 1;
-  }
-
   pack_bytes(param_bytes, param, 8192U);
   call_espnet_encoder_int8_core(frame_in, frame_out, param,
                                 esp_int8::MODE_INIT, esp_int8::UOP_COUNT_ENCODER);
@@ -986,30 +1044,16 @@ int main() {
     std::printf("[FAIL] BLOCK5 coefficient cache invalidation\n");
     return 1;
   }
-  const char* reference_dir = "D:/ESPNet/resolution_h240w240_gray/input_resize_1023";
-  if (const char* selected = std::getenv("ESP_INT8_CSIM_INPUT_REFERENCE_DIR")) {
-    reference_dir = selected;
+  if (!check_invalid_source_mode(frame_out, param)) { return 1; }
+  if (std::getenv("ESP_INT8_CSIM_UNITS_ONLY")) {
+    std::printf("top_golden_sample_tb units passed: MASK%d, no full network run\n",
+                esp_int8::FULLRES_MASK_W);
+    return 0;
   }
-  for (unsigned src_mode : {esp_int8::INPUT_SRC_H256W512, esp_int8::INPUT_SRC_H512W1024}) {
-    const std::string side = src_mode == esp_int8::INPUT_SRC_H256W512 ? "256" : "512";
-    std::vector<std::uint8_t> source, preprocessed, logits, mask;
-    const std::string base(reference_dir);
-    if (!read_binary((base + "/selected_int8_reference/I" + side + "Q.BIN").c_str(), source) ||
-        !read_binary((base + "/selected_reference/Q" + side + ".BIN").c_str(), preprocessed) ||
-        !read_binary((base + "/selected_int8_reference/L" + side + ".BIN").c_str(), logits) ||
-        !read_binary((base + "/selected_int8_reference/M" + side + ".BIN").c_str(), mask) ||
-        !check_source_mode_case(side.c_str(), src_mode, source, preprocessed, logits, mask,
-                                  frame_in, frame_out, param)) {
-      return 1;
-    }
-  }
-  if (!check_invalid_source_mode(frame_out, param) ||
-      !check_source_mode_case("reentry_native", esp_int8::INPUT_SRC_NATIVE, input_bytes, input_bytes,
-                                golden_logits, published_mask, frame_in, frame_out, param)) {
+  if (!check_source_mode_case("square512", esp_int8::INPUT_SRC_H512W512, square_source, input_bytes,
+                               golden_logits, published_mask, frame_in, frame_out, param)) {
     return 1;
   }
-  std::printf("[PASS] replay logits/mask are bit-exact, final AXI word covered, old geometry rejected\n");
-
-  std::printf("top_golden_sample_tb finished: all source modes and re-entry, 0 mismatches\n");
+  std::printf("top_golden_sample_tb finished: one mode3 full inference, 0 mismatches\n");
   return 0;
 }

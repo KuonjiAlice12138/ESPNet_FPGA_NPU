@@ -62,8 +62,10 @@ static bool check_frame(std::uint32_t mode,
 
 static bool check_synthetic(std::uint32_t mode) {
     using namespace esp_int8;
-    const unsigned side = mode == INPUT_SRC_H512W1024 ? 512U : 256U;
-    std::vector<std::uint8_t> source(side * side * 2);
+    const unsigned side = mode == INPUT_SRC_H256W512 ? 256U : 512U;
+    const unsigned pitch = mode == INPUT_SRC_H512W512 ? side : side * 2U;
+    const unsigned roi_x = mode == INPUT_SRC_H512W512 ? 0U : side / 2U;
+    std::vector<std::uint8_t> source(side * pitch);
     std::uint32_t random = 1023U + mode;
     for (auto& byte : source) {
         random = random * 1664525U + 1013904223U;
@@ -73,15 +75,15 @@ static bool check_synthetic(std::uint32_t mode) {
     const unsigned values[] = {0x80, 0xff, 0, 0x7f};
     const unsigned sy = side / 480U;
     for (unsigned x = 0; x < 4; ++x) {
-        const unsigned sx = side / 2U + ((2U * x + 1U) * side) / 480U;
-        source[sy * side * 2U + sx] = values[x];
+        const unsigned sx = roi_x + ((2U * x + 1U) * side) / 480U;
+        source[sy * pitch + sx] = values[x];
     }
     std::vector<std::uint8_t> expected(INPUT_FRAME_BYTES);
     for (unsigned y = 0; y < INPUT_FRAME_H; ++y) {
         const unsigned src_y = ((2U * y + 1U) * side) / 480U;
         for (unsigned x = 0; x < INPUT_FRAME_W; ++x) {
-            const unsigned src_x = side / 2U + ((2U * x + 1U) * side) / 480U;
-            expected[y * INPUT_FRAME_W + x] = source[src_y * side * 2U + src_x];
+            const unsigned src_x = roi_x + ((2U * x + 1U) * side) / 480U;
+            expected[y * INPUT_FRAME_W + x] = source[src_y * pitch + src_x];
         }
     }
     return check_frame(mode, source, expected);
@@ -127,7 +129,8 @@ int main() {
             return 1;
         }
     }
-    if (!check_synthetic(INPUT_SRC_H512W1024) || !check_synthetic(INPUT_SRC_H256W512) ||
+    if (!check_synthetic(INPUT_SRC_H512W512) || !check_synthetic(INPUT_SRC_H512W1024) ||
+        !check_synthetic(INPUT_SRC_H256W512) ||
         !check_frame(INPUT_SRC_NATIVE, bytes, bytes)) {
         return 1;
     }
@@ -142,9 +145,14 @@ int main() {
             return 1;
         }
     }
+    std::vector<std::uint8_t> square, selected;
+    const std::string restore = "D:/ESPNet/resolution_h240w240_gray/output_restore_1104/selected_reference/";
+    if (!read_bytes(restore + "I512S.BIN", square) ||
+        !read_bytes(restore + "Q240.BIN", selected) ||
+        !check_frame(INPUT_SRC_H512W512, square, selected)) { return 1; }
     if (!check_frame(INPUT_SRC_NATIVE, bytes, bytes)) {
         return 1;
     }
-    std::printf("frame_dma_tb passed: native/re-entry, two signed-pattern modes, two reference frames\n");
+    std::printf("frame_dma_tb passed: native/re-entry, three signed-pattern modes, square/wide references\n");
     return 0;
 }

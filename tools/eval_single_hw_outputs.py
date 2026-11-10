@@ -7,7 +7,9 @@ import argparse
 import hashlib
 import json
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from math import gcd
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,22 @@ FULLRES_SHAPE = (512, 1024)
 UPSAMPLE_SCALE = 8
 
 
+def validate_mask_shape(shape) -> tuple[int, int]:
+    if (not isinstance(shape, (tuple, list)) or len(shape) != 2 or
+            any(isinstance(v, bool) or not isinstance(v, Integral) or v <= 0 for v in shape)):
+        raise ValueError(f"mask_shape must contain two positive integers, got {shape!r}")
+    return int(shape[0]), int(shape[1])
+
+
+def resize_labels_half_pixel(labels: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    height, width = validate_mask_shape(shape)
+    if labels.ndim != 2 or min(labels.shape) <= 0:
+        raise ValueError("label resize expects a nonempty HW array")
+    y = ((2 * np.arange(height, dtype=np.int64) + 1) * labels.shape[0]) // (2 * height)
+    x = ((2 * np.arange(width, dtype=np.int64) + 1) * labels.shape[1]) // (2 * width)
+    return np.ascontiguousarray(labels[y[:, None], x])
+
+
 @dataclass(frozen=True)
 class DeploymentContract:
     profile_name: str
@@ -28,6 +46,14 @@ class DeploymentContract:
     ignore_metric_class: int | None
     geometry: DeploymentGeometry = LEGACY_GEOMETRY
     center_square_crop: bool = False
+    mask_shape: tuple[int, int] | None = None
+    target_encoding: str = "auto"
+
+    def __post_init__(self):
+        if self.mask_shape is not None:
+            validate_mask_shape(self.mask_shape)
+        if self.target_encoding not in ("auto", "cityscapes_train_ids", "binary2_ids"):
+            raise ValueError(f"unsupported target_encoding={self.target_encoding}")
 
     @property
     def lowres_shape(self) -> tuple[int, int]:
@@ -35,7 +61,8 @@ class DeploymentContract:
 
     @property
     def fullres_shape(self) -> tuple[int, int]:
-        return self.geometry.input_height, self.geometry.input_width
+        return (validate_mask_shape(self.mask_shape) if self.mask_shape is not None else
+                (self.geometry.input_height, self.geometry.input_width))
 
     @property
     def ignore_target(self) -> int:
@@ -64,6 +91,8 @@ def load_deployment_contract(artifact_dir: Path) -> DeploymentContract:
         ignore_metric_class=None if ignore is None else int(ignore),
         geometry=geometry_from_manifest(manifest),
         center_square_crop=bool(manifest.get("preprocessing", {}).get("center_square_crop", False)),
+        mask_shape=(validate_mask_shape(manifest["mask_shape"]) if "mask_shape" in manifest else None),
+        target_encoding=str(manifest.get("target_encoding", "auto")),
     )
 
 
@@ -88,15 +117,21 @@ def load_i8_logits(
     return data.reshape(shape)
 
 
-def load_lowres_target(path: Path, contract: DeploymentContract) -> np.ndarray:
+def load_lowres_target(
+    path: Path, contract: DeploymentContract, *, target_encoding: str = "auto"
+) -> np.ndarray:
     target = np.load(path)
     expected = (1, *contract.lowres_shape)
-    if tuple(target.shape) == (1, *contract.fullres_shape):
+    encoder_shape = (contract.geometry.input_height, contract.geometry.input_width)
+    if tuple(target.shape) == (1, *encoder_shape):
         scale = contract.geometry.target_scale
         target = target[:, ::scale, ::scale]
+    elif tuple(target.shape) == (1, *contract.fullres_shape):
+        target = resize_labels_half_pixel(target[0], contract.lowres_shape)[None]
     if tuple(target.shape) != expected:
         raise ValueError(f"{path} shape={target.shape}, expected {expected}")
-    return remap_target_np(target[0], contract)
+    # Exported target.npy may already be binary, unlike the original annotation PNG.
+    return remap_target_np(target[0], replace(contract, target_encoding=target_encoding))
 
 
 def remap_target_np(target: np.ndarray, contract: DeploymentContract) -> np.ndarray:
@@ -109,8 +144,15 @@ def remap_target_np(target: np.ndarray, contract: DeploymentContract) -> np.ndar
         return mapped
 
     valid = mapped != 255
-    if set(np.unique(mapped).tolist()).issubset({0, 1, 255}):
+    binary_values = set(np.unique(mapped).tolist()).issubset({0, 1, 255})
+    if contract.target_encoding == "binary2_ids":
+        if not binary_values:
+            raise ValueError("binary2_ids target contains unmapped labels")
         return mapped
+    if contract.target_encoding == "auto" and binary_values:
+        return mapped
+    if contract.target_encoding == "cityscapes_train_ids" and np.any(valid & ((mapped < 0) | (mapped > 18))):
+        raise ValueError("expected Cityscapes train IDs 0..18 or ignore 255")
     mapped[((mapped < 13) | (mapped > 18)) & valid] = 1
     mapped[(mapped >= 13) & (mapped <= 18)] = 0
     return mapped
@@ -199,26 +241,44 @@ def bilinear_axis_map(
     return idx0, idx1, 16 - w1, w1
 
 
+def bilinear_axis_map_to_size(out_idx: int, in_size: int, out_size: int) -> tuple[int, int, int, int]:
+    """Exact half-pixel coordinate with a reduced integer weight denominator."""
+    if in_size <= 0 or out_size <= 0 or not 0 <= out_idx < out_size:
+        raise ValueError("invalid bilinear axis size/index")
+    divisor = gcd(gcd(2 * in_size, in_size - out_size), 2 * out_size)
+    denominator = 2 * out_size // divisor
+    numerator = ((2 * out_idx + 1) * in_size - out_size) // divisor
+    if numerator < 0:
+        return 0, 0, denominator, 0
+    if numerator >= (in_size - 1) * denominator:
+        return in_size - 1, in_size - 1, denominator, 0
+    index, weight = divmod(numerator, denominator)
+    return index, index + 1, denominator - weight, weight
+
+
 def fullres_mask_from_logits(
     logits: np.ndarray,
     class_count: int = 2,
     geometry: DeploymentGeometry = LEGACY_GEOMETRY,
+    mask_shape: tuple[int, int] | None = None,
 ) -> np.ndarray:
-    logits2 = logits.reshape(geometry.logits_height, geometry.logits_width, class_count).astype(np.int32)
-    fullres_shape = (geometry.input_height, geometry.input_width)
+    logits2 = logits.reshape(geometry.logits_height, geometry.logits_width, class_count).astype(np.int64)
+    fullres_shape = ((geometry.input_height, geometry.input_width) if mask_shape is None else
+                    validate_mask_shape(mask_shape))
     mask = np.zeros(fullres_shape, dtype=np.uint8)
     x_maps = [
-        bilinear_axis_map(x, geometry.logits_width, geometry.target_scale)
+        (bilinear_axis_map(x, geometry.logits_width, geometry.target_scale) if mask_shape is None else
+         bilinear_axis_map_to_size(x, geometry.logits_width, fullres_shape[1]))
         for x in range(fullres_shape[1])
     ]
     x0 = np.asarray([item[0] for item in x_maps], dtype=np.intp)
     x1 = np.asarray([item[1] for item in x_maps], dtype=np.intp)
-    wx0 = np.asarray([item[2] for item in x_maps], dtype=np.int32)[:, None]
-    wx1 = np.asarray([item[3] for item in x_maps], dtype=np.int32)[:, None]
+    wx0 = np.asarray([item[2] for item in x_maps], dtype=np.int64)[:, None]
+    wx1 = np.asarray([item[3] for item in x_maps], dtype=np.int64)[:, None]
     for y in range(fullres_shape[0]):
-        y0, y1, wy0, wy1 = bilinear_axis_map(
-            y, geometry.logits_height, geometry.target_scale
-        )
+        y0, y1, wy0, wy1 = (bilinear_axis_map(y, geometry.logits_height, geometry.target_scale)
+                            if mask_shape is None else
+                            bilinear_axis_map_to_size(y, geometry.logits_height, fullres_shape[0]))
         top = logits2[y0, x0, :] * wx0 + logits2[y0, x1, :] * wx1
         bottom = logits2[y1, x0, :] * wx0 + logits2[y1, x1, :] * wx1
         mask[y, :] = np.argmax(top * wy0 + bottom * wy1, axis=1).astype(np.uint8)
@@ -271,27 +331,33 @@ def load_fullres_target(
     contract: DeploymentContract,
     espnet_dir: Path,
 ) -> np.ndarray:
-    import cv2
-
     with cached_data_file.open("rb") as f:
         data = pickle.load(f)
     target_path = resolve_cached_path(
         data["valAnnot"][sample_index], cached_data_file, espnet_dir
     )
+    return load_target_image(target_path, contract)
+
+
+def load_target_image(target_path: Path, contract: DeploymentContract) -> np.ndarray:
+    import cv2
+
     target = cv2.imread(str(target_path), cv2.IMREAD_UNCHANGED)
     if target is None:
         raise FileNotFoundError(target_path)
+    if target.ndim != 2:
+        raise ValueError(f"expected a HW label-ID annotation, got {target.shape}")
     if contract.center_square_crop:
         height, width = target.shape[:2]
         side = min(height, width)
         top, left = (height - side) // 2, (width - side) // 2
         target = target[top:top + side, left:left + side]
     if tuple(target.shape[:2]) != contract.fullres_shape:
-        target = cv2.resize(
-            target,
-            (contract.fullres_shape[1], contract.fullres_shape[0]),
-            interpolation=cv2.INTER_NEAREST,
-        )
+        if contract.mask_shape is not None:
+            target = resize_labels_half_pixel(target, contract.fullres_shape)
+        else:
+            target = cv2.resize(target, (contract.fullres_shape[1], contract.fullres_shape[0]),
+                                interpolation=cv2.INTER_NEAREST)
     return remap_target_np(target, contract)
 
 
@@ -338,6 +404,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     cached_data_file = Path(args.cached_data_file)
     espnet_dir = Path(args.espnet_dir)
     contract = load_deployment_contract(artifact_dir)
+    requested_shape = (getattr(args, "mask_height", 0), getattr(args, "mask_width", 0))
+    if any(requested_shape):
+        contract = replace(contract, mask_shape=validate_mask_shape(requested_shape))
+    if getattr(args, "target_encoding", "auto") != "auto":
+        contract = replace(contract, target_encoding=args.target_encoding)
     sample_index, sample_name = find_sample_index(artifact_dir, cached_data_file)
 
     golden_logits = load_i8_logits(
@@ -352,7 +423,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
     golden_low_mask = np.argmax(golden_logits[0], axis=-1).astype(np.uint8)
     golden_full_mask = fullres_mask_from_logits(
-        golden_logits, contract.class_count, contract.geometry
+        golden_logits, contract.class_count, contract.geometry, mask_shape=contract.mask_shape
     )
     valid_low = low_target != contract.ignore_target
     valid_full = full_target != contract.ignore_target
@@ -367,6 +438,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "ignore_metric_class": contract.ignore_metric_class,
         },
         "geometry": contract.geometry.to_manifest(),
+        "mask_shape": list(contract.fullres_shape),
+        "target_encoding": contract.target_encoding,
         "input_q_sha256": sha256_file(artifact_dir / "input_q.bin"),
         "golden_output_q_sha256": sha256_file(artifact_dir / "golden_output_q.bin"),
         "artifact_consistency": check_single_vs_val_smoke(
@@ -472,6 +545,9 @@ def main() -> None:
     parser.add_argument("--val-smoke-dir", default=r"D:\ESP_INT8\hw_artifacts\sched_v4_val_smoke")
     parser.add_argument("--lowres-logits", default="")
     parser.add_argument("--fullres-mask", default="")
+    parser.add_argument("--mask-height", type=int, default=0)
+    parser.add_argument("--mask-width", type=int, default=0)
+    parser.add_argument("--target-encoding", choices=("auto", "cityscapes_train_ids", "binary2_ids"), default="auto")
     parser.add_argument(
         "--out-json",
         default=r"D:\ESP_INT8\hw_artifacts\sched_v4_p7_0702\single_hw_output_metrics.json",

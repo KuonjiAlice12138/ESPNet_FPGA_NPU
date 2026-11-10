@@ -2,6 +2,10 @@
 
 #include <cstdint>
 
+#ifndef ESP_INT8_MASK_SIZE
+#define ESP_INT8_MASK_SIZE 512
+#endif
+
 namespace esp_int8 {
 
 constexpr std::uint32_t PARAM_BLOB_MAGIC = 0x544E4945U;  // "EINT" in little-endian word view.
@@ -34,8 +38,8 @@ constexpr int MAX_CLASS_C = 2;
 // Binary golden/debug TB compatibility; the H240 upsample path requires C2.
 constexpr int ENCODER_OUT_C = 2;
 constexpr int UPSAMPLE_SCALE = 8;
-constexpr int FULLRES_MASK_H = INPUT_FRAME_H;
-constexpr int FULLRES_MASK_W = INPUT_FRAME_W;
+constexpr int FULLRES_MASK_H = ESP_INT8_MASK_SIZE;
+constexpr int FULLRES_MASK_W = ESP_INT8_MASK_SIZE;
 constexpr int FULLRES_MASK_C = 1;
 
 constexpr int INPUT_FRAME_BYTES = INPUT_FRAME_H * INPUT_FRAME_W * INPUT_FRAME_C;
@@ -44,6 +48,7 @@ constexpr int INPUT_FRAME_AXI_WORDS = (INPUT_FRAME_BYTES + AXI_WORD_BYTES - 1) /
 constexpr std::uint32_t INPUT_SRC_NATIVE = 0;
 constexpr std::uint32_t INPUT_SRC_H256W512 = 1;
 constexpr std::uint32_t INPUT_SRC_H512W1024 = 2;
+constexpr std::uint32_t INPUT_SRC_H512W512 = 3;
 constexpr int INPUT_SOURCE_MAX_BYTES = 512 * 1024;
 constexpr int INPUT_SOURCE_MAX_AXI_WORDS = INPUT_SOURCE_MAX_BYTES / AXI_WORD_BYTES;
 constexpr int INPUT_RESIZE_LANES = 4;
@@ -74,8 +79,10 @@ static_assert(INPUT_FRAME_H == 240 && INPUT_FRAME_W == 240 &&
                   INPUT_FRAME_W % INPUT_RESIZE_LANES == 0 &&
                   INPUT_FRAME_BYTES % AXI_WORD_BYTES == 0,
               "Input resize requires a tightly packed H240W240 output without tail padding");
-static_assert(OUTPUT_FRAME_AXI_WORDS == 1800,
-              "H240W240 mask must occupy 1800 AXI words");
+static_assert(ESP_INT8_MASK_SIZE == 240 || ESP_INT8_MASK_SIZE == 512,
+              "Select one compile-time mask engine: 240 regression or 512 deployment");
+static_assert(OUTPUT_FRAME_BYTES % AXI_WORD_BYTES == 0 && OUTPUT_FRAME_AXI_WORDS <= 8192,
+              "Mask must occupy whole AXI words within the output interface depth");
 
 constexpr std::uint32_t RUNTIME_MODE_MASK = 0x0000000fU;
 constexpr std::uint32_t RUNTIME_UOP_COUNT_MASK = 0x0000ffffU;

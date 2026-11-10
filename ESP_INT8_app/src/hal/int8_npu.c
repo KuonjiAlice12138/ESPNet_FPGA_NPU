@@ -765,6 +765,7 @@ u32 int8_npu_source_bytes(u32 src_mode)
     case INT8_INPUT_SRC_NATIVE: return INT8_INPUT_BYTES;
     case INT8_INPUT_SRC_H256W512: return 256U * 512U;
     case INT8_INPUT_SRC_H512W1024: return 512U * 1024U;
+    case INT8_INPUT_SRC_H512W512: return 512U * 512U;
     default: return 0U;
     }
 }

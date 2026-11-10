@@ -28,8 +28,6 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from geometry_contract import DeploymentGeometry
 from hw_int8_math import (
-    clamp_i8,
-    hls_round_shift_int,
     INT8_MIN,
     INT8_MAX,
 )
@@ -1096,12 +1094,7 @@ def add_i8_array(a: np.ndarray, b: np.ndarray, q: AddQParam) -> np.ndarray:
         if q.act_type == ACT_RELU:
             out = np.clip(out, 0, None).astype(np.int8)
         return out
-    scaled = summed.astype(np.int64) * np.int64(q.mult)
-    rounded = np.vectorize(lambda v: hls_round_shift_int(int(v), int(q.shift)), otypes=[np.int32])(scaled)
-    out = np.clip(rounded, INT8_MIN, INT8_MAX).astype(np.int8)
-    if q.act_type == ACT_RELU:
-        out = np.clip(out, 0, None).astype(np.int8)
-    return out
+    return affine_i8_to_i8_np(summed, q.mult, 0, q.shift, q.act_type)
 
 
 @dataclass

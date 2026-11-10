@@ -25,6 +25,8 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from eval_hw_constrained_qat import add_espnet  # noqa: E402
+from eval_single_hw_outputs import (DeploymentContract, load_target_image, resolve_cached_path,
+                                    validate_mask_shape)
 from geometry_contract import (  # noqa: E402
     DEFAULT_GEOMETRY,
     LEGACY_GEOMETRY,
@@ -49,6 +51,33 @@ def load_eval_geometry(
     return fallback
 
 
+def load_eval_mask_shape(sd_manifest, param_audit, geometry, explicit=None) -> tuple[int, int]:
+    if explicit is not None:
+        return validate_mask_shape(explicit)
+    for manifest in (sd_manifest, param_audit):
+        if isinstance(manifest, Mapping) and "mask_shape" in manifest:
+            return validate_mask_shape(manifest["mask_shape"])
+    return geometry.input_height, geometry.input_width
+
+
+class RawMaskTargets(torch.utils.data.Dataset):
+    """Read original annotations, without passing them through an encoder-size loader."""
+
+    def __init__(self, espnet_dir, cached_data_file, contract):
+        self.root = espnet_dir
+        self.cache = cached_data_file
+        self.data = pickle.loads(cached_data_file.read_bytes())
+        self.contract = contract
+
+    def __len__(self):
+        return len(self.data["valAnnot"])
+
+    def __getitem__(self, index):
+        path = resolve_cached_path(self.data["valAnnot"][index], self.cache, self.root)
+        target = torch.from_numpy(load_target_image(path, self.contract)).long()
+        return torch.empty(0), target, str(path)
+
+
 def metric_dict(metric: Any) -> dict[str, Any]:
     overall_acc, per_class_acc, per_class_iu, miou = metric.getMetric()
     return {
@@ -65,7 +94,16 @@ def build_fullres_val_dataset(
     geometry: DeploymentGeometry = LEGACY_GEOMETRY,
     preprocessing: dict | None = None,
     profile: str = "binary2",
+    mask_shape: tuple[int, int] | None = None,
+    target_encoding: str = "cityscapes_train_ids",
 ):
+    if mask_shape is not None:
+        if not (preprocessing or {}).get("center_square_crop", False):
+            raise ValueError("independent mask geometry requires an explicit center_square_crop contract")
+        return RawMaskTargets(espnet_dir, cached_data_file, DeploymentContract(
+            profile, 2 if profile == "binary2" else 20, None if profile == "binary2" else 19,
+            geometry, center_square_crop=True, mask_shape=validate_mask_shape(mask_shape),
+            target_encoding=target_encoding))
     if geometry.input_channels == 1:
         from export_val_hw_dataset import build_artifact_val_loader
         return build_artifact_val_loader(
@@ -148,12 +186,14 @@ def parse_timing_log(path: Path | None) -> dict[str, Any]:
 def load_mask(
     path: Path,
     geometry: DeploymentGeometry = LEGACY_GEOMETRY,
+    mask_shape: tuple[int, int] | None = None,
 ) -> np.ndarray:
     data = np.fromfile(path, dtype=np.uint8)
-    expected_bytes = geometry.output_mask_bytes
+    shape = (geometry.input_height, geometry.input_width) if mask_shape is None else validate_mask_shape(mask_shape)
+    expected_bytes = int(np.prod(shape))
     if data.size != expected_bytes:
         raise ValueError(f"{path} has {data.size} bytes, expected {expected_bytes}")
-    return data.reshape((geometry.input_height, geometry.input_width))
+    return data.reshape(shape)
 
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
@@ -169,15 +209,24 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         param_audit = json.loads(Path(args.param_audit).read_text(encoding="utf-8"))
     fallback_geometry = DeploymentGeometry(args.height, args.width, args.target_scale)
     geometry = load_eval_geometry(sd_manifest, param_audit, fallback=fallback_geometry)
-    preprocessing = (sd_manifest or param_audit or {}).get("preprocessing", {})
+    preprocessing = dict((param_audit or {}).get("preprocessing", {}))
+    preprocessing.update((sd_manifest or {}).get("preprocessing", {}))
     profile = "binary2" if args.classes == 2 else "cityscapes20"
-    expected_bytes = geometry.output_mask_bytes
+    explicit = (getattr(args, "mask_height", 0), getattr(args, "mask_width", 0))
+    shape_manifest = dict(param_audit or {})
+    shape_manifest.update(sd_manifest or {})
+    independent_mask = (any(explicit) or "mask_shape" in shape_manifest)
+    mask_shape = load_eval_mask_shape(sd_manifest, param_audit, geometry,
+                                      explicit if any(explicit) else None)
+    expected_bytes = int(np.prod(mask_shape))
     dataset = build_fullres_val_dataset(
         Path(args.espnet_dir),
         Path(args.cached_data_file),
         geometry,
         preprocessing,
         profile,
+        mask_shape=mask_shape if independent_mask else None,
+        target_encoding=shape_manifest.get("target_encoding", "cityscapes_train_ids"),
     )
     metric = iouEval(args.classes)
     missing: list[str] = []
@@ -215,10 +264,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             )
 
         _inputs, target, _name = dataset[index]
-        if geometry.input_channels != 1:
+        if geometry.input_channels != 1 and not independent_mask:
             from export_val_hw_dataset import map_target_for_profile
             target = map_target_for_profile(target, profile)
-        pred = torch.from_numpy(load_mask(out_path, geometry)).long()
+        pred = torch.from_numpy(load_mask(out_path, geometry, mask_shape=mask_shape)).long()
+        if torch.any((pred < 0) | (pred >= args.classes)):
+            raise ValueError(f"invalid predicted class IDs in {out_path}")
         metric.addBatch(pred, target)
         processed += 1
 
@@ -249,6 +300,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             param_audit.get("format") if isinstance(param_audit, dict) else None
         ),
         "geometry": geometry.to_manifest(),
+        "mask_shape": list(mask_shape),
         "mask_bytes": expected_bytes,
         "timing": parse_timing_log(Path(args.timing_log) if args.timing_log else None),
         "metrics": metric_dict(metric),
@@ -266,6 +318,8 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=DEFAULT_GEOMETRY.input_height)
     parser.add_argument("--width", type=int, default=DEFAULT_GEOMETRY.input_width)
     parser.add_argument("--target-scale", type=int, default=DEFAULT_GEOMETRY.target_scale)
+    parser.add_argument("--mask-height", type=int, default=0)
+    parser.add_argument("--mask-width", type=int, default=0)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--progress-every", type=int, default=25)

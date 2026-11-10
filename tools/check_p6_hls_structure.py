@@ -1236,8 +1236,26 @@ def check_p7_bans(sources: dict[str, str]) -> int:
         return fail("Vec shared row buffer must not add a global reset control set")
     if "cyclic factor=SA_ACTIVE_TM" not in sa_core:
         return fail("SA core must partition arrays by the active 32-lane MAC group")
-    if "emit_fullres_rows(" in upsample and upsample.count("emit_fullres_rows(") > 2:
-        return fail("upsample fullres emitter has multiple specialized call sites")
+    config = read(CONFIG)
+    for token in ("#define ESP_INT8_MASK_SIZE 512", "FULLRES_MASK_H = ESP_INT8_MASK_SIZE",
+                  "FULLRES_MASK_W = ESP_INT8_MASK_SIZE", "INPUT_SRC_H512W512 = 3"):
+        if token not in config:
+            return fail(f"512-mask/source geometry contract missing: {token}")
+    for token in ("emit_fullres_rows(", "interpolate_binary_segment(", "labels[UPSAMPLE_SCALE]"):
+        if token in upsample:
+            return fail(f"retired 8x-only output path remains: {token}")
+    if (count_call_sites(upsample, "emit_mask_row") != 2 or
+            count_call_sites(upsample, "emit_mask_segment") != 2 or
+            upsample.count("gmem_frame_out[s_mask_word_index++] =") != 1):
+        return fail("mask engine must have one row/segment call site and one AXI writer")
+    if ("ap_memory port=gmem_frame_out depth=8192" not in sources["core"] or
+            "bundle=gmem1 depth=8192" not in sources["core"]):
+        return fail("512 mask requires output interface capacity of 8192 words")
+    frame_dma = sources["frame_dma"]
+    if (frame_dma.count("#pragma HLS DATAFLOW") != 1 or
+            "INPUT_SRC_H512W512" not in frame_dma or
+            frame_dma.count("on_chip_memory_write_input_axi_word(") != 2):
+        return fail("square input must reuse the single DMA and input writer")
     for token in ("resolve_block5_scratch_descs",):
         if token not in scratch:
             return fail(f"scratch_mgr.cpp missing storage helper: {token}")
