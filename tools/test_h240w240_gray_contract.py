@@ -353,7 +353,7 @@ class GrayRound7RSourceTests(unittest.TestCase):
     def test_vec_commit_uses_an_independent_bounded_incremental_cursor(self):
         source = (self.root / "vec_alu_engine.cpp").read_text(encoding="utf-8-sig")
         body = structure.function_body(source, "run_fixed_affine_common")
-        self.assertIn("for (ap_uint<9> word = 0; word < ROW_CONTIG_MAX_WORDS; ++word)", body)
+        self.assertIn("for (ap_uint<10> word = 0; word < ROW_CONTIG_MAX_WORDS; ++word)", body)
         self.assertIn("commit_offset += commit_step;", body)
         self.assertNotIn("VEC_MAX_ROW_SERVICES", source)
         self.assertNotIn("service_count = tile_service_count +", body)
@@ -449,7 +449,7 @@ class GrayRound8SourceTests(unittest.TestCase):
         source = (self.root / "src/vec_alu_engine.cpp").read_text(encoding="utf-8-sig")
         self.assertIn("ap_uint<2> packed_carry_bytes", source)
         self.assertIn("ap_uint<3> packed_group_slot", source)
-        self.assertIn("ap_uint<9> packed_word_idx", source)
+        self.assertIn("ap_uint<10> packed_word_idx", source)
         self.assertIn("u32_t packed_carry", source)
         self.assertNotIn("unsigned packed_group_slot", source)
         self.assertNotIn("unsigned packed_word_idx", source)
@@ -493,15 +493,15 @@ class GrayHlsContractTests(unittest.TestCase):
             self.assertEqual(re.findall(comparison, source), [],
                              f"{path.name}: ambiguous synthesis AP-int/enum comparison")
 
-    def test_fixed_frame_contract_is_gray_h240(self):
+    def test_fixed_frame_contract_is_gray_native512(self):
         config = (self.root / "include/npu_config.hpp").read_text(encoding="utf-8-sig")
-        for name, value in (("INPUT_FRAME_H", 240), ("INPUT_FRAME_W", 240),
-                            ("INPUT_FRAME_C", 1), ("ENCODER_OUT_H", 30),
-                            ("ENCODER_OUT_W", 30)):
+        for name, value in (("INPUT_FRAME_H", 512), ("INPUT_FRAME_W", 512),
+                            ("INPUT_FRAME_C", 1), ("ENCODER_OUT_H", 64),
+                            ("ENCODER_OUT_W", 64)):
             self.assertIn(f"constexpr int {name} = {value};", config)
         top = (self.root / "src/int8_core.cpp").read_text(encoding="utf-8-sig")
-        self.assertIn("bundle=gmem0 depth=1800", top)
-        self.assertIn("bundle=gmem1 depth=1800", top)
+        self.assertIn("bundle=gmem0 depth=8192", top)
+        self.assertIn("bundle=gmem1 depth=8192", top)
 
     def test_tensor_stride_decodes_compiler_row_padding_flag(self):
         types = (self.root / "include/npu_types.hpp").read_text(encoding="utf-8-sig")

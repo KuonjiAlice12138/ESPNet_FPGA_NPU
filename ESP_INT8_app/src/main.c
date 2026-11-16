@@ -742,7 +742,9 @@ static int load_param_and_init(Int8NpuContext *npu, const char *param_file,
     }
     if (int8_npu_read_param_header(g_param, param_size, header) !=
             XST_SUCCESS ||
-        int8_npu_validate_param_header(header, param_size) != XST_SUCCESS) {
+        int8_npu_validate_param_header(header, param_size) != XST_SUCCESS ||
+        int8_npu_validate_deployment_geometry(g_param, param_size, header) !=
+            XST_SUCCESS) {
         xil_printf("APP: param validation failed: %s\r\n", param_file);
         return XST_FAILURE;
     }
@@ -878,6 +880,10 @@ int main(void)
     print_addr("input", (UINTPTR)g_input, INT8_INPUT_BYTES);
     print_addr("output", (UINTPTR)g_output, INT8_OUTPUT_BYTES);
     print_addr("param", (UINTPTR)g_param, INT8_PARAM_HW_MAX_BYTES);
+    xil_printf("APP: native input=%ux%ux%u logits=%ux%ux%u output=%ux%u; no input resize\r\n",
+               INT8_APP_INPUT_H, INT8_APP_INPUT_W, INT8_APP_INPUT_C,
+               INT8_APP_LOGITS_H, INT8_APP_LOGITS_W, INT8_APP_EXPECTED_CLASS_COUNT,
+               INT8_APP_OUTPUT_H, INT8_APP_OUTPUT_W);
     print_timer_selftest();
 
     if (SD_Init() != XST_SUCCESS) {

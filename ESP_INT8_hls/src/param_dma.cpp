@@ -421,7 +421,7 @@ static bool window_schedule_contract_valid(const window_sched_desc_t& desc) {
             return word == (static_cast<unsigned>(WINDOW_ROW_REUSE_STRIDE2_KEEP1) |
                             (WINGEN_C1_PACKED_ROW_WORDS << WINDOW_ROW_REUSE_WORDS_SHIFT)) &&
                    desc.kernel == 3 && desc.stride == 2 && desc.dilation == 1 && desc.padding == 1 &&
-                   desc.in_c == 1 && desc.k_tiles == 1 && desc.out_w == 120 &&
+                   desc.in_c == 1 && desc.k_tiles == 1 && desc.out_w == INPUT_FRAME_W / 2 &&
                    desc.loader_class.to_uint() == static_cast<unsigned>(WIN_LOADER_3X3_NARROW) &&
                    desc.flags.to_uint() == static_cast<unsigned>(WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2);
         case WIN_MODE_3X3_STAGED_C12:

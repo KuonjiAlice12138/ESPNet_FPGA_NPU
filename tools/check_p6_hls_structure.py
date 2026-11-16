@@ -340,6 +340,11 @@ def check_mainctrl_structure(core: str, main_ctrl: str, ctrl: str, vec_alu: str,
 
 
 def check_stage_counter_interfaces(core: str, ctrl: str, main_ctrl: str, conv_engine: str) -> int:
+    top = function_body(core, "espnet_encoder_int8_core") or ""
+    top_pragma = "#pragma HLS TOP name=espnet_encoder_int8_core"
+    if (top.count(top_pragma) != 1 or "#pragma HLS INTERFACE" not in top or
+            top.index(top_pragma) > top.index("#pragma HLS INTERFACE")):
+        return fail("Top must explicitly declare HLS TOP before its interface pragmas; scalarized DDR ports are invalid")
     required_stages = (
         "PROF_STAGE_IDLE = 0",
         "PROF_STAGE_PARAM_INIT = 1",
@@ -834,7 +839,7 @@ def check_executor_gateways(
         return fail("H240 Round7R Vec must finish row staging before its separate commit loop")
     commit_body = fixed_affine_body[commit_begin:].split("aligned_row +=", 1)[0]
     if "#pragma HLS PIPELINE II=1" not in commit_body or \
-       "for (ap_uint<9> word = 0; word < ROW_CONTIG_MAX_WORDS; ++word)" not in commit_body:
+       "for (ap_uint<10> word = 0; word < ROW_CONTIG_MAX_WORDS; ++word)" not in commit_body:
         return fail("H240 Round7R Vec must use a bounded short word-commit pipeline")
     if "s_shared_row_contig_words[tile.to_uint()] = out_packed;" not in fixed_affine_body or \
        "commit_offset += commit_step;" not in commit_body:
@@ -863,7 +868,7 @@ def check_executor_gateways(
     if "s_shared_row_contig_words[" in pack_loops or "word_index.to_uint() >= row_word_count" not in staging_tail:
         return fail("H240 Round8 Vec pack loops must be memory-free with a checked staging tail")
     for token in ("ap_uint<2> packed_carry_bytes", "ap_uint<3> packed_group_slot",
-                  "ap_uint<9> packed_word_idx", "u32_t packed_carry"):
+                  "ap_uint<10> packed_word_idx", "u32_t packed_carry"):
         if token not in fixed_affine_body:
             return fail(f"H240 Round8 Vec bounded packetizer state missing: {token}")
     if "affine_cache_generation == generation" not in block5_row_body or \
@@ -1386,8 +1391,10 @@ def check_round0727_supply_structure(win_gen: str, memory: str, conv_engine: str
     ):
         if token not in c1:
             return fail(f"C1 KEEP1/reentry contract missing: {token}")
-    if "on_chip_memory_read_aligned_tensor_word" not in c1_load or ".range(255, 128) = 0" not in c1_load:
-        return fail("C1 raw-row reader must use aligned source words and clear local padding")
+    if ("on_chip_memory_read_aligned_tensor_word" not in c1_load or
+            "INPUT_FRAME_W % AXI_WORD_BYTES == 0" not in c1_load or
+            ".range(255, 128) = 0" in c1_load or "previous >> 128" in c1_load):
+        return fail("Native C1 reader must retain every aligned source byte without H240 tail handling")
     assembler = function_body(win_gen, "window_row_assembler") or ""
     if "BIND_STORAGE variable=s_delta_cache.data type=ram_1p impl=bram" not in assembler:
         return fail("Narrow delta cache must have one single-port BRAM owner")

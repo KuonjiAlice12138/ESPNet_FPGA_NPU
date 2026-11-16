@@ -15,8 +15,8 @@ constexpr int PARAM_HEADER_AXI_WORDS = PARAM_HEADER_BYTES / AXI_WORD_BYTES;
 constexpr int TM = 32;
 constexpr int TK = 32;
 
-constexpr int MAX_FM_H = 240;
-constexpr int MAX_FM_W = 240;
+constexpr int MAX_FM_H = 512;
+constexpr int MAX_FM_W = 512;
 constexpr int MAX_FM_C = 256;
 constexpr int MAX_C_TILE_COUNT = (MAX_FM_C + TM - 1) / TM;
 
@@ -25,13 +25,13 @@ constexpr int MAX_C_TILE_COUNT = (MAX_FM_C + TM - 1) / TM;
 // Raising this expands window_sched_desc_t and breaks the v4 blob contract.
 constexpr int MAX_K_TILE_COUNT = 40;
 
-constexpr int INPUT_FRAME_H = 240;
-constexpr int INPUT_FRAME_W = 240;
+constexpr int INPUT_FRAME_H = 512;
+constexpr int INPUT_FRAME_W = 512;
 constexpr int INPUT_FRAME_C = 1;
-constexpr int ENCODER_OUT_H = 30;
-constexpr int ENCODER_OUT_W = 30;
+constexpr int ENCODER_OUT_H = 64;
+constexpr int ENCODER_OUT_W = 64;
 constexpr int MAX_CLASS_C = 2;
-// Binary golden/debug TB compatibility; the H240 upsample path requires C2.
+// Binary native512 upsample and golden/debug compatibility.
 constexpr int ENCODER_OUT_C = 2;
 constexpr int UPSAMPLE_SCALE = 8;
 constexpr int FULLRES_MASK_H = INPUT_FRAME_H;
@@ -50,48 +50,49 @@ static_assert(INPUT_FRAME_H == ENCODER_OUT_H * UPSAMPLE_SCALE,
               "Input/logits height must match the fixed upsample scale");
 static_assert(INPUT_FRAME_W == ENCODER_OUT_W * UPSAMPLE_SCALE,
               "Input/logits width must match the fixed upsample scale");
-static_assert(INPUT_FRAME_AXI_WORDS == 1800,
-              "H240W240 C1 input must occupy 1800 AXI words");
-static_assert(OUTPUT_FRAME_AXI_WORDS == 1800,
-              "H240W240 mask must occupy 1800 AXI words");
+static_assert(INPUT_FRAME_AXI_WORDS == 8192,
+              "Native512 C1 input must occupy 8192 AXI words");
+static_assert(OUTPUT_FRAME_AXI_WORDS == 8192,
+              "Native512 mask must occupy 8192 AXI words");
 
 constexpr std::uint32_t RUNTIME_MODE_MASK = 0x0000000fU;
 constexpr std::uint32_t RUNTIME_UOP_COUNT_MASK = 0x0000ffffU;
 
-// H240 gray lifetime-allocated shared feature memory. Main tensors and BLOCK5
+// Native512 gray lifetime-allocated shared feature memory. Tensors and BLOCK5
 // workspaces occupy the URAM prefix; Pool tensors occupy the BRAM-only tail.
-constexpr int FMBUF_BYTES = 0xCF080;
-constexpr int FMBUF_URAM_BYTES = 0xC8000;
+constexpr int FMBUF_BYTES = 0x378000;
+constexpr int FMBUF_URAM_BYTES = 0x358000;
 constexpr int FMBUF_BRAM_BYTES = FMBUF_BYTES - FMBUF_URAM_BYTES;
 constexpr int FMBUF_URAM_AXI_WORDS = (FMBUF_URAM_BYTES + AXI_WORD_BYTES - 1) / AXI_WORD_BYTES;
 constexpr int FMBUF_BRAM_AXI_WORDS = (FMBUF_BRAM_BYTES + AXI_WORD_BYTES - 1) / AXI_WORD_BYTES;
 constexpr int FMBUF_PRIMARY_BASE = 0x000000;
-constexpr int FMBUF_BLOCK5_BASE = 0x38400;
-constexpr int FMBUF_B1_BASE = 0x78000;
-constexpr int FMBUF_L20_BASE = 0x78000;
-constexpr int FMBUF_L30_BASE = 0x78000;
-constexpr int FMBUF_OUT_BASE = 0x78000;
-constexpr int FMBUF_POOL1_BASE = 0xC8000;
-constexpr int FMBUF_POOL_TMP_BASE = 0xCB840;
+constexpr int FMBUF_BLOCK5_BASE = 0x100000;
+constexpr int FMBUF_B1_BASE = 0x208000;
+constexpr int FMBUF_L20_BASE = 0x208000;
+constexpr int FMBUF_L30_BASE = 0x208000;
+constexpr int FMBUF_OUT_BASE = 0x208000;
+constexpr int FMBUF_POOL1_BASE = 0x358000;
+constexpr int FMBUF_POOL_TMP_BASE = 0x368000;
 constexpr int FMBUF_L20_PHYS_C = 64;
 constexpr int FMBUF_L20_C_OFFSET = 0;
-constexpr int FMBUF_L2_SCRATCH_BASE = 0xB8000;
-constexpr int FMBUF_L2_SCRATCH_SLOT_BYTES = 60 * 60 * 16;
-constexpr int FMBUF_L30_SCRATCH_C1_BASE = 0xB8000;
+constexpr int FMBUF_L2_SCRATCH_BASE = 0x318000;
+constexpr int FMBUF_L2_SCRATCH_SLOT_BYTES = 128 * 128 * 16;
+constexpr int FMBUF_L30_SCRATCH_C1_BASE = 0x318000;
 constexpr int FMBUF_L30_SCRATCH_LOW_BASE = FMBUF_BLOCK5_BASE;
-constexpr int FMBUF_L30_SCRATCH_SLOT_BYTES = 30 * 768;
-constexpr int FMBUF_L3B0_SCRATCH_BASE = 0xB8000;
-constexpr int FMBUF_L3B0_SCRATCH_SLOT_BYTES = 30 * 768;
+constexpr int FMBUF_L30_SCRATCH_SLOT_BYTES = 64 * 1600;
+constexpr int FMBUF_L3B0_SCRATCH_BASE = 0x318000;
+constexpr int FMBUF_L3B0_SCRATCH_SLOT_BYTES = 64 * 1600;
 constexpr int BLOCK5_ROW_BLOCK_ROWS = 64;
 constexpr int FMBUF_L2_BLOCK5_BASE = FMBUF_BLOCK5_BASE;
 constexpr int FMBUF_L30_BLOCK5_BASE = FMBUF_BLOCK5_BASE;
 constexpr int FMBUF_L3B0_BLOCK5_BASE = FMBUF_BLOCK5_BASE;
-constexpr int ROW_CONTIG_MAX_W = 120;
+constexpr int ROW_CONTIG_MAX_W = INPUT_FRAME_W / 2;
 constexpr int ROW_CONTIG_MAX_C = 129;
-constexpr int ROW_CONTIG_MAX_BYTES = ROW_CONTIG_MAX_W * ROW_CONTIG_MAX_C;
+// C17 uses W256; the widest compact byte span is W128*C129, not W256*C129.
+constexpr int ROW_CONTIG_MAX_BYTES = (INPUT_FRAME_W / 4) * ROW_CONTIG_MAX_C;
 constexpr int ROW_CONTIG_MAX_WORDS = (ROW_CONTIG_MAX_BYTES + AXI_WORD_BYTES - 1) / AXI_WORD_BYTES;
-constexpr int BRAM_SCR0_BYTES = 120 * 120;
-constexpr int BRAM_SCR1_BYTES = (60 * 60 + 31) & ~31;
+constexpr int BRAM_SCR0_BYTES = 256 * 256;
+constexpr int BRAM_SCR1_BYTES = 128 * 128;
 constexpr int BRAM_SCR0_AXI_WORDS = (BRAM_SCR0_BYTES + AXI_WORD_BYTES - 1) / AXI_WORD_BYTES;
 constexpr int BRAM_SCR1_AXI_WORDS = (BRAM_SCR1_BYTES + AXI_WORD_BYTES - 1) / AXI_WORD_BYTES;
 constexpr int FMBUF_POOL2_ALIAS_BASE = FMBUF_POOL1_BASE;
@@ -141,21 +142,21 @@ constexpr int SECTION_ALIGNMENT_BYTES = 64;
 static_assert(MAX_K_TILE_COUNT == 40, "v4 WINDOW_SCHED_DESC_BLOB_BYTES assumes 40 K tiles");
 static_assert(WINDOW_SCHED_DESC_BLOB_BYTES == 18 + (MAX_K_TILE_COUNT + 1) * 2 + 28,
               "window_sched_desc_t blob size mismatch");
-static_assert(60 * 7744 <= FMBUF_L20_BASE,
+static_assert(128 * 16512 <= FMBUF_L20_BASE,
               "B2 output must end before the residual slot without a backup");
-static_assert(FMBUF_B1_BASE + 120 * 2048 <= FMBUF_L2_SCRATCH_BASE,
+static_assert(FMBUF_B1_BASE + 256 * 4352 <= FMBUF_L2_SCRATCH_BASE,
               "The B1 tensor must end before C1 scratch");
-static_assert(FMBUF_L2_BLOCK5_BASE + 60 * 60 * 64 <= FMBUF_L20_BASE,
+static_assert(FMBUF_L2_BLOCK5_BASE + BLOCK5_ROW_BLOCK_ROWS * 128 * 64 <= FMBUF_L20_BASE,
               "Level2 BLOCK5 workspace must end before the residual slot");
 static_assert(FMBUF_L2_SCRATCH_BASE + FMBUF_L2_SCRATCH_SLOT_BYTES <= FMBUF_URAM_BYTES,
               "Level2 C1 scratch must fit in the URAM prefix");
-static_assert(FMBUF_L30_BASE + 30 * 30 * 128 <= FMBUF_L30_SCRATCH_C1_BASE,
+static_assert(FMBUF_L30_BASE + 64 * 64 * 128 <= FMBUF_L30_SCRATCH_C1_BASE,
               "Level3 compact tensor must not overlap LS_C1 scratch");
 static_assert(FMBUF_L30_SCRATCH_C1_BASE + FMBUF_L30_SCRATCH_SLOT_BYTES <= FMBUF_URAM_BYTES,
               "Level3 LS_C1 scratch must fit in the URAM prefix");
 static_assert(FMBUF_L3B0_SCRATCH_BASE + FMBUF_L3B0_SCRATCH_SLOT_BYTES <= FMBUF_URAM_BYTES,
               "Level3B0 LS_C1 scratch must fit in the URAM prefix");
-static_assert(FMBUF_L30_BLOCK5_BASE + 30 * 30 * 128 <= FMBUF_L20_BASE,
+static_assert(FMBUF_L30_BLOCK5_BASE + BLOCK5_ROW_BLOCK_ROWS * 64 * 128 <= FMBUF_L20_BASE,
               "Level3 BLOCK5 workspace must end before the residual slot");
 static_assert(FMBUF_POOL1_BASE == FMBUF_URAM_BYTES,
               "Pool storage must start at the BRAM-only boundary");

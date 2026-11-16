@@ -1,94 +1,76 @@
-ESP INT8 board app: H240W240 grayscale binary2 Round 8 single-image profiling.
+ESP INT8 board app: native H512W512 grayscale binary2, adapted QAT10 weights.
 
-Platform: platform_h240_1021, standalone_psu_cortexa53_0, Cortex-A53 0.
-App tag: INT8-BOARD-20261021-P7-H240W240-GRAY-R8-B2.
-app.yaml, the App component, boot_h240.bif and the JTAG launch configuration
-select this platform. JTAG bitstream, FSBL and psu_init paths are aligned.
-App builds remain manual. Round 8 has been built and passed the single-image
-board test. Never reuse a Round 7R ELF or BOOT.BIN for this release; any rebuild
-requires packaging a matching BOOT.BIN before SD boot.
+Platform: platform_h512_baseline, standalone_psu_cortexa53_0, Cortex-A53 0.
+App tag: INT8-BOARD-20261116-P7-H512W512-GRAY-QAT10-B2.
+Manual rebuild required after future App source changes. The current ELF
+was manually rebuilt on 2026-11-16; its QAT10 tag was confirmed on board.
+The platform, App component, app.yaml, BSP and boot recipe remain native512.
+Only weights/qparams changed: all tensor/Conv/window/consumer/fixed/BLOCK5
+descriptors and the EXEC plan match the implemented hardware's prior model.
+No IP repackaging, platform rebuild or bitstream change is needed for QAT10.
 
-One boot runs binary2 once. Dual-model, EXEC-prefix and validation-set modes
-are disabled. PARAM v4 has 75 logical UOPs, 16 EXEC records including END,
-26 CONV, 7 AFFINE, 14 ADD and 3 POOL; U71/U72 remain separate.
-Input is true grayscale NHWC INT8, 240x240x1. Output is a 240x240 uint8 mask.
-All DDR buffers are 64-byte aligned; PARAM capacity remains 262144 bytes.
+One launch runs binary2 once, with all 75 UOPs / 16 EXEC entries of PARAM v4.
+Dual-model, EXEC-prefix and validation-set modes are disabled. All 13 stage
+bins and the three Conv WIN/SA/POST state counters remain enabled and required.
+Input is NHWC signed INT8 512x512x1, with no FPGA input sampler/resize.
+Logits are 64x64x2; exact 8x bilinear logits interpolation then argmax produces
+a 512x512 uint8 mask. DDR input/output buffers are each 262144 bytes and
+64-byte aligned. PARAM capacity is 262144 bytes.
 
 SD files (8.3 names):
-BOOT.BIN  matching FSBL + Round 8 bitstream + rebuilt App, required for SD boot
-P2G.BIN   PARAM, 143040 bytes
-I2G.BIN   grayscale input, 57600 bytes
-O2G.BIN   generated output, 57600 bytes; remove any old copy before running
+P512F.BIN  QAT10 PARAM, 143040 bytes
+I512F.BIN  input paired with this export, 262144 bytes
+O512F.BIN  fresh board output, 262144 bytes; do not copy golden to this name
+BOOT.BIN   not required for JTAG; SD boot requires newly packaged firmware
 
-Copy PARAM.BIN and INPUTQ.BIN from:
-hw_artifacts/binary2_int8_h240w240_gray_r6_v4
-Hardware profile: p7_h240w240_gray_c1_r6_delta.
-Round 8 reuses this artifact without re-export/QAT. Schedule word 9 selects
-packed-row/delta transfer protocols. The baseline H240 PARAM is incompatible.
-Do not use preserved H256/RGB artifacts or the baseline H240 BOOT.
-The input uses center-square crop, resize to 240x240 and the QAT grayscale
-normalization. Labels are vehicles=0, valid background=1, ignored target=255.
-Golden fullres output contains c0=4105, c1=53495 and no invalid class IDs.
-The board mask must match golden_fullres_mask.bin byte for byte. A valid
-histogram alone is not sufficient to pass the output-correctness gate.
+Source artifact: hw_artifacts/binary2_int8_h512w512_gray_finetuned_v4
+Model export: D:/ESPNet/resolution_h512w512_gray/quantized_artifacts_native512_finetuned
+Hardware profile: p7_h512w512_gray_c1_v1. The selected checkpoint is the best
+of the completed 10-epoch QAT phase, following 40 epochs of native512 FP32
+fine-tuning. The stopped extra phase is not used. Labels are vehicles=0,
+valid background=1, GT255 ignored. The App validates geometry and complete
+EXEC-plan length before INIT and rejects timeout/ERROR/invalid output labels.
 
-Top-level stage and Conv WIN/SA/POST counter dumps remain enabled; the Conv
-capability bit is required. Reject ERROR stage activity, timeout or invalid IDs.
-POST state 1 classifies staging words; state 2 classifies commit words. Both
-include psum wait, requantization and packing, not pure phase durations.
-WIN/SA/POST overlap within Conv; their cycle totals must not be summed.
+Full val500 QAT/PARAM replay: PA=98.2372%, mIoU=86.9902%, vehicle IoU=75.8465%.
+All 4096000 INT8 logits match between QAT and replay. Expected first-sample
+golden histogram: c0=19021, c1=243123, invalid=0. Histogram equality is not
+sufficient: compare O512F.BIN byte-for-byte with golden_fullres_mask.bin.
+CSim was not run for this QAT checkpoint. The 2026-11-16 board mask now
+matches the integer golden exactly: 0/262144 pixels, invalid=0, ERROR=0.
+First-sample board PA=98.9952%, mIoU=93.6241%, vehicle IoU=88.3357% on the
+matching512 center-ROI GT. Full val500 board scoring remains pending.
+The obsolete H240-direct-transfer native512 hardware artifact was removed;
+its historical scores remain in workplan_1110.md, not this release.
 
 ARM timing uses CNTPCT_EL0 / runtime CNTFRQ_EL0, BSP reference 33333000 Hz.
-PL counters use nominal 100 MHz (10 ns), independently of the ARM timer.
-The XSA reports 99.999001 MHz, unchanged from the previous platform.
-MODE_RUN includes hardware frame transfers. SD I/O, MODE_INIT, cache
-maintenance and counter/UART dumps are outside the measured interval.
-Board-tested Round 7 baseline: 5334364 cycles (53.34364 ms), Conv=3418908,
-PPU row=289114, BLOCK5 final=773550, Vec=667534, Pool=135617 cycles.
-Round 7R measured 5097039 PL cycles (50.97039 ms), a 4.45% improvement over R7.
-Conv=3418908, PPU row=289114, BLOCK5 final=679846, Vec=523904, Pool=135617.
-ARM measured 1699004 ticks / 33333000 Hz = 50.9706297 ms; ERROR=0.
-The SD output matches golden byte for byte (0/57600 mismatch).
-Round 8 measured 4985440 PL cycles (49.854400 ms), 2.19% faster than R7R.
-ARM measured 1661804 ticks / 33333000 Hz = 49.854618546 ms; ERROR=0.
-Conv=3418908, PPU row=289114, BLOCK5 final=658246, Vec=433904, Pool=135617.
-The board mask matches golden byte for byte (0/57600 mismatch). Fullres CSim
-also passed: logits 0/1800, mask 0/57600 mismatches, last_error=0.
-Vec<=450000 passes; BLOCK5 final<=600000 remains a future working budget.
-Frozen stages retain Round 7 performance. This single result is below 50 ms,
-but three consecutive timing runs and 500-image board validation remain open.
-Actual performance requires board measurements, not HLS max latency or II=1.
+PL uses nominal 100 MHz (10 ns). SD I/O, MODE_INIT, cache maintenance and
+printing remain outside MODE_RUN. WIN/SA/POST overlap and must not be summed.
+POST staging/commit bins include psum waits, requantization and packing.
+QAT10 board timing is 22228515 PL cycles=222.28515 ms; ARM timing is
+7409496 ticks/33333000 Hz=222.28710 ms. Only one cycle differs from the old
+direct-transfer model; model adaptation improves accuracy, not throughput.
 
-Verified SHA256:
-P2G.BIN  9e380cebe305c4945642c4a334f75a7a2ba94eefa1f2ccc7f2964f8d3bf9d878
-I2G.BIN  c1f3b03245d4bc6514c2a2dfcada898453f0d8eca6292ddcd46b40c1c2b5dd87
-Golden   88bc39cb00f9f6056d76ed85f74b69c86ff4808e6f868d40f6f4e6203ce426ce
-XSA      3851987666143fc94cb2c3fc325367d9a6cdd1ad284bc357eb63a7e7507ff0b1
-Bit      6988d69a594720394faf6b3a9789ca38d2d0e69b287c48eebe2c09dfd28c89c4
-FSBL     d34cb10632763bd7d00ea27f35f4ce4011dc0aff0a92aa3905991e5650c344c7
-App ELF and BOOT.BIN must be verified after the manual build/package.
+Reused implementation: routing errors=0, WNS=+0.439 ns, WHS=+0.010 ns at 100MHz;
+logic/total LUT=205438/223151, FF=172818, BRAM tile=228.5, DSP=1289, URAM=108.
+NPU control=0xA0000000; RTL counter=0xA0010000. JTAG launch uses the platform
+FSBL, the hash-identical cached bitstream, and ESP_INT8_app/build/ESP_INT8_app.elf.
+The optional PSU-init path also points to this platform's psu_init.tcl.
+Create a new Run/Debug configuration if the existing one is removed.
 
-Implementation: routing errors=0, WNS=+0.585 ns, WHS=+0.010 ns at 100 MHz.
-Placed resources: logic LUT=203653, total LUT=221366, FF=173049,
-BRAM tile=204, DSP=1292, URAM=28, CLB=40642/42660 (95.27%). XSA, exported platform XSA
-and embedded bitstream hashes agree with the completed implementation.
-Installed Vec/BLOCK5 RTL matches the current Round 8 HLS synthesis. Resources
-and setup margin improve relative to R7R; board timing is recorded above.
-NPU control=0xA0000000; RTL counter=0xA0010000. The stage-valid and all three
-Conv-state ports are connected to the counter in the exported hardware.
-Prepare E:/ with P2G.BIN and I2G.BIN plus a newly packaged BOOT.BIN for SD boot.
-The Round 8 O2G.BIN has been verified against golden; remove it before
-the next board test to prevent mistaking a stale output for the new result.
-Preserve validation folders B/C/D/Q; do not reformat the card.
-Check the rebuilt ELF buffer addresses for 64-byte alignment and non-overlap.
+Verified data SHA256:
+P512F.BIN 7c2175418f1f34e53bb3f12f57f8e182df204d27b2df0a3e136ac488baf45d4a
+I512F.BIN b3355dbbd88d11bf34bc984d5591b83a04951a1cf93b7a674c2e908d37bcfe93
+Golden    7bf97daf99a91f6dc41e148ac40c73400a93c7559083e20fcef8fb9ad120cf8c
 
-After manually building ESP_INT8_app on platform_h240_1021:
-1. Check the new ELF contains the Round 8 tag above and uses the new BSP.
-2. From D:/ESP_INT8, package the corrected boot recipe:
-   & 'D:/Xilinx/2025.1/Vivado/bin/bootgen.bat' -arch zynqmp -image ESP_INT8_app/src/boot_h240.bif -o ESP_INT8_app/BOOT.BIN -w on
-3. Copy the newly generated ESP_INT8_app/BOOT.BIN to E:/BOOT.BIN and verify hashes.
-Do not start SD boot until this final step is complete.
-JTAG can use the aligned launch configuration after the build without SD BOOT.
-The SD data files alone do not make a bootable card. The stable source checkpoint
-is the board-tested Round 8 version, not an unimplemented workplan_1021 upgrade.
-Stable <50 ms across three runs and 500-image board validation remain pending.
+JTAG preparation: manually rebuild, select ESP_INT8_app_app_hw_1, keep FSBL
+initialization selected, and verify the new QAT10 tag at startup.
+Bitstream: platform_h512_baseline/hw/sdt/ESP_INT8_hwplat.bit
+FSBL: platform_h512_baseline/export/platform_h512_baseline/sw/boot/fsbl.elf
+PS init: platform_h512_baseline/hw/sdt/psu_init.tcl
+
+For SD boot only, package after the NEW ELF is built, from D:/ESP_INT8:
+& D:/Xilinx/2025.1/Vivado/bin/bootgen.bat -arch zynqmp -image ESP_INT8_app/src/boot_h512_native.bif -o ESP_INT8_app/BOOT.BIN -w on
+Then copy that new BOOT.BIN to E:/BOOT.BIN and verify its hash. No BOOT.BIN
+was generated during this preparation; data files alone are not boot firmware.
+Remove obsolete P512N.BIN/O512N.BIN and any stale O512F.BIN before testing.
+Preserve unrelated H240/resize comparison data and validation folders B/C/D/Q.

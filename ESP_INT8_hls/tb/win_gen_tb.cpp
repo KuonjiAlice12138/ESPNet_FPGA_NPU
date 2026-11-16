@@ -42,9 +42,9 @@ bool on_chip_memory_read_aligned_tensor_word(const tensor_desc_t& desc,
                                              act_vec_t& packed) {
     packed = 0;
     ++g_aligned_reads;
-    if (desc.c == 1 && desc.w == 240 &&
+    if (desc.c == 1 && desc.w == 512 &&
         (byte_offset < desc.base_offset || byte_offset.to_uint() + 32U >
-         desc.base_offset.to_uint() + desc.h.to_uint() * 240U)) {
+         desc.base_offset.to_uint() + desc.h.to_uint() * desc.w.to_uint())) {
         ++g_failures;
         return false;
     }
@@ -392,7 +392,7 @@ static void check_case(const char* tag,
     sched.k_tiles = (kernel * kernel * in_c + esp_int8::TK - 1) / esp_int8::TK;
     configure_loader_contract(sched);
     if (row_reuse) {
-        sched.reserved[esp_int8::WINDOW_LOADER_ROW_REUSE_WORD] = 2U | (8U << 2);
+        sched.reserved[esp_int8::WINDOW_LOADER_ROW_REUSE_WORD] = 2U | (((in_w + 31U) / 32U) << 2);
     } else if (kernel == 3 && in_c <= 25) {
         const unsigned protocol = in_c == 12 && stride == 1 && dilation == 1 && paired ? 1U : 2U;
         sched.reserved[esp_int8::WINDOW_LOADER_ROW_REUSE_WORD] = protocol << 9;
@@ -456,7 +456,8 @@ static void check_case(const char* tag,
         ++g_failures;
     }
     if (row_reuse) {
-        const unsigned expected_reads = row_step == 1 ? 1920U : 2872U;
+        const unsigned packed_words = (static_cast<unsigned>(in_w) + 31U) / 32U;
+        const unsigned expected_reads = (row_step == 1 ? in_h : 3U*out_h-1U) * packed_words;
         if (g_aligned_reads != expected_reads) { ++g_failures; }
         std::printf("[C1] %s source_reads=%u expected=%u errors=%d\n", tag,
                     g_aligned_reads, expected_reads, g_failures);
@@ -482,9 +483,13 @@ static void check_case(const char* tag,
 }
 
 int main() {
-    check_case("C1 packed phases/borders", 240, 240, 1, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C1, true, true);
-    check_case("C1 new frame", 240, 240, 1, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C1, true, true);
-    check_case("C1 noncontiguous rows", 240, 240, 1, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C1, true, true, 37);
+    if (esp_int8::INPUT_FRAME_W != 512 || esp_int8::WINGEN_C1_PACKED_ROW_WORDS != 16) {
+        std::printf("[FAIL] native512 requires sixteen complete C1 source words\n");
+        return 1;
+    }
+    check_case("C1 native512 borders", 512, 512, 1, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C1, true, true);
+    check_case("C1 new frame", 512, 512, 1, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C1, true, true);
+    check_case("C1 noncontiguous rows", 512, 512, 1, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C1, true, true, 37);
     check_case("C12-paired-d1", 4, 12, 12, 3, 1, 1, esp_int8::WIN_MODE_3X3_STAGED_C12, true);
     check_case("C12-single", 6, 8, 12, 3, 1, 2, esp_int8::WIN_MODE_3X3_STAGED_C12, false);
     check_case("C12-paired", 6, 8, 12, 3, 1, 2, esp_int8::WIN_MODE_3X3_STAGED_C12, true);
@@ -492,8 +497,11 @@ int main() {
     check_case("C17-paired", 6, 9, 17, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C17, true);
     check_case("C25-paired", 5, 7, 25, 3, 1, 2, esp_int8::WIN_MODE_3X3_STAGED_C25, true);
     check_case("C129-wide", 4, 5, 129, 3, 1, 1, esp_int8::WIN_MODE_3X3_STAGED_C129, false);
+    check_case("C17 native256", 6, 256, 17, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C17, true);
+    check_case("C129 native128", 4, 128, 129, 3, 2, 1, esp_int8::WIN_MODE_3X3_STAGED_C129, false);
+    check_case("C12 group-boundary halo", 128, 128, 12, 3, 1, 16, esp_int8::WIN_MODE_3X3_STAGED_C12, true);
     for (int dilation = 1; dilation <= 16; dilation *= 2) {
-        check_case("C12 delta slot wrap", 6, 67, 12, 3, 1, dilation, esp_int8::WIN_MODE_3X3_STAGED_C12, true);
+        check_case("C12 delta slot wrap", 6, 128, 12, 3, 1, dilation, esp_int8::WIN_MODE_3X3_STAGED_C12, true);
         check_case("C25 delta slot wrap", 5, 67, 25, 3, 1, dilation, esp_int8::WIN_MODE_3X3_STAGED_C25, false);
     }
     check_case("C64-1x1-single", 4, 6, 64, 1, 1, 1, esp_int8::WIN_MODE_1X1_ALIGNED, false);

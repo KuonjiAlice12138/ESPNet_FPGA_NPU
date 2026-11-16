@@ -90,7 +90,7 @@ bool conv_store_word_span_plan_ok(u8_t bank_id,
   }
   if (first_offset >= static_cast<u64_t>(byte_capacity)) { return false; }
   // Widen before the last-address calculation; a wrapped 32-bit end is not valid.
-  const ap_uint<9> last_word = static_cast<ap_uint<9>>(count - 1U);
+  const ap_uint<10> last_word = static_cast<ap_uint<10>>(count - 1U);
   const u64_t end_offset = first_offset +
       static_cast<u64_t>(last_word * byte_step) + static_cast<u64_t>(AXI_WORD_BYTES);
   return end_offset <= static_cast<u64_t>(byte_capacity);

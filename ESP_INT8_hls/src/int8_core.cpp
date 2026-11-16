@@ -336,9 +336,9 @@ static error_code_t core_mode_run(const axi_vec_t* gmem_frame_in,
 
 }  // namespace esp_int8
 
-static_assert(esp_int8::INPUT_FRAME_AXI_WORDS == 1800,
+static_assert(esp_int8::INPUT_FRAME_AXI_WORDS == 8192,
               "Update gmem_frame_in m_axi depth when INPUT_FRAME_AXI_WORDS changes.");
-static_assert(esp_int8::OUTPUT_FRAME_AXI_WORDS == 1800,
+static_assert(esp_int8::OUTPUT_FRAME_AXI_WORDS == 8192,
               "Update gmem_frame_out m_axi depth when OUTPUT_FRAME_AXI_WORDS changes.");
 
 void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
@@ -353,9 +353,11 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
                               volatile esp_int8::u8_t& prof_conv_win_state,
                               volatile esp_int8::u8_t& prof_conv_sa_state,
                               volatile esp_int8::u8_t& prof_conv_post_state) {
+// Keep top/interface recognition explicit when cfg directive injection is lost.
+#pragma HLS TOP name=espnet_encoder_int8_core
 #ifdef ESP_INT8_COSIM_LITE
-#pragma HLS INTERFACE ap_memory port=gmem_frame_in depth=1800
-#pragma HLS INTERFACE ap_memory port=gmem_frame_out depth=1800
+#pragma HLS INTERFACE ap_memory port=gmem_frame_in depth=8192
+#pragma HLS INTERFACE ap_memory port=gmem_frame_out depth=8192
 #pragma HLS INTERFACE ap_memory port=gmem_param depth=8192
 #pragma HLS INTERFACE ap_none port=mode
 #pragma HLS INTERFACE ap_none port=uop_count
@@ -368,8 +370,8 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
 #pragma HLS INTERFACE ap_none port=prof_conv_post_state register
 #pragma HLS INTERFACE ap_ctrl_hs port=return
 #else
-#pragma HLS INTERFACE m_axi port=gmem_frame_in offset=slave bundle=gmem0 depth=1800 max_read_burst_length=64 num_read_outstanding=4
-#pragma HLS INTERFACE m_axi port=gmem_frame_out offset=slave bundle=gmem1 depth=1800 max_write_burst_length=64 num_write_outstanding=4
+#pragma HLS INTERFACE m_axi port=gmem_frame_in offset=slave bundle=gmem0 depth=8192 max_read_burst_length=64 num_read_outstanding=4
+#pragma HLS INTERFACE m_axi port=gmem_frame_out offset=slave bundle=gmem1 depth=8192 max_write_burst_length=64 num_write_outstanding=4
 #pragma HLS INTERFACE m_axi port=gmem_param offset=slave bundle=gmem2 depth=8192 max_read_burst_length=64 num_read_outstanding=4
 #pragma HLS INTERFACE ap_vld port=prof_stage_id register
 #pragma HLS INTERFACE ap_none port=prof_active register

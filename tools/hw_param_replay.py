@@ -186,15 +186,16 @@ def window_row_reuse_contract_valid(
     if mode == WINDOW_ROW_REUSE_NONE:
         return words == 0
     if desc.mode == WIN_MODE_3X3_STAGED_C1:
-        common = (mode == WINDOW_ROW_REUSE_STRIDE2_KEEP1 and words == 8 and protocol == 0
+        common = (mode == WINDOW_ROW_REUSE_STRIDE2_KEEP1 and (words, desc.out_w) in ((8, 120), (16, 256)) and protocol == 0
                   and desc.kernel == 3 and desc.in_c == 1 and desc.stride == 2
                   and desc.dilation == 1 and desc.padding == 1 and desc.k_tiles == 1
-                  and desc.out_w == 120 and desc.loader_class == WIN_LOADER_3X3_NARROW
+                  and desc.loader_class == WIN_LOADER_3X3_NARROW
                   and desc.flags == WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2)
         if not common or conv is None or src is None:
             return False
-        return (src.h == src.w == conv.in_h == conv.in_w == 240 and src.c == src.phys_c == 1
-                and src.row_stride_bytes == 240 and src.elem_bytes == 1 and src.c_offset == 0
+        width = 2 * desc.out_w
+        return (src.h == src.w == conv.in_h == conv.in_w == width and src.c == src.phys_c == 1
+                and src.row_stride_bytes == width and src.elem_bytes == 1 and src.c_offset == 0
                 and src.base_offset % 32 == 0 and 0 < conv.out_c <= 16
                 and all(getattr(conv, f) == getattr(desc, f) for f in
                         ("in_c", "kernel", "stride", "dilation", "padding", "k_tiles")))
@@ -777,8 +778,14 @@ class ParamBlob:
 # ── on-chip feature memory ─────────────────────────────────
 class FeatureMemory:
     """Minimal on-chip FMBUF simulation for replay."""
-    def __init__(self):
-        self.buf = np.zeros(FMBUF_BYTES, dtype=np.uint8)
+    def __init__(self, capacity_bytes: int = FMBUF_BYTES):
+        if capacity_bytes <= 0:
+            raise ValueError("feature memory capacity must be positive")
+        self.buf = np.zeros(capacity_bytes, dtype=np.uint8)
+
+    def check_span(self, offset: int, count: int) -> None:
+        if offset < 0 or count < 0 or offset + count > self.buf.size:
+            raise ValueError(f"feature memory span {offset}+{count} exceeds {self.buf.size}")
 
     @staticmethod
     def physical_base(desc: TensorDesc) -> int:
@@ -793,6 +800,7 @@ class FeatureMemory:
             return np.zeros(count, dtype=np.int8)
         valid = min(count, desc.c - c_begin, desc.phys_c)
         off = self.physical_base(desc) + desc.elem_offset(h, w, c_begin)
+        self.check_span(off, valid)
         result = np.zeros(count, dtype=np.int8)
         slice_buf = self.buf[off:off + valid].astype(np.int8)
         result[:valid] = slice_buf
@@ -803,6 +811,7 @@ class FeatureMemory:
             return
         valid = min(count, desc.c - c_begin)
         off = self.physical_base(desc) + desc.elem_offset(h, w, c_begin)
+        self.check_span(off, valid)
         self.buf[off:off + valid] = np.clip(data[:valid], INT8_MIN, INT8_MAX).astype(np.uint8)
 
     def dump_tensor(self, desc: TensorDesc) -> np.ndarray:
@@ -810,6 +819,7 @@ class FeatureMemory:
         for h in range(desc.h):
             for w in range(desc.w):
                 off = self.physical_base(desc) + desc.elem_offset(h, w, 0)
+                self.check_span(off, desc.c)
                 result[h, w, :] = self.buf[off:off + desc.c].astype(np.int8)
         return result
 
@@ -854,6 +864,7 @@ def _write_array_to_fmem(fmem: FeatureMemory, desc: TensorDesc, arr: np.ndarray)
     if desc.c_offset == 0 and desc.phys_c == desc.c and desc.row_stride_bytes == desc.w * desc.c:
         flat = np.ascontiguousarray(arr.reshape(-1)).astype(np.uint8)
         start = fmem.physical_base(desc)
+        fmem.check_span(start, flat.size)
         fmem.buf[start:start + flat.size] = flat
         return
     for h in range(desc.h):
@@ -900,11 +911,11 @@ def replay_conv_array(blob: ParamBlob, param_id: int, src: np.ndarray) -> np.nda
     out_w = math.ceil(desc.in_w / stride_val)
     out_c = int(desc.out_c)
 
-    fmem = FeatureMemory()
     src_desc = TensorDesc(base_offset=0, h=desc.in_h, w=desc.in_w, c=desc.in_c, reserved0=desc.in_c)
     src_bytes = int(desc.in_h) * int(desc.in_w) * int(desc.in_c)
     dst_base = ((src_bytes + 63) // 64) * 64
     dst_desc = TensorDesc(base_offset=dst_base, h=out_h, w=out_w, c=out_c, reserved0=out_c)
+    fmem = FeatureMemory(dst_base + out_h * out_w * out_c)
     _write_array_to_fmem(fmem, src_desc, src)
     replay_conv(fmem, blob, param_id, src_desc, dst_desc, RowConsumerDesc())
     return fmem.dump_tensor(dst_desc)

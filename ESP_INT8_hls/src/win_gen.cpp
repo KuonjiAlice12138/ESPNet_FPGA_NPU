@@ -91,7 +91,7 @@ struct narrow_delta_cache_t {
 };
 static narrow_delta_cache_t s_delta_cache;
 
-// The raw C1 frame has 240-byte rows; no padded copy is stored in FM memory.
+// Native C1 source rows are complete AXI words; no padded frame copy is stored.
 static act_vec_t s_c1_rows[3][WINGEN_C1_PACKED_ROW_WORDS];
 static bool s_c1_rows_valid = false;
 static u16_t s_c1_last_row = 0;
@@ -1622,31 +1622,19 @@ static void scheduled_1x1_window_row(const tensor_desc_t& src_desc,
 template <int ROW>
 static void c1_load_packed_source_row(const tensor_desc_t& src, int source_row) {
 #pragma HLS INLINE
+    static_assert(INPUT_FRAME_W % AXI_WORD_BYTES == 0, "Native C1 rows must be AXI aligned");
     const bool valid = source_row >= 0 && source_row < INPUT_FRAME_H;
     const unsigned row_byte = src.base_offset.to_uint() +
                               static_cast<unsigned>(valid ? source_row : 0) * INPUT_FRAME_W;
-    const unsigned phase = row_byte & 31U;
-    const unsigned aligned = row_byte & ~31U;
-    act_vec_t previous = 0;
     for (int wi = 0; wi < WINGEN_C1_PACKED_ROW_WORDS; ++wi) {
 #pragma HLS PIPELINE off
         act_vec_t current = 0;
         if (valid) {
             on_chip_memory_read_aligned_tensor_word(src,
-                static_cast<u32_t>(aligned + static_cast<unsigned>(wi) * AXI_WORD_BYTES), current);
+                static_cast<u32_t>(row_byte + static_cast<unsigned>(wi) * AXI_WORD_BYTES), current);
         }
-        if (phase == 0U) {
-            s_c1_rows[ROW][wi] = current;
-        } else if (wi != 0) {
-            s_c1_rows[ROW][wi - 1] = (previous >> 128) | (current << 128);
-        }
-        previous = current;
+        s_c1_rows[ROW][wi] = current;
     }
-    if (phase != 0U) {
-        s_c1_rows[ROW][WINGEN_C1_PACKED_ROW_WORDS - 1] = previous >> 128;
-    }
-    // 240 real bytes followed by 16 local zeros, including the last raw frame row.
-    s_c1_rows[ROW][WINGEN_C1_PACKED_ROW_WORDS - 1].range(255, 128) = 0;
 }
 
 template <int ROW>

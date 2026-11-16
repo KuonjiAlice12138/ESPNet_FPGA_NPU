@@ -692,6 +692,47 @@ int int8_npu_validate_param_header(const Int8ParamBlobHeader *header,
     return XST_SUCCESS;
 }
 
+int int8_npu_validate_deployment_geometry(const u8 *param_blob, u32 param_bytes,
+                                          const Int8ParamBlobHeader *header)
+{
+    const u8 *input;
+    const u8 *logits;
+    u32 input_hw;
+    u32 logits_hw;
+    u32 input_c;
+    u32 logits_c;
+
+    if (param_blob == NULL || header == NULL ||
+        header->tensor_desc_count <= INT8_PARAM_LOGITS_TENSOR_ID ||
+        header->tensor_desc_offset > param_bytes ||
+        header->tensor_desc_count >
+            (param_bytes - header->tensor_desc_offset) / INT8_PARAM_TENSOR_DESC_BYTES) {
+        xil_printf("NPU: invalid deployment tensor section\r\n");
+        return XST_FAILURE;
+    }
+    /* PARAM v4 TID_INPUT/TID_OUT; same-size H240 blobs must not pass this gate. */
+    input = param_blob + header->tensor_desc_offset +
+            INT8_PARAM_INPUT_TENSOR_ID * INT8_PARAM_TENSOR_DESC_BYTES;
+    logits = param_blob + header->tensor_desc_offset +
+             INT8_PARAM_LOGITS_TENSOR_ID * INT8_PARAM_TENSOR_DESC_BYTES;
+    input_hw = read_u32_le(input + 8U);
+    logits_hw = read_u32_le(logits + 8U);
+    input_c = read_u32_le(input + 12U) & 0xffffU;
+    logits_c = read_u32_le(logits + 12U) & 0xffffU;
+    if (input[1] != 1U || logits[1] != 1U ||
+        (input_hw & 0xffffU) != INT8_APP_INPUT_H ||
+        (input_hw >> 16) != INT8_APP_INPUT_W || input_c != INT8_APP_INPUT_C ||
+        (logits_hw & 0xffffU) != INT8_APP_LOGITS_H ||
+        (logits_hw >> 16) != INT8_APP_LOGITS_W ||
+        logits_c != INT8_APP_EXPECTED_CLASS_COUNT) {
+        xil_printf("NPU: incompatible geometry input=%ux%ux%u logits=%ux%ux%u\r\n",
+                   input_hw & 0xffffU, input_hw >> 16, input_c,
+                   logits_hw & 0xffffU, logits_hw >> 16, logits_c);
+        return XST_FAILURE;
+    }
+    return XST_SUCCESS;
+}
+
 int int8_npu_read_exec_plan_entry(const u8 *param_blob, u32 param_bytes,
                                   const Int8ParamBlobHeader *header,
                                   u32 index, Int8ExecPlanEntry *entry)

@@ -63,7 +63,7 @@ constexpr unsigned WINDOW_ROW_REUSE_WORDS_MASK = 0x7FU;
 constexpr unsigned WINDOW_TRANSFER_PROTOCOL_SHIFT = 9U;
 constexpr unsigned WINDOW_TRANSFER_PROTOCOL_MASK = 0x3U;
 constexpr unsigned WINDOW_ROW_REUSE_RESERVED_SHIFT = 11U;
-constexpr int WINGEN_C1_PACKED_ROW_WORDS = 8;
+constexpr int WINGEN_C1_PACKED_ROW_WORDS = INPUT_FRAME_W / AXI_WORD_BYTES;
 
 enum window_transfer_protocol_t : std::uint8_t {
   WINDOW_TRANSFER_SPATIAL_WORDS = 0,

@@ -59,6 +59,8 @@ int int8_npu_read_param_header(const u8 *param_blob, u32 param_bytes,
                                Int8ParamBlobHeader *header);
 int int8_npu_validate_param_header(const Int8ParamBlobHeader *header,
                                    u32 param_bytes);
+int int8_npu_validate_deployment_geometry(const u8 *param_blob, u32 param_bytes,
+                                          const Int8ParamBlobHeader *header);
 int int8_npu_read_exec_plan_entry(const u8 *param_blob, u32 param_bytes,
                                   const Int8ParamBlobHeader *header,
                                   u32 index, Int8ExecPlanEntry *entry);

@@ -182,6 +182,9 @@ static bool check_vec_span_plans() {
     {BANK_FMEM0, FMBUF_BYTES - 32, 32, 2, false},
     {BANK_FMEM0, FMBUF_BYTES, 32, 1, false},
     {BANK_FMEM0, 0, 32, ROW_CONTIG_MAX_WORDS, true},
+    {BANK_FMEM0, 0, 32, 511, true},
+    {BANK_FMEM0, 0, 32, 512, true},
+    {BANK_FMEM0, FMBUF_BYTES - 128, 32, 516, false},
     {BANK_FMEM0, 0, 32, ROW_CONTIG_MAX_WORDS + 1, false},
     {BANK_FMEM0, 0, 32, 0, false},
     {BANK_FMEM0, 1, 32, 1, false},
@@ -392,29 +395,34 @@ static bool check_vec_bad_destinations(const std::vector<std::uint8_t>& original
   return param_dma_ready();
 }
 
-static bool check_block5_cache_row(bool l3, unsigned row, bool residual_enabled) {
+static bool check_block5_cache_row(bool l3, unsigned row, bool residual_enabled,
+                                  bool group_boundary = false) {
   using namespace esp_int8;
   const unsigned counts[5] = {l3 ? 28U : 16U, l3 ? 25U : 12U, l3 ? 25U : 12U,
                               l3 ? 25U : 12U, l3 ? 25U : 12U};
+  const unsigned local_row = group_boundary ? row % BLOCK5_ROW_BLOCK_ROWS : row;
+  const unsigned source_rows = group_boundary ? BLOCK5_ROW_BLOCK_ROWS : 3U;
+  const unsigned output_rows = group_boundary ? 128U : 3U;
+  const unsigned generation = group_boundary ? (row / BLOCK5_ROW_BLOCK_ROWS) * 23U : 0U;
   tensor_desc_t sources[4];
   for (unsigned source = 0; source < 4; ++source) {
     tensor_desc_t& desc = sources[source];
     desc = tensor_desc_t();
     desc.bank_id = static_cast<u8_t>(static_cast<unsigned>(BANK_FMEM0));
     desc.elem_bytes = 1;
-    desc.h = 3;
+    desc.h = source_rows;
     desc.w = 3;
     desc.c = counts[source];
     desc.reserved0 = TENSOR_ROW_ALIGN32 | counts[source];
     desc.reserved1 = 16;
-    desc.base_offset = 0x24000U + source * 0x1000U;
+    desc.base_offset = group_boundary ? 0x50000U + source * 0x8000U : 0x24000U + source * 0x1000U;
     const unsigned stride = tensor_row_stride_bytes(desc).to_uint();
-    std::vector<std::uint8_t> data(16U + 3U * stride + 31U, 0);
-    for (unsigned y = 0; y < 3; ++y) {
+    std::vector<std::uint8_t> data(16U + source_rows * stride + 31U, 0);
+    for (unsigned y = 0; y < source_rows; ++y) {
       for (unsigned x = 0; x < 3; ++x) {
         for (unsigned c = 0; c < counts[source]; ++c) {
           data[16U + y * stride + x * counts[source] + c] =
-              static_cast<std::uint8_t>(13U + source * 47U + y * 9U + x * 5U + c * 3U);
+              static_cast<std::uint8_t>(13U + generation + source * 47U + y * 9U + x * 5U + c * 3U);
         }
       }
     }
@@ -431,14 +439,14 @@ static bool check_block5_cache_row(bool l3, unsigned row, bool residual_enabled)
   tensor_desc_t dst = tensor_desc_t();
   dst.bank_id = static_cast<u8_t>(static_cast<unsigned>(BANK_FMEM0));
   dst.elem_bytes = 1;
-  dst.h = 3;
+  dst.h = output_rows;
   dst.w = 3;
   dst.c = l3 ? 128U : 64U;
   dst.reserved0 = dst.c;
   dst.base_offset = 0x20000U;
   tensor_desc_t residual = dst;
-  residual.base_offset = 0x22000U;
-  for (unsigned byte = 0; byte < 3U * tensor_row_stride_bytes(residual).to_uint();
+  residual.base_offset = group_boundary ? 0x30000U : 0x22000U;
+  for (unsigned byte = 0; byte < output_rows * tensor_row_stride_bytes(residual).to_uint();
        byte += AXI_WORD_BYTES) {
     axi_vec_t word = 0;
     for (unsigned lane = 0; lane < AXI_WORD_BYTES; ++lane) {
@@ -452,7 +460,7 @@ static bool check_block5_cache_row(bool l3, unsigned row, bool residual_enabled)
   for (unsigned x = 0; x < 3; ++x) {
     row_buf[x] = 0;
     for (unsigned c = 0; c < counts[4]; ++c) {
-      set_byte(row_buf[x], c, static_cast<std::uint8_t>(19U + x * 11U + c * 7U));
+      set_byte(row_buf[x], c, static_cast<std::uint8_t>(19U + generation + x * 11U + c * 7U));
     }
   }
   block5_sched_desc_t sched = block5_sched_desc_t();
@@ -466,9 +474,9 @@ static bool check_block5_cache_row(bool l3, unsigned row, bool residual_enabled)
   const bool ok = ppu_consume_block5_final_row(sched, sources[0], sources[1], sources[2],
                                                sources[3], residual, dst, residual_enabled,
                                                add_qparam, static_cast<u8_t>(0),
-                                               static_cast<u16_t>(row), static_cast<u16_t>(row),
+                                               static_cast<u16_t>(local_row), static_cast<u16_t>(row),
                                                row_buf);
-  if (row >= 3U) { return !ok; }
+  if (row >= output_rows) { return !ok; }
   if (!ok) { return false; }
   for (unsigned x = 0; x < 3; ++x) {
     for (unsigned tile = 0; tile < dst.c.to_uint() / TM; ++tile) {
@@ -487,8 +495,8 @@ static bool check_block5_cache_row(bool l3, unsigned row, bool residual_enabled)
         unsigned source = 0;
         while (channel >= counts[source]) { channel -= counts[source++]; }
         int value = source == 4U
-            ? as_i8(static_cast<std::uint8_t>(19U + x * 11U + channel * 7U))
-            : as_i8(static_cast<std::uint8_t>(13U + source * 47U + row * 9U + x * 5U + channel * 3U));
+            ? as_i8(static_cast<std::uint8_t>(19U + generation + x * 11U + channel * 7U))
+            : as_i8(static_cast<std::uint8_t>(13U + generation + source * 47U + local_row * 9U + x * 5U + channel * 3U));
         if (residual_enabled) {
           value += as_i8(static_cast<std::uint8_t>((offset + lane) * 17U + 31U));
           value = value > 127 ? 127 : (value < -128 ? -128 : value);
@@ -504,6 +512,25 @@ static bool check_block5_cache_row(bool l3, unsigned row, bool residual_enabled)
       }
     }
   }
+  return true;
+}
+
+static bool check_block5_group_boundary() {
+  using namespace esp_int8;
+  if (!check_block5_cache_row(false, 63, true, true)) { return false; }
+  axi_vec_t saved[6];
+  const u8_t bank = static_cast<unsigned>(BANK_FMEM0);
+  const unsigned row63 = 0x20000U + 63U * 3U * 64U;
+  for (unsigned word = 0; word < 6; ++word) {
+    if (!on_chip_memory_read_fmbuf_abs_word(bank, row63 + word * AXI_WORD_BYTES, saved[word])) { return false; }
+  }
+  if (!check_block5_cache_row(false, 64, true, true)) { return false; }
+  for (unsigned word = 0; word < 6; ++word) {
+    axi_vec_t actual = 0;
+    if (!on_chip_memory_read_fmbuf_abs_word(bank, row63 + word * AXI_WORD_BYTES, actual) ||
+        actual != saved[word]) { return false; }
+  }
+  std::printf("[PASS] BLOCK5 local scratch reuse at absolute rows 63/64; prior output preserved\n");
   return true;
 }
 
@@ -777,10 +804,10 @@ static void count_labels(const std::vector<std::uint8_t>& bytes,
 
 int main() {
   static constexpr int MAX_ALLOWED_MASK_MISMATCHES = 0;
-  static_assert(ESP_INT8_CSIM_CLASS_COUNT == 2, "H240 grayscale release is binary2");
+  static_assert(ESP_INT8_CSIM_CLASS_COUNT == 2, "Native512 grayscale release is binary2");
   if (!check_bounded_int8_math() || !check_compact_packing() ||
       !check_binary_interpolation() || !check_vec_span_plans()) { return 1; }
-  const char* artifact_dir = "D:/ESP_INT8/hw_artifacts/binary2_int8_h240w240_gray_r6_v4";
+  const char* artifact_dir = "D:/ESP_INT8/hw_artifacts/binary2_int8_h512w512_gray_finetuned_v4";
   if (const char* selected = std::getenv("ESP_INT8_CSIM_ARTIFACT_DIR")) {
     artifact_dir = selected;
   }
@@ -849,6 +876,16 @@ int main() {
   if (!esp_int8::param_dma_ready()) {
     std::printf("[FAIL] current PARAM rejected by INIT\n");
     return 1;
+  }
+  if (std::getenv("ESP_INT8_CSIM_BOUNDARY_ONLY")) {
+    for (unsigned seed = 1; seed <= 2; ++seed) {
+      if (!check_vec_alias_case(5U, seed) || !check_vec_alias_case(8U, seed)) { return 1; }
+    }
+    if (!check_block5_group_boundary() ||
+        !check_block5_cache_reload(param_bytes, param, frame_in, frame_out) ||
+        !check_vec_bad_destinations(param_bytes, param, frame_in, frame_out)) { return 1; }
+    std::printf("[PASS] native512 boundary checks; no network inference executed\n");
+    return 0;
   }
   call_espnet_encoder_int8_core(frame_in, frame_out, param,
                                 esp_int8::MODE_RUN,
@@ -991,17 +1028,20 @@ int main() {
   std::printf("[PASS] INIT rejected %zu malformed/retired schedules\n",
               sizeof(corruptions) / sizeof(corruptions[0]));
 
-  if (!read_binary("D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_r2_v4/PARAM.BIN",
-                   old_param_bytes)) {
-    return 1;
-  }
-  pack_bytes(old_param_bytes, param, 8192U);
-  call_espnet_encoder_int8_core(frame_in, frame_out, param,
-                                esp_int8::MODE_INIT,
-                                esp_int8::UOP_COUNT_ENCODER);
-  if (esp_int8::param_dma_ready()) {
-    std::printf("[FAIL] legacy H256W512 PARAM passed H240W240/C1 geometry gate\n");
-    return 1;
+  const char* old_artifacts[] = {
+    "D:/ESP_INT8/hw_artifacts/binary2_int8_h256w512_r2_v4/PARAM.BIN",
+    "D:/ESP_INT8/hw_artifacts/binary2_int8_h240w240_gray_r6_v4/PARAM.BIN",
+  };
+  for (const char* old_path : old_artifacts) {
+    if (!read_binary(old_path, old_param_bytes)) { return 1; }
+    pack_bytes(old_param_bytes, param, 8192U);
+    call_espnet_encoder_int8_core(frame_in, frame_out, param,
+                                  esp_int8::MODE_INIT,
+                                  esp_int8::UOP_COUNT_ENCODER);
+    if (esp_int8::param_dma_ready()) {
+      std::printf("[FAIL] old PARAM passed native512/C1 geometry gate: %s\n", old_path);
+      return 1;
+    }
   }
 
   pack_bytes(param_bytes, param, 8192U);
@@ -1011,7 +1051,7 @@ int main() {
     std::printf("[FAIL] valid INIT did not recover after rejection\n");
     return 1;
   }
-  if (!check_block5_cache_reload(param_bytes, param, frame_in, frame_out)) {
+  if (!check_block5_group_boundary() || !check_block5_cache_reload(param_bytes, param, frame_in, frame_out)) {
     std::printf("[FAIL] BLOCK5 coefficient cache invalidation\n");
     return 1;
   }

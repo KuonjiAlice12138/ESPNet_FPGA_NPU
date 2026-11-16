@@ -827,8 +827,8 @@ def load_deployment_contract(artifact_dir: Path) -> ArtifactDeploymentContract:
     geometry = geometry_from_manifest(manifest)
     preprocessing = manifest.get("preprocessing", {})
     if geometry.input_channels == 1:
-        if (geometry.input_height, geometry.input_width, class_count) != (240, 240, 2):
-            raise ValueError("C1 deployment is restricted to H240W240 binary2")
+        if (geometry.input_height, geometry.input_width, class_count) not in ((240, 240, 2), (512, 512, 2)):
+            raise ValueError("C1 deployment requires native H240W240 or H512W512 binary2")
         if (preprocessing.get("image_mode") != "gray" or
                 preprocessing.get("center_square_crop") is not True or
                 len(preprocessing.get("mean", [])) != 1 or
@@ -1084,6 +1084,24 @@ def pack_fixed_exec_desc(desc: FixedExecDesc) -> bytes:
 
 def pack_exec_plan_entry(entry: ExecPlanEntry) -> bytes:
     return struct.pack("<4B", entry.kind, entry.desc_id, entry.logical_uop_id, entry.flags)
+
+
+def validate_block5_schedule(desc: Block5SchedDesc, convs: Sequence[ConvExecDesc]) -> None:
+    first = desc.first_branch_conv_id
+    if desc.branch_count != 5 or first < 0 or first + 5 > len(convs) or desc.row_group_h != 64:
+        raise ValueError("BLOCK5 requires five valid branches and 64-row local groups")
+    channels = {BLOCK5_PATTERN_L2_C16_4C12: (16, 12, 12, 12, 12),
+                BLOCK5_PATTERN_L3_C28_4C25: (28, 25, 25, 25, 25)}.get(desc.pattern)
+    if channels is None or desc.valid_c != sum(channels):
+        raise ValueError("BLOCK5 pattern/channel contract mismatch")
+    for i, conv in enumerate(convs[first:first+5]):
+        expected = (conv_out_dim(conv.in_h, conv.stride), conv_out_dim(conv.in_w, conv.stride))
+        if (expected != (desc.out_h, desc.out_w) or conv.src_tensor != desc.src_tensor or
+                conv.out_c != channels[i] or conv.kernel != 3 or conv.stride != 1):
+            raise ValueError(f"BLOCK5 branch {i} geometry/source contract mismatch")
+    if (convs[first].window_sched_id != desc.first_window_sched_id or
+            convs[first].qparam_id != desc.first_conv_qparam_id):
+        raise ValueError("BLOCK5 first-branch schedule/qparam mismatch")
 
 
 def pack_block5_sched_desc(desc: Block5SchedDesc) -> bytes:
@@ -1675,8 +1693,9 @@ def compile_window_row_reuse_word(
     ):
         return 0
 
-    if in_c == 1 and source_w == 240 and stride == 2:
-        return WINDOW_ROW_REUSE_STRIDE2_KEEP1 | (8 << WINDOW_ROW_REUSE_WORDS_SHIFT)
+    if in_c == 1 and source_w in (240, 512) and stride == 2:
+        words = (source_w + TK - 1) // TK
+        return WINDOW_ROW_REUSE_STRIDE2_KEEP1 | (words << WINDOW_ROW_REUSE_WORDS_SHIFT)
     # Preserve offline RGB compilation; it is not a handler in the H240 IP.
     if in_c != 3 or stride != 2:
         return 0
@@ -4055,7 +4074,7 @@ def build_memory_lifetime_audit(
             "uram_bytes": layout.uram_bytes,
             "bram_bytes": layout.bram_bytes,
             "high_water_mark": layout.fmbuf_bytes,
-            "estimated_uram_blocks_256b": layout.uram_bytes // 0x8000,
+            "estimated_uram_blocks_256b": 4 * ((layout.uram_bytes + 0x1FFFF) // 0x20000),
             "pool_bram_base": layout.pool1_base,
         },
         "aliases": [
@@ -4314,6 +4333,8 @@ def build_blob_v4(args: argparse.Namespace) -> dict:
         )
         for _ in range(MAX_BLOCK5_SCHED_COUNT - len(block5_sched_descs))
     ]
+    for desc in block5_sched_descs:
+        validate_block5_schedule(desc, conv_exec_descs)
     block5_sched_data = b"".join(pack_block5_sched_desc(desc) for desc in block5_sched_padded)
     uop_data = b"".join(pack_uop(uop) for uop in uops)
 
@@ -4491,12 +4512,12 @@ def build_blob_v4(args: argparse.Namespace) -> dict:
         "param_blob_bytes": len(blob),
         "param_blob_sha256": audit["param_blob"]["sha256"],
         "param_version": PARAM_BLOB_VERSION_SCHED,
-        "hardware_profile": ("p7_h240w240_gray_c1_v1" if contract.geometry.input_channels == 1
+        "hardware_profile": (f"p7_h{contract.geometry.input_height}w{contract.geometry.input_width}_gray_c1_v1" if contract.geometry.input_channels == 1
                              else "p7_rgb_v4"),
         "preprocessing": contract.preprocessing,
         "artifact_hashes": frame_hashes,
         "hardware_contract": {
-            "memory_layout": ("p7_h240_gray_rowpad_fmbuf_v1" if contract.geometry.input_channels == 1
+            "memory_layout": (f"p7_h{contract.geometry.input_height}_gray_rowpad_fmbuf_v1" if contract.geometry.input_channels == 1
                               else "p7_h256_compact_fmbuf_v1_20260909"),
             "schedule": "P7_PARAM_V4_EXEC_PLAN",
             "weight_layout": "SA-ready packed weight words: oc-local TM lane, kt K-tile",
@@ -4697,6 +4718,9 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
     if len(block5_records) != MAX_BLOCK5_SCHED_COUNT * 32:
         raise ValueError("block5_sched_desc section is truncated")
     active_block5 = 0
+    convs_for_block5 = [ConvExecDesc(*struct.unpack_from("<4B4H4B2B2HI4H2x", data,
+                        offsets["conv_exec_desc"] + i * 36))
+                       for i in range(counts["conv_exec_desc_count"])]
     for sid in range(MAX_BLOCK5_SCHED_COUNT):
         bo = block5_off + sid * 32
         pattern, branch_count, first_conv, first_sched, _first_qparam = struct.unpack("<5B", data[bo : bo + 5])
@@ -4711,6 +4735,7 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
             raise ValueError(f"block5_sched[{sid}] branch conv range out of bounds")
         if first_sched >= counts["window_sched_count"]:
             raise ValueError(f"block5_sched[{sid}] bad first_window_sched_id={first_sched}")
+        validate_block5_schedule(Block5SchedDesc(*struct.unpack_from("<16B6HI", data, bo)), convs_for_block5)
     if active_block5 == 0:
         raise ValueError("PARAM v4 is missing active block5_sched_desc records")
     last = struct.unpack("<4B", data[exec_off + (exec_count - 1) * 4 : exec_off + exec_count * 4])
@@ -4840,7 +4865,8 @@ def parse_and_check_blob_v4(path: Path, audit: dict | None = None) -> None:
             )
             stride2_ok = (
                 reuse_mode == WINDOW_ROW_REUSE_STRIDE2_KEEP1
-                and (in_c == 3 or (in_c == 1 and packed_words == 8 and padding == 1 and out_w == 120))
+                and (in_c == 3 or (in_c == 1 and padding == 1 and
+                     (packed_words, out_w) in ((8, 120), (16, 256))))
                 and stride == 2
             )
             if not common_reuse or not stride2_ok:
@@ -5013,8 +5039,8 @@ def recompile_window_reuse_artifact(source_dir: Path, out_dir: Path) -> dict:
     original = (source_dir / "PARAM.BIN").read_bytes()
     compiled = compile_window_reuse_param(source_dir / "PARAM.BIN")
     blob = ParamBlob(source_dir / "PARAM.BIN")
-    if (blob.geometry.input_height, blob.geometry.input_width, blob.geometry.input_channels) not in ((256, 512, 3), (240, 240, 1)):
-        raise ValueError("schedule recompile supports H256 RGB and H240 grayscale releases")
+    if (blob.geometry.input_height, blob.geometry.input_width, blob.geometry.input_channels) not in ((256, 512, 3), (240, 240, 1), (512, 512, 1)):
+        raise ValueError("schedule recompile supports H256 RGB and native H240/H512 grayscale releases")
     original_golden = (source_dir / "golden_output_q.bin").read_bytes()
     shutil.copytree(source_dir, out_dir, dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns("sa_utilization*", "csim_*"))
@@ -5052,7 +5078,7 @@ def recompile_window_reuse_artifact(source_dir: Path, out_dir: Path) -> dict:
             metadata["param_blob_sha256"] = sha256_file(out_dir / "PARAM.BIN")
             metadata["param_blob_bytes"] = len(compiled)
             if blob.geometry.input_channels == 1:
-                metadata["hardware_profile"] = "p7_h240w240_gray_c1_r6_delta"
+                metadata["hardware_profile"] = f"p7_h{blob.geometry.input_height}w{blob.geometry.input_width}_gray_c1_delta"
             metadata["frame_data"].update(replay_report)
             for key, entry in metadata["artifact_hashes"].items():
                 entry["sha256"] = sha256_file(out_dir / entry["file"])
@@ -5076,7 +5102,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--recompile-window-reuse-from", type=Path,
-        help="Schedule-only export from a frozen H256 RGB or H240 grayscale v4 artifact; never retrains.",
+        help="Schedule-only export from a frozen H256 RGB or native H240/H512 grayscale v4 artifact; never retrains.",
     )
     parser.add_argument(
         "--artifact-dir",
