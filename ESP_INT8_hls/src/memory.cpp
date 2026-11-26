@@ -4,8 +4,54 @@
 
 namespace esp_int8 {
 
+// One word bus avoids exporting four bank return buses through every consumer.
 static axi_vec_t s_fmbuf_uram[FMBUF_URAM_AXI_WORDS];
 static axi_vec_t s_fmbuf_bram[FMBUF_BRAM_AXI_WORDS];
+static runtime_profile_t s_runtime_profile = RUNTIME_PROFILES[DEFAULT_RUNTIME_PROFILE_ID];
+static bool s_runtime_profile_valid = false;
+static runtime_io_t s_runtime_io;
+static bool s_runtime_io_valid = false;
+
+bool runtime_select_profile(std::uint32_t id) {
+#pragma HLS INLINE off
+    s_runtime_profile_valid = false;
+    s_runtime_io_valid = false;
+    s_runtime_io = {};
+    s_runtime_profile_valid = runtime_profile_lookup(id, s_runtime_profile);
+    if (s_runtime_profile_valid) {
+        s_runtime_io_valid = runtime_io_lookup(id, 0, 0, s_runtime_io);
+    }
+    return s_runtime_profile_valid;
+}
+
+bool runtime_profile_ready() {
+#pragma HLS INLINE
+    return s_runtime_profile_valid;
+}
+
+void runtime_get_profile(runtime_profile_t& profile) {
+#pragma HLS INLINE
+    profile = s_runtime_profile;
+}
+
+bool runtime_select_io(std::uint32_t source, std::uint32_t mask) {
+#pragma HLS INLINE off
+    s_runtime_io_valid = false;
+    s_runtime_io = {};
+    if (!s_runtime_profile_valid) { return false; }
+    s_runtime_io_valid = runtime_io_lookup(s_runtime_profile.profile_id, source, mask, s_runtime_io);
+    return s_runtime_io_valid;
+}
+
+bool runtime_io_ready() {
+#pragma HLS INLINE
+    return s_runtime_io_valid;
+}
+
+void runtime_get_io(runtime_io_t& io) {
+#pragma HLS INLINE
+    io = s_runtime_io;
+}
 
 
 static u16_t desc_c_offset(const tensor_desc_t& desc) {
@@ -24,6 +70,8 @@ static u8_t effective_lanes(u8_t valid_c) {
 
 static bool bank_base(u8_t bank_id, u32_t& base) {
 #pragma HLS INLINE
+    runtime_profile_t profile;
+    runtime_get_profile(profile);
     switch (static_cast<unsigned>(bank_id.to_uint())) {
         case BANK_FMEM0:
         case BANK_FMEM1:
@@ -31,7 +79,7 @@ static bool bank_base(u8_t bank_id, u32_t& base) {
             base = 0;
             return true;
         case BANK_BRAM_SCR0:
-            base = FMBUF_POOL_TMP_BASE;
+            base = profile.pool_tmp_base;
             return true;
         default:
             base = 0;
@@ -127,21 +175,25 @@ static bool write_phys_word(u32_t phys_byte_addr, axi_vec_t value) {
 
 static bool resolve_pool2_alias_addr(u32_t byte_offset, u32_t& phys_addr) {
 #pragma HLS INLINE
+    runtime_profile_t profile;
+    runtime_get_profile(profile);
     const unsigned idx = byte_offset.to_uint();
     if ((idx & (AXI_WORD_BYTES - 1)) != 0U ||
-        idx + AXI_WORD_BYTES > static_cast<unsigned>(BRAM_SCR1_BYTES)) {
+        idx + AXI_WORD_BYTES > profile.pool2_bytes) {
         phys_addr = 0;
         return false;
     }
-    phys_addr = static_cast<u32_t>(FMBUF_POOL2_ALIAS_BASE) + byte_offset;
+    phys_addr = static_cast<u32_t>(profile.pool1_base) + byte_offset;
     return phys_addr.to_uint() + static_cast<unsigned>(AXI_WORD_BYTES) <=
-           static_cast<unsigned>(FMBUF_POOL2_ALIAS_BASE + FMBUF_POOL2_ALIAS_BYTES);
+           profile.pool1_base + profile.pool2_bytes;
 }
 
 static bool resolve_pool_bram_addr(u8_t bank_id,
                                    u32_t byte_offset,
                                    u32_t& phys_addr) {
 #pragma HLS INLINE
+    runtime_profile_t profile;
+    runtime_get_profile(profile);
     const unsigned bank = bank_id.to_uint();
     const unsigned offset = byte_offset.to_uint();
     if ((offset & static_cast<unsigned>(AXI_WORD_BYTES - 1)) != 0U) {
@@ -150,17 +202,17 @@ static bool resolve_pool_bram_addr(u8_t bank_id,
     }
 
     if (bank == static_cast<unsigned>(BANK_BRAM_SCR0)) {
-        if (offset + AXI_WORD_BYTES > static_cast<unsigned>(BRAM_SCR0_BYTES)) {
+        if (offset + AXI_WORD_BYTES > profile.pool1_bytes) {
             phys_addr = 0;
             return false;
         }
-        phys_addr = static_cast<u32_t>(FMBUF_POOL_TMP_BASE) + byte_offset;
+        phys_addr = static_cast<u32_t>(profile.pool_tmp_base) + byte_offset;
     } else if (bank == static_cast<unsigned>(BANK_BRAM_SCR1)) {
-        if (offset + AXI_WORD_BYTES > static_cast<unsigned>(BRAM_SCR1_BYTES)) {
+        if (offset + AXI_WORD_BYTES > profile.pool2_bytes) {
             phys_addr = 0;
             return false;
         }
-        phys_addr = static_cast<u32_t>(FMBUF_POOL1_BASE) + byte_offset;
+        phys_addr = static_cast<u32_t>(profile.pool1_base) + byte_offset;
     } else if (bank == static_cast<unsigned>(BANK_FMEM0) ||
                bank == static_cast<unsigned>(BANK_FMEM1) ||
                bank == static_cast<unsigned>(BANK_FMEM2)) {
@@ -479,8 +531,10 @@ bool on_chip_memory_write_pool2_abs_word(u32_t byte_offset,
 
 bool on_chip_memory_write_input_axi_word(u32_t word_offset, axi_vec_t value) {
 #pragma HLS INLINE off
+    runtime_profile_t profile;
+    runtime_get_profile(profile);
     const u32_t byte_offset = word_offset * AXI_WORD_BYTES;
-    if (byte_offset + AXI_WORD_BYTES > static_cast<u32_t>(INPUT_FRAME_BYTES)) {
+    if (byte_offset + AXI_WORD_BYTES > static_cast<u32_t>(profile.input_bytes)) {
         return false;
     }
     return write_bank_word(static_cast<u8_t>(static_cast<unsigned>(BANK_FMEM0)), byte_offset, value);

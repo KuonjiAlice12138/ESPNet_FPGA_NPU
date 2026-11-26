@@ -108,7 +108,6 @@ struct conv_issue_t {
   u8_t fixed_desc_id;
   u8_t block5_chain_add_base;
   u8_t block5_scratch_first_param;
-  u8_t reserved0;
   u16_t conv_row_base;
   u16_t consumer_row_base;
   u16_t row_count;
@@ -117,9 +116,10 @@ struct conv_issue_t {
 };
 
 struct conv_issue_result_t {
-  conv_exec_desc_t conv_desc;
-  row_consumer_desc_t consumer;
   tensor_desc_t dst;
+  u8_t alias_tensor;
+  u16_t store_c_offset;
+  u16_t valid_c;
   bool emit_fullres_mask;
 };
 
@@ -131,7 +131,6 @@ struct conv_rows_task_t {
   tensor_desc_t block5_scratch1;
   tensor_desc_t block5_scratch2;
   tensor_desc_t block5_scratch3;
-  tensor_desc_t block5_prev_branch;
   tensor_desc_t block5_residual;
   tensor_desc_t block5_final_dst;
   conv_cfg_t cfg;
@@ -489,21 +488,12 @@ static bool run_conv_rows_task(const conv_rows_task_t& task,
     npu_profile_set_stage(prof_stage_id,
                           task.block5_finalize ? PROF_STAGE_PPU_BLOCK5_FINAL
                                                 : PROF_STAGE_PPU_ROW_CONSUME);
-    const bool preadd_enable = task.block5_finalize;
     bool preadd_ok = true;
-    if (preadd_enable) {
-      const tensor_desc_t& preadd_other =
-          task.block5_finalize ? task.block5_prev_branch : task.add_other;
-      const u8_t preadd_valid_c =
-          task.block5_finalize
-              ? static_cast<u8_t>(task.cfg.out_c.to_uint())
-              : ((task.consumer.valid_c.to_uint() == 0U)
-                     ? static_cast<u8_t>(task.cfg.out_c.to_uint())
-                     : static_cast<u8_t>(task.consumer.valid_c.to_uint()));
-      preadd_ok = ppu_preadd_row(preadd_other,
+    if (task.block5_finalize) {
+      preadd_ok = ppu_preadd_row(task.add_other,
                                  consumer_row,
                                  task.cfg,
-                                 preadd_valid_c,
+                                 static_cast<u8_t>(task.cfg.out_c.to_uint()),
                                  task.add_qparam,
                                  s_shared_conv_row_buf);
       if (!preadd_ok) {
@@ -540,44 +530,23 @@ static bool run_conv_rows_task(const conv_rows_task_t& task,
   return write_ok;
 }
 
-static bool build_normal_conv_task(const conv_issue_t& issue,
-                                   conv_rows_task_t& task,
-                                   conv_issue_result_t& result) {
-#pragma HLS INLINE off
-  conv_exec_desc_t conv_desc;
-  window_sched_desc_t sched;
+static bool configure_normal_consumer(const conv_exec_desc_t& conv_desc,
+                                       const conv_cfg_t& cfg,
+                                       conv_rows_task_t& task,
+                                       conv_issue_result_t& result) {
+#pragma HLS INLINE
   row_consumer_desc_t consumer;
-  tensor_desc_t src;
   tensor_desc_t dst;
   tensor_desc_t add_other;
-  conv_q_t qparam;
   add_q_t add_qparam = add_q_t();
-#pragma HLS ARRAY_PARTITION variable=qparam.bias complete dim=1
-#pragma HLS ARRAY_PARTITION variable=qparam.mult complete dim=1
-#pragma HLS ARRAY_PARTITION variable=qparam.shift complete dim=1
 
-  if (!param_dma_get_conv_exec_desc(issue.conv_desc_id, conv_desc) ||
-      !param_dma_get_window_sched(conv_desc.window_sched_id, sched) ||
-      !param_dma_get_row_consumer(conv_desc.row_consumer_id, consumer)) {
+  if (!param_dma_get_row_consumer(conv_desc.row_consumer_id, consumer)) {
     return false;
   }
 
-  const conv_cfg_t cfg = conv_cfg_from_exec_desc(conv_desc);
   const u16_t stride = conv_effective_stride(cfg);
   const u16_t out_h = conv_out_dim(cfg.in_h, stride);
   const u16_t out_w = conv_out_dim(cfg.in_w, stride);
-
-  select_scratch_region_for_fields(static_cast<u8_t>(static_cast<unsigned>(UOP_CONV)),
-                                   conv_desc.param_id,
-                                   conv_desc.src_tensor,
-                                   static_cast<u8_t>(static_cast<unsigned>(TID_INVALID)),
-                                   conv_desc.dst_tensor,
-                                   conv_desc.in_h,
-                                   out_h);
-  if (!resolve_tensor_read(conv_desc.src_tensor, src) ||
-      !param_dma_get_conv_qparam(conv_desc.qparam_id, qparam)) {
-    return false;
-  }
 
   if (cfg.out_c.to_uint() > static_cast<unsigned>(TM)) {
     return false;
@@ -604,11 +573,12 @@ static bool build_normal_conv_task(const conv_issue_t& issue,
   }
 
   if (emit_fullres_mask) {
+    runtime_profile_t profile;
+    runtime_get_profile(profile);
     if (cfg.out_c.to_uint() < 2U ||
         cfg.out_c.to_uint() > static_cast<unsigned>(MAX_CLASS_C) ||
         cfg.out_c.to_uint() != consumer.valid_c.to_uint() ||
-        out_h.to_uint() != static_cast<unsigned>(ENCODER_OUT_H) ||
-        out_w.to_uint() != static_cast<unsigned>(ENCODER_OUT_W)) {
+        out_h.to_uint() != profile.logits_h || out_w.to_uint() != profile.logits_w) {
       return false;
     }
     dst = tensor_desc_t();
@@ -624,51 +594,34 @@ static bool build_normal_conv_task(const conv_issue_t& issue,
     }
   }
 
-  task = conv_rows_task_t();
-  task.src = src;
   task.dst = dst;
   task.add_other = add_other;
-  task.cfg = cfg;
-  task.conv_desc = conv_desc;
-  task.sched = sched;
   task.consumer = consumer;
-  task.qparam = qparam;
   task.add_qparam = add_qparam;
-  task.conv_row_base = static_cast<u16_t>(0);
-  task.consumer_row_base = static_cast<u16_t>(0);
-  task.row_count = out_h;
   task.has_add_other = has_add_other;
 
-  result.conv_desc = conv_desc;
-  result.consumer = consumer;
   result.dst = dst;
+  result.alias_tensor = consumer.alias_tensor;
+  result.store_c_offset = consumer.store_c_offset;
+  result.valid_c = consumer.valid_c;
   result.emit_fullres_mask = emit_fullres_mask;
   return true;
 }
 
-static bool build_block5_branch_task(const conv_issue_t& issue, conv_rows_task_t& task) {
-#pragma HLS INLINE off
-  conv_exec_desc_t conv_desc;
-  window_sched_desc_t sched;
+static bool configure_block5_consumer(const conv_issue_t& issue,
+                                      const conv_exec_desc_t& conv_desc,
+                                      conv_rows_task_t& task) {
+#pragma HLS INLINE
   block5_sched_desc_t bsched;
   fixed_exec_desc_t fixed_desc;
-  tensor_desc_t src;
   tensor_desc_t scratch_desc[5];
   tensor_desc_t residual;
   tensor_desc_t final_dst;
-  conv_q_t qparam;
   add_q_t add_qparam = add_q_t();
   add_q_t residual_add_qparam = add_q_t();
-#pragma HLS ARRAY_PARTITION variable=qparam.bias complete dim=1
-#pragma HLS ARRAY_PARTITION variable=qparam.mult complete dim=1
-#pragma HLS ARRAY_PARTITION variable=qparam.shift complete dim=1
 
-  if (!param_dma_get_conv_exec_desc(issue.conv_desc_id, conv_desc) ||
-      !param_dma_get_window_sched(conv_desc.window_sched_id, sched) ||
-      !param_dma_get_block5_sched(issue.block5_sched_id, bsched) ||
-      !param_dma_get_fixed_exec_desc(issue.fixed_desc_id, fixed_desc) ||
-      !param_dma_get_conv_qparam(conv_desc.qparam_id, qparam) ||
-      !resolve_tensor_read(issue.src_tensor, src)) {
+  if (!param_dma_get_block5_sched(issue.block5_sched_id, bsched) ||
+      !param_dma_get_fixed_exec_desc(issue.fixed_desc_id, fixed_desc)) {
     return false;
   }
   if (bsched.pattern.to_uint() != issue.block5_pattern.to_uint() ||
@@ -745,20 +698,11 @@ static bool build_block5_branch_task(const conv_issue_t& issue, conv_rows_task_t
   consumer.valid_c = conv_desc.out_c;
   consumer.reserved0 = store_layout;
 
-  task = conv_rows_task_t();
-  task.src = src;
   task.dst = scratch_desc[branch];
   task.add_other = prev;
-  task.cfg = conv_cfg_from_exec_desc(conv_desc);
-  task.conv_desc = conv_desc;
-  task.sched = sched;
   task.consumer = consumer;
-  task.qparam = qparam;
   task.add_qparam = add_qparam;
   task.block5_residual_add_qparam = residual_add_qparam;
-  task.conv_row_base = issue.conv_row_base;
-  task.consumer_row_base = issue.consumer_row_base;
-  task.row_count = issue.row_count;
   task.has_add_other = add_prev && !final_branch;
   task.block5_finalize = final_branch;
   task.block5_has_residual = has_residual;
@@ -768,7 +712,6 @@ static bool build_block5_branch_task(const conv_issue_t& issue, conv_rows_task_t
   task.block5_scratch1 = scratch_desc[1];
   task.block5_scratch2 = scratch_desc[2];
   task.block5_scratch3 = scratch_desc[3];
-  task.block5_prev_branch = prev;
   task.block5_residual = residual;
   task.block5_final_dst = final_dst;
   return true;
@@ -778,14 +721,53 @@ static bool build_conv_task_from_issue(const conv_issue_t& issue,
                                        conv_rows_task_t& task,
                                        conv_issue_result_t& result) {
 #pragma HLS INLINE off
+  const unsigned kind = issue.kind.to_uint();
+  const bool block5 = kind == static_cast<unsigned>(CONV_ISSUE_BLOCK5_BRANCH);
+  if (!block5 && kind != static_cast<unsigned>(CONV_ISSUE_NORMAL)) {
+    return false;
+  }
+  conv_exec_desc_t conv_desc;
+  window_sched_desc_t sched;
+  conv_q_t qparam;
+#pragma HLS ARRAY_PARTITION variable=qparam.bias complete dim=1
+#pragma HLS ARRAY_PARTITION variable=qparam.mult complete dim=1
+#pragma HLS ARRAY_PARTITION variable=qparam.shift complete dim=1
+  if (!param_dma_get_conv_exec_desc(issue.conv_desc_id, conv_desc) ||
+      !param_dma_get_window_sched(conv_desc.window_sched_id, sched) ||
+      !param_dma_get_conv_qparam(conv_desc.qparam_id, qparam)) {
+    return false;
+  }
+  const conv_cfg_t cfg = conv_cfg_from_exec_desc(conv_desc);
+  const u16_t out_h = conv_out_dim(cfg.in_h, conv_effective_stride(cfg));
+  if (!block5) {
+    select_scratch_region_for_fields(static_cast<u8_t>(static_cast<unsigned>(UOP_CONV)),
+                                     conv_desc.param_id, conv_desc.src_tensor,
+                                     static_cast<u8_t>(static_cast<unsigned>(TID_INVALID)),
+                                     conv_desc.dst_tensor, conv_desc.in_h, out_h);
+  }
+  tensor_desc_t src;
+  const u8_t source_id = block5 ? issue.src_tensor : conv_desc.src_tensor;
+  if (!resolve_tensor_read(source_id, src)) {
+    return false;
+  }
+  // Only this boundary submits the full task. Mode adapters are inline and
+  // never own another descriptor/qparam loader or a registered task return bus.
+  task = conv_rows_task_t();
   result = conv_issue_result_t();
-  if (issue.kind.to_uint() == static_cast<unsigned>(CONV_ISSUE_NORMAL)) {
-    return build_normal_conv_task(issue, task, result);
+  if (block5) {
+    if (!configure_block5_consumer(issue, conv_desc, task)) { return false; }
+  } else {
+    if (!configure_normal_consumer(conv_desc, cfg, task, result)) { return false; }
   }
-  if (issue.kind.to_uint() == static_cast<unsigned>(CONV_ISSUE_BLOCK5_BRANCH)) {
-    return build_block5_branch_task(issue, task);
-  }
-  return false;
+  task.src = src;
+  task.cfg = cfg;
+  task.conv_desc = conv_desc;
+  task.sched = sched;
+  task.qparam = qparam;
+  task.conv_row_base = block5 ? issue.conv_row_base : static_cast<u16_t>(0);
+  task.consumer_row_base = block5 ? issue.consumer_row_base : static_cast<u16_t>(0);
+  task.row_count = block5 ? issue.row_count : out_h;
+  return true;
 }
 
 static bool run_conv_issue_once(const conv_issue_t& issue,
@@ -854,14 +836,12 @@ error_code_t conv_engine_exec(const npu_issue_t& issue,
     return ERR_NONE;
   }
 
-  const unsigned consumer_mode = result.consumer.mode.to_uint();
   if (!result.emit_fullres_mask) {
-    (void)consumer_mode;
-    if (result.consumer.alias_tensor.to_uint() != static_cast<unsigned>(TID_INVALID) &&
-        !alias_tensor_to_slice(result.consumer.alias_tensor,
+    if (result.alias_tensor.to_uint() != static_cast<unsigned>(TID_INVALID) &&
+        !alias_tensor_to_slice(result.alias_tensor,
                                result.dst,
-                               result.consumer.store_c_offset,
-                               result.consumer.valid_c)) {
+                               result.store_c_offset,
+                               result.valid_c)) {
       return ERR_TENSOR_DESC_RANGE;
     }
   }

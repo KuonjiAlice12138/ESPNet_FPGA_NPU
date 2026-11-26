@@ -292,7 +292,10 @@ class GrayRound7SourceTests(unittest.TestCase):
     def test_compact_pack_memory_commit_is_outside_the_pipeline(self):
         ppu = (self.root / "ppu.cpp").read_text(encoding="utf-8-sig")
         conv = (self.root / "conv_engine.cpp").read_text(encoding="utf-8-sig")
-        self.assertEqual(structure.check_round4a_ppu_structure(ppu, conv), 0)
+        consumer=structure.function_body(ppu,"ppu_consume_conv_stream")
+        self.assertEqual(consumer.count("ppu_write_compact_word("),1)
+        self.assertIn("ppu_consume_conv_stream(",conv)
+        self.assertNotIn("ppu_store_compact_row(",ppu)
 
     def test_report_audit_flags_clock_and_specialization_warnings(self):
         for message in (
@@ -312,12 +315,12 @@ class GrayRound7SourceTests(unittest.TestCase):
 
     def test_pool_arithmetic_is_separate_from_memory_commit(self):
         source = (self.root / "avgpool_unit.cpp").read_text(encoding="utf-8-sig")
-        begin = source.index("static void compute_c1_group_word(")
+        begin = source.index("static void compute_pool_group_words(")
         end = source.index("\nstatic bool ", begin)
         arithmetic = source[begin:end]
         self.assertIn("#pragma HLS PIPELINE II=1", arithmetic)
         self.assertNotIn("on_chip_memory_", arithmetic)
-        self.assertIn("round_div9(sum)", arithmetic)
+        self.assertIn("round_div9(sum[ch])", arithmetic)
         self.assertNotIn("#pragma HLS UNROLL factor=32", source)
 
 
@@ -353,7 +356,7 @@ class GrayRound7RSourceTests(unittest.TestCase):
     def test_vec_commit_uses_an_independent_bounded_incremental_cursor(self):
         source = (self.root / "vec_alu_engine.cpp").read_text(encoding="utf-8-sig")
         body = structure.function_body(source, "run_fixed_affine_common")
-        self.assertIn("for (ap_uint<10> word = 0; word < ROW_CONTIG_MAX_WORDS; ++word)", body)
+        self.assertIn("for (ap_uint<11> word = 0; word < ROW_CONTIG_MAX_WORDS; ++word)", body)
         self.assertIn("commit_offset += commit_step;", body)
         self.assertNotIn("VEC_MAX_ROW_SERVICES", source)
         self.assertNotIn("service_count = tile_service_count +", body)
@@ -377,8 +380,8 @@ class GrayRound7RSourceTests(unittest.TestCase):
         self.assertIsNotNone(body, "The existing store owner must validate the whole word span")
         self.assertIn("const u64_t end_offset", body)
         self.assertIn("ROW_CONTIG_MAX_WORDS", body)
-        self.assertIn("BRAM_SCR1_BYTES", body)
-        self.assertIn("FMBUF_POOL_TMP_BASE", body)
+        self.assertIn("profile.pool2_bytes", body)
+        self.assertIn("runtime_get_profile(profile)", body)
         self.assertNotIn("on_chip_memory_", body)
         self.assertNotIn("#pragma HLS PIPELINE II=1", body)
 
@@ -449,7 +452,7 @@ class GrayRound8SourceTests(unittest.TestCase):
         source = (self.root / "src/vec_alu_engine.cpp").read_text(encoding="utf-8-sig")
         self.assertIn("ap_uint<2> packed_carry_bytes", source)
         self.assertIn("ap_uint<3> packed_group_slot", source)
-        self.assertIn("ap_uint<10> packed_word_idx", source)
+        self.assertIn("ap_uint<11> packed_word_idx", source)
         self.assertIn("u32_t packed_carry", source)
         self.assertNotIn("unsigned packed_group_slot", source)
         self.assertNotIn("unsigned packed_word_idx", source)
@@ -481,61 +484,27 @@ class GrayRound8SourceTests(unittest.TestCase):
         self.assertIn("if {$round in {7 7r 8} && $tests ne \"full\"}", script)
 
 
-class GrayHlsContractTests(unittest.TestCase):
-    root = Path(__file__).resolve().parents[1] / "ESP_INT8_hls"
+class SharedHlsSourceContracts(unittest.TestCase):
+    root=Path(__file__).resolve().parents[1]/'ESP_INT8_hls'
 
-    def test_schedule_fields_do_not_compare_ap_int_directly_with_enums(self):
-        field = r"\b(?:desc|sched)\.(?:mode|loader_class|flags)\b"
-        enum = r"\b(?:WIN_MODE_|WIN_LOADER_|WINDOW_SCHED_FLAG_)\w+\b"
-        comparison = rf"(?:{field}\s*(?:==|!=)\s*{enum}|{enum}\s*(?:==|!=)\s*{field})"
-        for path in (self.root / "src").glob("*.cpp"):
-            source = path.read_text(encoding="utf-8-sig")
-            self.assertEqual(re.findall(comparison, source), [],
-                             f"{path.name}: ambiguous synthesis AP-int/enum comparison")
+    def test_schedule_enums_are_converted_to_scalars_before_comparison(self):
+        field=r'\b(?:desc|sched)\.(?:mode|loader_class|flags)\b'
+        enum=r'\b(?:WIN_MODE_|WIN_LOADER_|WINDOW_SCHED_FLAG_)\w+\b'
+        comparison=rf'(?:{field}\s*(?:==|!=)\s*{enum}|{enum}\s*(?:==|!=)\s*{field})'
+        for path in (self.root/'src').glob('*.cpp'):
+            self.assertEqual(re.findall(comparison,path.read_text(encoding='utf-8-sig')),[],path.name)
 
-    def test_fixed_frame_contract_is_gray_native512(self):
-        config = (self.root / "include/npu_config.hpp").read_text(encoding="utf-8-sig")
-        for name, value in (("INPUT_FRAME_H", 512), ("INPUT_FRAME_W", 512),
-                            ("INPUT_FRAME_C", 1), ("ENCODER_OUT_H", 64),
-                            ("ENCODER_OUT_W", 64)):
-            self.assertIn(f"constexpr int {name} = {value};", config)
-        top = (self.root / "src/int8_core.cpp").read_text(encoding="utf-8-sig")
-        self.assertIn("bundle=gmem0 depth=8192", top)
-        self.assertIn("bundle=gmem1 depth=8192", top)
+    def test_padded_tensor_stride_uses_the_shared_descriptor_decoder(self):
+        text=(self.root/'include/npu_types.hpp').read_text(encoding='utf-8-sig')
+        for token in ('tensor_row_stride_bytes(', '0x8000', '0x7fff'): self.assertIn(token,text)
+        for name in ('memory','win_gen','ppu','vec_alu_engine','conv_store'):
+            self.assertNotIn('? desc.c : desc.reserved0',(self.root/f'src/{name}.cpp').read_text(encoding='utf-8-sig'))
 
-    def test_tensor_stride_decodes_compiler_row_padding_flag(self):
-        types = (self.root / "include/npu_types.hpp").read_text(encoding="utf-8-sig")
-        self.assertIn("tensor_row_stride_bytes(", types)
-        self.assertIn("0x8000", types)
-        self.assertIn("0x7fff", types)
-        for name in ("memory.cpp", "win_gen.cpp", "ppu.cpp", "vec_alu_engine.cpp", "conv_store.cpp"):
-            source = (self.root / "src" / name).read_text(encoding="utf-8-sig")
-            self.assertNotIn("? desc.c : desc.reserved0", source)
-
-    def test_old_rgb_kernels_do_not_remain_in_gray_owners(self):
-        win = (self.root / "src/win_gen.cpp").read_text(encoding="utf-8-sig")
-        for channels in (17, 129):
-            self.assertIn(f"build_staged_c{channels}_word(", win)
-        self.assertIn("scheduled_c1_packed_row(", win)
-        self.assertNotIn("build_staged_c1_word(", win)
-        for token in ("build_staged_c3_word(", "build_staged_c19_word(",
-                      "build_staged_c131_word(", "s_narrow_reuse_", "c3_reuse_incremental"):
-            self.assertNotIn(token, win)
-        pool = (self.root / "src/avgpool_unit.cpp").read_text(encoding="utf-8-sig")
-        self.assertNotIn("avgpool_unit_c3_fast", pool)
-        self.assertIn("avgpool_unit_c1", pool)
-        up = (self.root / "src/upsample_unit.cpp").read_text(encoding="utf-8-sig")
-        self.assertNotIn("FULLRES_MASK_W / AXI_WORD_BYTES", up)
-
-    def test_retired_dump_hooks_and_buffer_constants_are_removed(self):
-        for name in ("int8_core.cpp", "main_ctrl.cpp", "conv_engine.cpp", "ppu.cpp"):
-            source = (self.root / "src" / name).read_text(encoding="utf-8-sig")
-            for token in ("csim_dump_u40_prestore_row", "csim_dump_tensor_set_",
-                          "CSIM_DUMP_UPSAMPLE_INPUT", "s_csim_tensor_dumped"):
-                self.assertFalse(token in source, f"{name}: retired token {token}")
-        config = (self.root / "include/npu_config.hpp").read_text(encoding="utf-8-sig")
-        self.assertNotIn("QBUF", config)
-        self.assertNotIn("SCRATCH_BRAM_BYTES", config)
+    def test_retired_debug_caches_are_not_reintroduced(self):
+        for name in ('int8_core','main_ctrl','conv_engine','ppu'):
+            text=(self.root/f'src/{name}.cpp').read_text(encoding='utf-8-sig')
+            for token in ('csim_dump_tensor_set_', 'CSIM_DUMP_UPSAMPLE_INPUT','s_csim_tensor_dumped'):
+                self.assertNotIn(token,text)
 
 
 if __name__ == "__main__":

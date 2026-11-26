@@ -13,7 +13,11 @@ from typing import Any
 
 import numpy as np
 
-from geometry_contract import LEGACY_GEOMETRY, DeploymentGeometry, geometry_from_manifest
+from geometry_contract import (
+    LEGACY_GEOMETRY, DeploymentGeometry, RuntimeSelection, geometry_from_manifest,
+    runtime_selection_from_manifest, select_runtime_input, runtime_mask_from_logits,
+    runtime_target_view,
+)
 
 
 LOWRES_TARGET_SHAPE = (1, 64, 128)
@@ -43,6 +47,8 @@ class DeploymentContract:
 
 
 def load_deployment_contract(artifact_dir: Path) -> DeploymentContract:
+    if (artifact_dir / "MODEL.JSN").is_file():
+        return load_runtime_contract(artifact_dir)[2]
     candidates = (
         artifact_dir / "manifest.json",
         artifact_dir / "export_manifest.json",
@@ -73,6 +79,210 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def runtime_artifact_directory(path: str | Path) -> Path:
+    directory = Path(path).resolve()
+    if directory.name.upper() == "MODEL.JSN":
+        directory = directory.parent
+    if not (directory / "MODEL.JSN").is_file():
+        raise FileNotFoundError(f"unified artifact requires {directory / 'MODEL.JSN'}")
+    return directory
+
+
+def load_runtime_array(path: Path, dtype: Any, shape: tuple[int, ...]) -> np.ndarray:
+    expected = int(np.prod(shape)) * np.dtype(dtype).itemsize
+    if path.stat().st_size != expected:
+        raise ValueError(f"{path} has {path.stat().st_size} bytes, expected {expected} for {shape}")
+    return np.fromfile(path, dtype=dtype).reshape(shape)
+
+
+def load_runtime_contract(
+    artifact_dir: Path,
+) -> tuple[dict[str, Any], RuntimeSelection, DeploymentContract]:
+    """Validate MODEL.JSN identities and semantics, never infer a mode from bytes."""
+    from export_int8_hw_blob import validate_runtime_artifact
+
+    artifact_dir = runtime_artifact_directory(artifact_dir)
+    manifest = json.loads((artifact_dir / "MODEL.JSN").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or manifest.get("format") != "P7_UNIFIED_INT8_ARTIFACT_V1":
+        raise ValueError("unsupported MODEL.JSN artifact format")
+    for key in ("deployment", "preprocessing", "target", "provenance"):
+        if not isinstance(manifest.get(key, {}), dict):
+            raise ValueError(f"MODEL.JSN {key} metadata must be an object")
+    selection = runtime_selection_from_manifest(manifest)
+    required = {
+        "param": ("PARAM.BIN", "PARAM_v4_unified"),
+        "input": ("INPUTQ.BIN", "source_HWC_int8_prequantized"),
+        "encoder": ("ENCODER.BIN", "encoder_HWC_int8_selected"),
+        "logits": ("LOGITS.BIN", "logits_HWC_int8"),
+        "mask": ("MASK.BIN", "mask_HW_uint8_logits_then_argmax"),
+    }
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not required.keys() <= files.keys():
+        raise ValueError("MODEL.JSN files must register PARAM, INPUTQ, ENCODER, LOGITS and MASK")
+    if set(files) - required.keys() - {"target"}:
+        raise ValueError("MODEL.JSN has unsupported file roles")
+    if "target" in files:
+        required["target"] = ("TARGET.BIN", "mapped_target_HW_uint8")
+    for role, (filename, semantics) in required.items():
+        entry = files[role]
+        if (not isinstance(entry, dict) or entry.get("file") != filename
+                or entry.get("semantics") != semantics
+                or (artifact_dir / filename).resolve().parent != artifact_dir):
+            raise ValueError(f"MODEL.JSN {role} requires {filename} with {semantics} semantics")
+    deployment = manifest.get("deployment", {})
+    profile = "binary2" if selection.classes == 2 else "cityscapes20"
+    ignore = None if selection.classes == 2 else 19
+    mapping = ("cityscapes_vehicle_ids_13_to_18_vs_rest_ignore_255" if selection.classes == 2
+               else "cityscapes_train_id_0_to_18_void_to_19")
+    if (deployment.get("class_count") != selection.classes
+            or deployment.get("profile_name") != profile
+            or "ignore_metric_class" not in deployment
+            or deployment["ignore_metric_class"] != ignore
+            or deployment.get("label_mapping", mapping) != mapping):
+        raise ValueError("MODEL.JSN deployment class count/profile/label mapping disagrees with runtime")
+    g = selection.profile.geometry
+    if geometry_from_manifest(manifest, allow_legacy_fallback=False) != g:
+        raise ValueError("MODEL.JSN geometry disagrees with runtime encoder profile")
+    try:
+        validate_runtime_artifact(artifact_dir)
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"MODEL.JSN validation metadata is incomplete: {exc}") from exc
+    source = load_runtime_array(artifact_dir / "INPUTQ.BIN", np.int8, selection.source_shape)
+    encoder = load_runtime_array(artifact_dir / "ENCODER.BIN", np.int8, g.input_shape_nhwc)
+    if not np.array_equal(encoder, select_runtime_input(source, selection)):
+        raise ValueError("ENCODER.BIN differs from the registered runtime source selection")
+    logits = load_runtime_array(artifact_dir / "LOGITS.BIN", np.int8, g.lowres_shape(selection.classes))
+    mask = load_runtime_array(artifact_dir / "MASK.BIN", np.uint8, selection.mask_shape)
+    if not np.array_equal(mask, runtime_mask_from_logits(logits, selection)):
+        raise ValueError("MASK.BIN differs from registered logits interpolation/argmax")
+    contract = DeploymentContract(profile, selection.classes, ignore, g)
+    if "target" in files:
+        target = load_runtime_array(artifact_dir / "TARGET.BIN", np.uint8, selection.mask_shape)
+        map_runtime_target(target, contract, encoding="mapped_output")
+    return manifest, selection, contract
+
+
+def map_runtime_target(
+    target: np.ndarray, contract: DeploymentContract, *, encoding: str,
+) -> np.ndarray:
+    """Raw train IDs and mapped binary IDs are distinct, even for an all-0/1 image."""
+    target = np.asarray(target)
+    if target.ndim != 2 or not np.issubdtype(target.dtype, np.integer):
+        raise ValueError("runtime target must be a two-dimensional integer label image")
+    mapped = target.astype(np.int64, copy=True)
+    if encoding == "cityscapes_train_ids":
+        if np.any((mapped != 255) & ((mapped < 0) | (mapped > 19))):
+            raise ValueError("original Cityscapes target must contain train IDs 0..19 or ignore255")
+        if contract.class_count == 2:
+            valid = mapped != 255
+            mapped[valid] = np.where((mapped[valid] >= 13) & (mapped[valid] <= 18), 0, 1)
+    elif encoding != "mapped_output":
+        raise ValueError(f"unsupported runtime target encoding: {encoding}")
+    if np.any((mapped != 255) & ((mapped < 0) | (mapped >= contract.class_count))):
+        raise ValueError(f"mapped {contract.profile_name} target has invalid class IDs")
+    if contract.class_count == 20:
+        mapped[mapped == 255] = 19
+    return mapped.astype(np.uint8)
+
+
+def load_runtime_target(
+    artifact_dir: Path, manifest: dict[str, Any], selection: RuntimeSelection,
+    contract: DeploymentContract, original_target: str = "",
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if "target" in manifest["files"]:
+        path = artifact_dir / "TARGET.BIN"
+        target = load_runtime_array(path, np.uint8, selection.mask_shape)
+        return map_runtime_target(target, contract, encoding="mapped_output"), {
+            "path": str(path), "sha256": sha256_file(path), "encoding": "mapped_output",
+            "sampling": manifest.get("target", {}).get("sampling", "registered_output_grid"),
+            "mask_shape_hw": list(selection.mask_shape), "roi_yxhw": list(selection.roi),
+        }
+    info = manifest.get("target", {})
+    sampling = "half_pixel_nearest_source_then_center_ROI_then_mask"
+    if (info.get("sampling") != sampling or not info.get("original_path")
+            or not info.get("original_sha256")):
+        raise ValueError("unified evaluation requires registered TARGET.BIN or original GT with an exact registered transform/hash")
+    center = info.get("center_square_source")
+    if center is None and selection.src_mode == 0:
+        center = manifest.get("preprocessing", {}).get("center_square_crop")
+    if not isinstance(center, bool):
+        raise ValueError("registered original GT requires explicit center_square_source; use TARGET.BIN for unsupported source transforms")
+    path = Path(original_target or info["original_path"])
+    if not path.is_absolute():
+        path = artifact_dir / path
+    if sha256_file(path) != info["original_sha256"]:
+        raise ValueError(f"registered original GT hash mismatch: {path}")
+    if path.suffix.lower() == ".npy":
+        raw = np.load(path, allow_pickle=False)
+    else:
+        import cv2
+        raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if raw is None:
+            raise ValueError(f"unreadable registered original GT: {path}")
+    # Validate the full raw image before sampling, not just labels that survive the ROI.
+    mapped = map_runtime_target(raw, contract, encoding="cityscapes_train_ids")
+    target = runtime_target_view(mapped, selection, center_square_source=center)
+    return target, {"path": str(path), "sha256": sha256_file(path), "sampling": sampling,
+                    "encoding": "cityscapes_train_ids", "center_square_source": center,
+                    "mask_shape_hw": list(selection.mask_shape), "roi_yxhw": list(selection.roi)}
+
+
+def evaluate_runtime(args: argparse.Namespace, artifact_dir: Path) -> dict[str, Any]:
+    artifact_dir = runtime_artifact_directory(artifact_dir)
+    manifest, selection, contract = load_runtime_contract(artifact_dir)
+    target, target_info = load_runtime_target(
+        artifact_dir, manifest, selection, contract, getattr(args, "target", ""),
+    )
+    shape = selection.profile.geometry.lowres_shape(selection.classes)
+    golden_logits = load_runtime_array(artifact_dir / "LOGITS.BIN", np.int8, shape)
+    golden_mask = load_runtime_array(artifact_dir / "MASK.BIN", np.uint8, selection.mask_shape)
+    golden_metrics = segmentation_metrics(golden_mask, target, selection.classes, contract.ignore_target)
+    result = {
+        "evaluation": "unified", "artifact_dir": str(artifact_dir),
+        "model_manifest_sha256": sha256_file(artifact_dir / "MODEL.JSN"),
+        "runtime": selection.to_manifest(), "deployment": manifest["deployment"],
+        "geometry": selection.profile.geometry.to_manifest(), "sample": manifest.get("sample", {}),
+        "ground_truth": target_info, "param_sha256": manifest["files"]["param"]["sha256"],
+        "input_q_sha256": manifest["files"]["input"]["sha256"],
+        "golden_output_q_sha256": manifest["files"]["logits"]["sha256"],
+        "artifact_consistency": {"file_identities_validated": True, "selected_encoder_mismatches": 0,
+                                 "logits_to_mask_mismatches": 0},
+        "golden_fullres_metrics": golden_metrics,
+    }
+    if getattr(args, "lowres_logits", ""):
+        path = Path(args.lowres_logits)
+        logits = load_runtime_array(path, np.int8, shape)
+        mask = runtime_mask_from_logits(logits, selection)
+        result["hls_lowres_logits"] = {
+            "path": str(path), "sha256": sha256_file(path), "shape_hwc": list(shape),
+            "logit_diff": logit_diff_metrics(logits, golden_logits),
+            "mask_diff_vs_golden": diff_metrics(mask, golden_mask),
+            "metrics": segmentation_metrics(mask, target, selection.classes, contract.ignore_target),
+        }
+    if getattr(args, "fullres_mask", ""):
+        path = Path(args.fullres_mask)
+        mask = load_runtime_array(path, np.uint8, selection.mask_shape)
+        invalid = int((mask >= selection.classes).sum())
+        if invalid:
+            raise ValueError(f"board mask {path} has {invalid} invalid class IDs for {selection.classes} classes")
+        result["hls_fullres_mask"] = {
+            "path": str(path), "sha256": sha256_file(path), "shape_hw": list(selection.mask_shape),
+            "invalid_labels": 0, "mask_diff_vs_golden": diff_metrics(mask, golden_mask),
+            "metrics": segmentation_metrics(mask, target, selection.classes, contract.ignore_target),
+        }
+        if "hls_lowres_logits" in result:
+            result["hls_fullres_mask"]["mask_diff_vs_board_logits"] = diff_metrics(
+                mask, runtime_mask_from_logits(logits, selection),
+            )
+    for key in ("hls_lowres_logits", "hls_fullres_mask"):
+        if key in result:
+            result[key]["metric_delta_vs_golden"] = {
+                name: result[key]["metrics"][name] - golden_metrics[name]
+                for name in ("pixel_accuracy", "mIoU")
+            }
+    return result
 
 
 def load_i8_logits(
@@ -334,7 +544,12 @@ def check_single_vs_val_smoke(
 
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
+    explicit_runtime = getattr(args, "runtime_artifact", "")
+    if explicit_runtime:
+        return evaluate_runtime(args, runtime_artifact_directory(explicit_runtime))
     artifact_dir = Path(args.artifact_dir)
+    if (artifact_dir / "MODEL.JSN").exists():
+        return evaluate_runtime(args, artifact_dir)
     cached_data_file = Path(args.cached_data_file)
     espnet_dir = Path(args.espnet_dir)
     contract = load_deployment_contract(artifact_dir)
@@ -431,6 +646,21 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def print_summary(result: dict[str, Any]) -> None:
+    if result.get("evaluation") == "unified":
+        runtime = result["runtime"]
+        print(f"unified model={runtime['model_profile_name']} classes={runtime['class_count']} "
+              f"source={runtime['source_shape_nhwc']} ROI={runtime['roi_yxhw']} "
+              f"output={runtime['mask_shape_hw']}")
+        metrics = result["golden_fullres_metrics"]
+        print(f"golden output-view: PA={metrics['pixel_accuracy']:.8f} mIoU={metrics['mIoU']:.8f} "
+              f"valid_pixels={metrics['valid_pixels']}")
+        for key in ("hls_lowres_logits", "hls_fullres_mask"):
+            if key in result:
+                entry = result[key]
+                metrics = entry["metrics"]
+                print(f"{key} output-view: PA={metrics['pixel_accuracy']:.8f} mIoU={metrics['mIoU']:.8f} "
+                      f"mask_mismatch={entry['mask_diff_vs_golden']['mismatches']}")
+        return
     print(f"sample index={result['sample_index']} name={result['sample_name']}")
     checks = result["artifact_consistency"]
     for key in ("input_vs_I0000", "golden_vs_R0000", "target_remap_vs_T0000"):
@@ -467,19 +697,22 @@ def print_summary(result: dict[str, Any]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact-dir", default=r"D:\ESP_INT8\hw_artifacts\sched_v4_p7_0702")
+    parser.add_argument("--runtime-artifact", default="", help="Unified artifact directory or MODEL.JSN; never uses legacy fallback.")
+    parser.add_argument("--target", default="", help="Relocate registered original GT with the same SHA256 (TARGET.BIN takes precedence).")
     parser.add_argument("--espnet-dir", default=r"D:\ESPNet")
     parser.add_argument("--cached-data-file", default=r"D:\ESPNet\city.p")
     parser.add_argument("--val-smoke-dir", default=r"D:\ESP_INT8\hw_artifacts\sched_v4_val_smoke")
     parser.add_argument("--lowres-logits", default="")
-    parser.add_argument("--fullres-mask", default="")
+    parser.add_argument("--fullres-mask", "--board-mask", default="", help="Board uint8 mask on the registered output grid.")
     parser.add_argument(
         "--out-json",
-        default=r"D:\ESP_INT8\hw_artifacts\sched_v4_p7_0702\single_hw_output_metrics.json",
+        default="",
+        help="Metrics JSON (default: single_hw_output_metrics.json in the selected artifact directory).",
     )
     args = parser.parse_args()
 
     result = evaluate(args)
-    out_path = Path(args.out_json)
+    out_path = Path(args.out_json) if args.out_json else Path(result["artifact_dir"]) / "single_hw_output_metrics.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     print_summary(result)

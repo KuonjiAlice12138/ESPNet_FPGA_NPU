@@ -103,22 +103,25 @@ class NativeCompilerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             memory.store_tile(replace(desc, base_offset=0x21CFE1), 0, 0, 0, 32, values)
 
-    def test_hls_constants_match_generated_layout_and_tight_row_bound(self):
+    def test_hls_default_fixture_and_unified_capacity_bounds(self):
         root = Path(__file__).resolve().parents[1]
         config = (root/'ESP_INT8_hls/include/npu_config.hpp').read_text(encoding='utf-8-sig')
         values = {}
         for name, expression in re.findall(r'constexpr int (\w+)\s*=\s*([^;]+);', config):
             values[name] = eval(expression.replace('/', '//'), {'__builtins__': {}}, values)
-        layout = compiler.build_memory_layout(GEOMETRY)
+        layout = compiler.build_runtime_memory_layout(GEOMETRY)
         for name, expected in dict(INPUT_FRAME_H=512, INPUT_FRAME_W=512, INPUT_FRAME_C=1,
                 ENCODER_OUT_H=64, ENCODER_OUT_W=64, INPUT_FRAME_AXI_WORDS=8192, OUTPUT_FRAME_AXI_WORDS=8192,
                 FMBUF_BYTES=layout.fmbuf_bytes, FMBUF_URAM_BYTES=layout.uram_bytes,
-                FMBUF_BLOCK5_BASE=layout.block5_base, FMBUF_B1_BASE=layout.residual_base,
-                FMBUF_L2_SCRATCH_BASE=layout.c1_scratch_base, FMBUF_POOL1_BASE=layout.pool1_base,
-                FMBUF_POOL_TMP_BASE=layout.pool_tmp_base, FMBUF_L2_SCRATCH_SLOT_BYTES=layout.l2_scratch_slot_bytes,
-                FMBUF_L30_SCRATCH_SLOT_BYTES=layout.l3_scratch_slot_bytes,
-                ROW_CONTIG_MAX_WORDS=516, BRAM_SCR0_BYTES=layout.pool1_bytes, BRAM_SCR1_BYTES=layout.pool2_bytes).items():
+                MAX_INPUT_FRAME_H=512, MAX_INPUT_FRAME_W=1024, MAX_INPUT_FRAME_C=3,
+                MAX_INPUT_FRAME_AXI_WORDS=49152, MAX_OUTPUT_FRAME_AXI_WORDS=16384,
+                MAX_ENCODER_OUT_H=64, MAX_ENCODER_OUT_W=128, MAX_CLASS_C=32,
+                ROW_CONTIG_MAX_WORDS=1048, BLOCK5_ROW_BLOCK_ROWS=32,
+                BRAM_SCR0_BYTES=256*512*3, BRAM_SCR1_BYTES=128*256*3).items():
             self.assertEqual(values[name], expected, name)
+        for legacy in ('FMBUF_BLOCK5_BASE', 'FMBUF_B1_BASE', 'FMBUF_L2_SCRATCH_BASE',
+                       'FMBUF_POOL1_BASE', 'FMBUF_POOL_TMP_BASE'):
+            self.assertNotIn(legacy, values, 'per-profile bases must not remain global aliases')
 
     def test_top_is_explicit_before_all_interface_pragmas(self):
         root = Path(__file__).resolve().parents[1]/'ESP_INT8_hls'

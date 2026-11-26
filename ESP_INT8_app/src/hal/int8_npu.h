@@ -3,6 +3,7 @@
 
 #include "xespnet_encoder_int8_core.h"
 #include "xil_types.h"
+#include "../runtime_profiles.h"
 
 typedef struct {
     u32 magic;
@@ -40,14 +41,11 @@ typedef struct {
 } Int8ParamBlobHeader;
 
 typedef struct {
-    u8 kind;
-    u8 desc_id;
-    u8 logical_uop_id;
-    u8 flags;
-} Int8ExecPlanEntry;
-
-typedef struct {
     XEspnet_encoder_int8_core ip;
+    runtime_profile_t profile;
+    runtime_io_t io;
+    u32 classes;
+    unsigned selected, ready, blocked;
 } Int8NpuContext;
 
 #define INT8_CONV_WIN_STATE_COUNT 2U
@@ -55,15 +53,17 @@ typedef struct {
 #define INT8_CONV_POST_STATE_COUNT 3U
 
 int int8_npu_init(Int8NpuContext *ctx);
+int int8_npu_select_runtime(Int8NpuContext *ctx, u32 profile, u32 classes,
+                            u32 source, u32 mask);
+u32 int8_npu_runtime_abi(const Int8NpuContext *ctx);
+u32 int8_npu_runtime_status(const Int8NpuContext *ctx);
+u32 int8_npu_runtime_capability(const Int8NpuContext *ctx);
 int int8_npu_read_param_header(const u8 *param_blob, u32 param_bytes,
                                Int8ParamBlobHeader *header);
 int int8_npu_validate_param_header(const Int8ParamBlobHeader *header,
                                    u32 param_bytes);
-int int8_npu_validate_deployment_geometry(const u8 *param_blob, u32 param_bytes,
+int int8_npu_validate_deployment_geometry(const Int8NpuContext *ctx, const u8 *param_blob, u32 param_bytes,
                                           const Int8ParamBlobHeader *header);
-int int8_npu_read_exec_plan_entry(const u8 *param_blob, u32 param_bytes,
-                                  const Int8ParamBlobHeader *header,
-                                  u32 index, Int8ExecPlanEntry *entry);
 int int8_npu_run_init(Int8NpuContext *ctx, UINTPTR param_addr, u32 uop_count,
                       u32 timeout_polls);
 int int8_npu_run_infer(Int8NpuContext *ctx, UINTPTR input_addr,

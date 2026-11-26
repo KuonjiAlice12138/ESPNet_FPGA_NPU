@@ -4,6 +4,21 @@
 The existing single-image exporter writes INPUTQ.BIN/golden_output_q.bin for one
 sample. This script keeps the same NHWC signed-INT8 contract, but emits the
 whole validation set with short 8.3-style names suitable for the SD-card flow.
+
+Unified export uses --runtime-artifact MODEL.JSN --source-manifest sources.json.
+It never reconstructs/calibrates a model or guesses how to generate raw inputs.
+The source JSON contract is P7_PREQUANTIZED_VAL_SOURCES_V1, with:
+  runtime_model_sha256: SHA256 of the exact MODEL.JSN
+  runtime: the canonical MODEL.JSN runtime dictionary
+  preprocessing: the unchanged MODEL.JSN preprocessing dictionary
+  samples: [{name, input: {file, bytes, sha256}, target: {file, bytes, sha256},
+             target_shape_hw: [H, W], target_encoding, center_square_source}]
+Files are relative, tightly packed binary arrays: source HWC signed INT8 and
+target HW uint8. target_encoding is cityscapes_train_ids (original GT, sampled
+with the explicitly registered center_square_source boolean and shared exact
+half-pixel/ROI rules) or mapped_output (already on the declared mask grid).
+The producer must bind the source bytes and GT transform to this exact model;
+raw PNG/JPEG generation or unregistered preprocessing is not supported here.
 """
 
 from __future__ import annotations
@@ -13,9 +28,11 @@ import csv
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import time
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +48,14 @@ from eval_hw_constrained_qat import (  # noqa: E402
     add_espnet,
     build_val_loader,
 )
-from geometry_contract import DEFAULT_GEOMETRY, DeploymentGeometry, geometry_from_manifest  # noqa: E402
+from geometry_contract import (  # noqa: E402
+    DEFAULT_GEOMETRY, DeploymentGeometry, geometry_from_manifest,
+    runtime_selection_from_manifest, select_runtime_input, runtime_mask_from_logits,
+    runtime_target_view,
+)
+from eval_single_hw_outputs import (  # noqa: E402
+    load_runtime_array, load_runtime_contract, map_runtime_target, runtime_artifact_directory,
+)
 
 
 PARAM_BLOB_MAGIC = 0x544E4945
@@ -376,7 +400,334 @@ def build_artifact_val_loader(
     return loader
 
 
+def read_bound_source_file(root: Path, record: dict[str, Any]) -> Path:
+    if not isinstance(record, dict) or not isinstance(record.get("file"), str):
+        raise ValueError("source records require file, bytes and sha256 identities")
+    relative = Path(record["file"])
+    path = (root / relative).resolve()
+    if (relative.is_absolute() or ".." in relative.parts or not path.is_relative_to(root)
+            or path.suffix.upper() != ".BIN" or not path.is_file()):
+        raise ValueError(f"source record must reference an existing relative binary file: {relative}")
+    if (type(record.get("bytes")) is not int or record["bytes"] != path.stat().st_size
+            or record.get("sha256") != sha256_file(path)):
+        raise ValueError(f"prequantized source/GT identity mismatch: {path}")
+    if "crc32" in record and record["crc32"] != f"{zlib.crc32(path.read_bytes()) & 0xffffffff:08X}":
+        raise ValueError(f"prequantized source/GT CRC mismatch: {path}")
+    return path
+
+
+def load_bound_source_sample(root, sample, selection, deployment):
+    if not isinstance(sample, dict) or not isinstance(sample.get("name"), str) or not sample["name"]:
+        raise ValueError("each prequantized validation sample requires a nonempty name")
+    input_path = read_bound_source_file(root, sample.get("input"))
+    target_path = read_bound_source_file(root, sample.get("target"))
+    source = load_runtime_array(input_path, np.int8, selection.source_shape)
+    shape = sample.get("target_shape_hw")
+    if (not isinstance(shape, list) or len(shape) != 2
+            or any(type(value) is not int or value <= 0 for value in shape)):
+        raise ValueError(f"{sample['name']}: target_shape_hw must contain two positive integers")
+    raw = load_runtime_array(target_path, np.uint8, tuple(shape))
+    encoding = sample.get("target_encoding")
+    if encoding == "mapped_output":
+        if tuple(shape) != selection.mask_shape:
+            raise ValueError(f"{sample['name']}: mapped_output target must use registered mask grid {selection.mask_shape}")
+        target = map_runtime_target(raw, deployment, encoding=encoding)
+    elif encoding == "cityscapes_train_ids":
+        center = sample.get("center_square_source")
+        if not isinstance(center, bool):
+            raise ValueError(f"{sample['name']}: original GT requires explicit center_square_source; unsupported source transform")
+        mapped = map_runtime_target(raw, deployment, encoding=encoding)
+        target = runtime_target_view(mapped, selection, center_square_source=center)
+    else:
+        raise ValueError(f"{sample['name']}: unsupported target_encoding {encoding!r}; use cityscapes_train_ids or mapped_output")
+    if not np.any(target != deployment.ignore_target):
+        raise ValueError(f"{sample['name']}: registered output GT has no valid pixels")
+    return source, target
+
+
+def export_runtime_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
+    """Export same-model prequantized sources with PARAM integer references only."""
+    from hw_param_replay import ParamBlob, replay_prefix
+
+    directory = runtime_artifact_directory(args.runtime_artifact)
+    model, selection, deployment = load_runtime_contract(directory)
+    source_manifest_path = getattr(args, "source_manifest", "")
+    if not source_manifest_path:
+        raise ValueError("--runtime-artifact requires --source-manifest with model-bound prequantized inputs; raw source transforms cannot be inferred from encoder preprocessing")
+    source_manifest_path = Path(source_manifest_path).resolve()
+    sources = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(sources, dict) or sources.get("format") != "P7_PREQUANTIZED_VAL_SOURCES_V1":
+        raise ValueError("--source-manifest must be P7_PREQUANTIZED_VAL_SOURCES_V1, not an unregistered raw-image dataset")
+    if sources.get("runtime_model_sha256") != sha256_file(directory / "MODEL.JSN"):
+        raise ValueError("source manifest is not bound to this MODEL.JSN model/quantization identity")
+    if runtime_selection_from_manifest(sources) != selection:
+        raise ValueError("source manifest runtime/source/ROI/mask selection differs from MODEL.JSN")
+    if "preprocessing" not in sources or sources["preprocessing"] != model.get("preprocessing", {}):
+        raise ValueError("source manifest preprocessing differs from the frozen model")
+    samples = sources.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise ValueError("source manifest requires a nonempty validation samples list")
+    limit = getattr(args, "limit", 0)
+    first = getattr(args, "first_index", 0)
+    if limit < 0:
+        raise ValueError("--limit must be nonnegative (0 means all source records)")
+    samples_to_export = samples[:limit] if limit else samples
+    short_bin("I", first)
+    short_bin("I", first + len(samples_to_export) - 1)
+    if getattr(args, "clean", False) or getattr(args, "clean_board_outputs", False):
+        raise ValueError("unified export requires a new/empty output directory; clean flags are legacy-only")
+    out_dir = Path(args.out_dir).resolve()
+    source_root = source_manifest_path.parent
+    if (out_dir == directory or out_dir.is_relative_to(directory)
+            or directory.is_relative_to(out_dir) or source_manifest_path.is_relative_to(out_dir)):
+        raise ValueError("unified output must be separate from immutable runtime/source artifacts")
+    if out_dir.exists() and (not out_dir.is_dir() or any(out_dir.iterdir())):
+        raise ValueError(f"unified output must be a new/empty directory: {out_dir}")
+    # Preflight every requested identity and GT transform before writing any dataset.
+    for sample in samples_to_export:
+        load_bound_source_sample(source_root, sample, selection, deployment)
+
+    contract = profile_contract(deployment.profile_name)
+    classes = selection.classes
+    g = selection.profile.geometry
+    shapes = {"input_nhwc": [1, *selection.source_shape],
+              "encoder_nhwc": [1, *g.input_shape_nhwc],
+              "reference_logit_nhwc": [1, *g.lowres_shape(classes)],
+              "target_hw": list(selection.mask_shape), "mask_hw": list(selection.mask_shape)}
+    sizes = {"input": selection.input_bytes, "encoder": g.input_bytes,
+             "reference_logit": g.logits_height * g.logits_width * classes,
+             "target": selection.mask_bytes, "mask": selection.mask_bytes}
+    accum = {"valid_pixels": 0, "correct_pixels": 0,
+             **{key: [0] * classes for key in ("tp", "fp", "fn", "support")}}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    copy_param = getattr(args, "copy_param", True)
+    if copy_param:
+        shutil.copy2(directory / "PARAM.BIN", out_dir / "PARAM.BIN")
+    blob = ParamBlob(directory / "PARAM.BIN")
+    rows = []
+    hashes = []
+
+    def record_file(path, role):
+        digest = sha256_file(path)
+        hashes.append({"file": path.name, "bytes": path.stat().st_size, "sha256": digest,
+                       "crc32": f"{zlib.crc32(path.read_bytes()) & 0xffffffff:08X}", "role": role})
+        return digest
+
+    if copy_param:
+        record_file(out_dir / "PARAM.BIN", "param")
+    start = time.time()
+    for offset, sample in enumerate(samples_to_export):
+        source, target = load_bound_source_sample(source_root, sample, selection, deployment)
+        encoder = select_runtime_input(source, selection)
+        index = first + offset
+        names = {"input": short_bin(contract["input_prefix"], index),
+                 "encoder": short_bin("E", index),
+                 "ref": short_bin(contract["reference_prefix"], index),
+                 "target": short_bin(contract["target_prefix"], index),
+                 "mask": short_bin(contract["mask_prefix"], index)}
+        source.tofile(out_dir / names["input"])
+        encoder.tofile(out_dir / names["encoder"])
+        logits = replay_prefix(blob, out_dir / names["encoder"], 74).tensors[17]
+        if logits.dtype != np.int8 or logits.shape != g.lowres_shape(classes):
+            raise ValueError(f"integer replay logits must be HWC signed INT8 {g.lowres_shape(classes)}, got {logits.shape}/{logits.dtype}")
+        mask = runtime_mask_from_logits(logits, selection)
+        for role, array in (("ref", logits), ("target", target), ("mask", mask)):
+            np.ascontiguousarray(array).tofile(out_dir / names[role])
+        if getattr(args, "write_npy", False):
+            for role, array in (("input", source), ("encoder", encoder), ("ref", logits), ("target", target), ("mask", mask)):
+                np.save(out_dir / Path(names[role]).with_suffix(".npy"), array)
+        row = {"index": index, **names, "board_output": short_bin(contract["board_output_prefix"], index),
+               "image": sample["name"], "target_encoding": sample["target_encoding"],
+               "center_square_source": sample.get("center_square_source"),
+               "source_input_sha256": sample["input"]["sha256"],
+               "source_target_sha256": sample["target"]["sha256"]}
+        for role, filename in names.items():
+            path = out_dir / filename
+            row[f"{role}_bytes"] = path.stat().st_size
+            row[f"{role}_sha256"] = record_file(path, role)
+        rows.append(row)
+        update_metrics(accum, mask, target, deployment.profile_name)
+        every = getattr(args, "progress_every", 0)
+        if every > 0 and ((offset + 1) % every == 0 or offset + 1 == len(samples_to_export)):
+            print(f"exported {offset + 1}/{len(samples_to_export)} prequantized runtime samples")
+
+    manifest = {
+        "format": "P7_UNIFIED_INT8_VAL_DATASET_V1", "out_dir": str(out_dir),
+        "num_exported": len(rows), "num_val_total": len(samples),
+        "runtime": selection.to_manifest(), "deployment": model["deployment"],
+        "geometry": g.to_manifest(), "preprocessing": model.get("preprocessing", {}),
+        "runtime_artifact": str(directory), "runtime_model_sha256": sha256_file(directory / "MODEL.JSN"),
+        "param_sha256": model["files"]["param"]["sha256"],
+        "source_manifest": str(source_manifest_path), "source_manifest_sha256": sha256_file(source_manifest_path),
+        "golden_authority": "PARAM_V4_INTEGER_REPLAY", "device": "cpu",
+        "board_contract": {"input": "source_HWC_int8_prequantized", "encoder": "encoder_HWC_int8_selected",
+                           "reference_logit": "logits_HWC_int8", "reference_mask": "mask_HW_uint8_logits_then_argmax",
+                           "target": "mapped_target_HW_uint8_registered_output_view",
+                           "output": "board_mask_HW_uint8_registered_output_view"},
+        "files": {"param": "PARAM.BIN" if copy_param else None, "manifest_csv": "VALMAN.CSV",
+                  "filehash_csv": "FILEHASH.CSV", "encoder_pattern": "E%04d.BIN",
+                  **{name: f"{contract[key]}%04d.BIN" for name, key in (
+                      ("input_pattern", "input_prefix"), ("reference_logit_pattern", "reference_prefix"),
+                      ("target_pattern", "target_prefix"), ("reference_mask_pattern", "mask_prefix"),
+                      ("board_output_pattern", "board_output_prefix"))}},
+        "shapes": shapes, "bytes": sizes, "samples": rows,
+        "reference_metrics": finalize_metrics(accum, deployment.profile_name),
+        "accuracy_status": "software integer references only; no board accuracy claim",
+        "elapsed_seconds": time.time() - start,
+    }
+    if getattr(args, "check_single", False):
+        originals = {"input": "INPUTQ.BIN", "encoder": "ENCODER.BIN", "ref": "LOGITS.BIN", "mask": "MASK.BIN"}
+        manifest["single_sample_check"] = [compare_file_bytes(out_dir / rows[0][role], directory / filename)
+                                           for role, filename in originals.items()]
+        if any(check["mismatches"] for check in manifest["single_sample_check"]):
+            raise ValueError("first validation sample does not match the frozen runtime INPUTQ/ENCODER/LOGITS/MASK")
+    for filename, entries in (("VALMAN.CSV", rows), ("FILEHASH.CSV", hashes)):
+        with (out_dir / filename).open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(entries[0]))
+            writer.writeheader()
+            writer.writerows(entries)
+    for filename in ("manifest.json", "SDMANIFEST.JSON"):
+        (out_dir / filename).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
+
+
+def publish_board_validation_suite(spec_path: Path, out_dir: Path) -> dict[str, Any]:
+    """Package already exported, model-bound VAL500 sets; never train or change geometry."""
+    from geometry_contract import RUNTIME_PROFILES, runtime_selection
+
+    spec_path = Path(spec_path).resolve()
+    out_dir = Path(out_dir).resolve()
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    entries = spec.get("datasets")
+    if (spec.get("format") != "P7_UNIFIED_VAL500_SUITE_V1" or not isinstance(entries, list)
+            or not 1 <= len(entries) <= 48):
+        raise ValueError("suite requires P7_UNIFIED_VAL500_SUITE_V1 and 1..48 dataset entries")
+    if out_dir.exists():
+        raise ValueError("board suite output must be a new directory; existing results are never overwritten")
+    prepared, keys, selections = [], set(), set()
+    ordered_images = None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("each suite entry requires key and dataset")
+        key = entry.get("key", "")
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Z0-9_]{1,8}", key) or key in keys:
+            raise ValueError("case keys must be unique uppercase 8.3 directory names")
+        keys.add(key)
+        if not isinstance(entry.get("dataset"), str) or not entry["dataset"]:
+            raise ValueError(f"{key}: dataset manifest path is required")
+        dataset_path = (spec_path.parent / entry["dataset"]).resolve()
+        data = json.loads(dataset_path.read_text(encoding="utf-8"))
+        root = dataset_path.parent
+        model_root = runtime_artifact_directory(Path(data["runtime_artifact"]))
+        model, selection, _ = load_runtime_contract(model_root)
+        signature = (selection.profile.profile_id, selection.classes, selection.src_mode, selection.mask_mode)
+        if signature in selections:
+            raise ValueError(f"{key}: duplicate runtime case in validation suite")
+        selections.add(signature)
+        if (data.get("format") != "P7_UNIFIED_INT8_VAL_DATASET_V1"
+                or runtime_selection_from_manifest(data) != selection
+                or data.get("runtime_model_sha256") != sha256_file(model_root / "MODEL.JSN")
+                or data.get("param_sha256") != model["files"]["param"]["sha256"]
+                or data.get("preprocessing") != model.get("preprocessing", {})
+                or data.get("deployment") != model["deployment"]):
+            raise ValueError(f"{key}: dataset/model geometry, preprocessing or quantization identity mismatch")
+        if (any(path == out_dir or path.is_relative_to(out_dir) or out_dir.is_relative_to(path)
+                for path in (root, model_root)) or spec_path.is_relative_to(out_dir)):
+            raise ValueError("output must be separate from its immutable source datasets/models/spec")
+        samples = data.get("samples")
+        if (not isinstance(samples, list) or len(samples) != 500
+                or data.get("num_exported") != 500 or data.get("num_val_total") != 500):
+            raise ValueError(f"{key}: full validation requires exactly 500 samples, not a prefix or repeated single image")
+        names, files, index_rows = [], [], []
+        valid_pixels = 0
+        for i, row in enumerate(samples):
+            if type(row.get("index")) is not int or row["index"] != i or not row.get("image"):
+                raise ValueError(f"{key}: sample indices must be exactly 0..499 in dataset order")
+            names.append(Path(str(row["image"]).replace("\\", "/")).name)
+            role_files, crcs = [], []
+            for role, expected in (("input", selection.input_bytes), ("target", selection.mask_bytes)):
+                record = dict(file=row.get(role), bytes=row.get(f"{role}_bytes"),
+                              sha256=row.get(f"{role}_sha256"))
+                path = read_bound_source_file(root, record)
+                if record["bytes"] != expected:
+                    raise ValueError(f"{key}/{i}: {role} size disagrees with runtime geometry")
+                raw = path.read_bytes()
+                if role == "target":
+                    target = np.frombuffer(raw, dtype=np.uint8)
+                    if np.any((target >= selection.classes) & (target != 255)):
+                        raise ValueError(f"{key}/{i}: invalid mapped target class ID")
+                    ignored = 19 if selection.classes == 20 else 255
+                    valid_pixels += int(np.count_nonzero((target != ignored) & (target != 255)))
+                crcs.append(f"{zlib.crc32(raw) & 0xffffffff:08X}")
+                role_files.append(path)
+            files.append(role_files)
+            index_rows.append(f"{i},{crcs[0]},{crcs[1]}\n")
+        if len(set(names)) != 500 or (ordered_images is not None and names != ordered_images):
+            raise ValueError(f"{key}: repeated samples or different validation image order across modes")
+        if not valid_pixels:
+            raise ValueError(f"{key}: validation targets contain no valid pixels")
+        ordered_images = names
+        index_bytes = ("index,input_crc,target_crc\n" + "".join(index_rows)).encode("ascii")
+        prepared.append((key, model_root, dataset_path, data, selection, files, index_bytes))
+
+    catalog = ["key,profile,classes,source,mask,param,param_crc,samples,samples_crc\n"]
+    cases = []
+    for key, model_root, dataset_path, data, selection, files, index_bytes in prepared:
+        param_crc = zlib.crc32((model_root / "PARAM.BIN").read_bytes()) & 0xffffffff
+        index_crc = zlib.crc32(index_bytes) & 0xffffffff
+        catalog.append(f"{key},{selection.profile.profile_id},{selection.classes},{selection.src_mode},"
+                       f"{selection.mask_mode},{key}/PARAM.BIN,{param_crc:08X},"
+                       f"{key}/SAMPLES.CSV,{index_crc:08X}\n")
+        cases.append(dict(key=key, runtime=selection.to_manifest(),
+                          dataset=str(dataset_path), dataset_sha256=sha256_file(dataset_path),
+                          model_sha256=data["runtime_model_sha256"], param_sha256=data["param_sha256"],
+                          samples_crc=f"{index_crc:08X}"))
+    catalog_bytes = "".join(catalog).encode("ascii")
+    if len(catalog_bytes) >= 8192:
+        raise ValueError("VALRUNS.CSV exceeds App catalog capacity")
+    # Preflight is complete. Never stage old output masks as new board results.
+    out_dir.mkdir(parents=True)
+    required_bytes = len(catalog_bytes)
+    for key, model_root, _, data, _, files, index_bytes in prepared:
+        folder = out_dir / key
+        folder.mkdir()
+        for name in ("PARAM.BIN", "MODEL.JSN"):
+            shutil.copyfile(model_root / name, folder / name)
+            required_bytes += (folder / name).stat().st_size
+        (folder / "SAMPLES.CSV").write_bytes(index_bytes)
+        (folder / "VALDATA.JSN").write_text(json.dumps(data, indent=2), encoding="utf-8")
+        required_bytes += len(index_bytes) + (folder / "VALDATA.JSN").stat().st_size
+        for i, paths in enumerate(files):
+            for role, path in zip(("I", "T"), paths):
+                shutil.copyfile(path, folder / short_bin(role, i))
+                required_bytes += path.stat().st_size
+    missing = []
+    for profile in RUNTIME_PROFILES:
+        sources = (0, 1, 2, 3) if profile.profile_id == 0 else (0, 4, 5, 6) if profile.profile_id == 1 else (0,)
+        for classes in (2, 20):
+            for source in sources:
+                for mask in range(2 if source else 1):
+                    if (profile.profile_id, classes, source, mask) not in selections:
+                        missing.append(runtime_selection(profile.profile_id, classes, src_mode=source,
+                                                         mask_mode=mask).to_manifest())
+    result = dict(format="P7_UNIFIED_VAL500_BOARD_V1", case_count=len(cases), samples_per_case=500,
+                  cases=cases, not_in_suite=missing, staged_bytes=required_bytes,
+                  output_bytes=sum(item[4].mask_bytes*500 for item in prepared),
+                  image_order_sha256=hashlib.sha256("\n".join(ordered_images).encode("utf-8")).hexdigest(),
+                  accuracy_status="not run on board; missing modes are not validated")
+    (out_dir / "SUITE.JSN").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    # The App autorun marker is published last, so a failed copy cannot start an incomplete suite.
+    (out_dir / "VALRUNS.CSV").write_bytes(catalog_bytes)
+    return result
+
+
 def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, "runtime_artifact", ""):
+        return export_runtime_val_dataset(args)
+    if getattr(args, "source_manifest", ""):
+        raise ValueError("--source-manifest requires --runtime-artifact")
+    if (Path(args.artifact_dir) / "MODEL.JSN").exists():
+        raise ValueError("unified dataset export requires explicit --runtime-artifact and model-bound --source-manifest")
     contract = profile_contract(args.profile)
     classes = int(contract["classes"])
     geometry = load_artifact_geometry(Path(args.artifact_dir))
@@ -692,6 +1043,9 @@ def export_val_dataset(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--runtime-artifact", default="", help="Unified artifact directory or MODEL.JSN; uses only its frozen PARAM/runtime contract.")
+    parser.add_argument("--source-manifest", default="", help="P7_PREQUANTIZED_VAL_SOURCES_V1 JSON of model-bound source INT8 and registered GT records (see module docstring).")
+    parser.add_argument("--board-suite", default="", help="P7_UNIFIED_VAL500_SUITE_V1 spec; package existing 500-image unified datasets for App autorun, without replay/training.")
     parser.add_argument("--espnet-dir", default=r"D:\ESPNet")
     parser.add_argument(
         "--artifact-dir",
@@ -754,6 +1108,9 @@ def parse_args() -> argparse.Namespace:
         "out_dir",
         "param_audit",
         "scale_table",
+        "runtime_artifact",
+        "source_manifest",
+        "board_suite",
     ):
         value = getattr(args, name)
         if value:
@@ -763,6 +1120,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.board_suite:
+        if args.runtime_artifact or args.source_manifest or args.clean or args.clean_board_outputs:
+            raise ValueError("--board-suite is a separate non-destructive packaging operation")
+        result = publish_board_validation_suite(Path(args.board_suite), Path(args.out_dir))
+        print(f"Prepared VAL500: {result['case_count']} cases; {len(result['not_in_suite'])} hardware modes not in suite")
+        print(f"Staged bytes={result['staged_bytes']}; reserve output bytes={result['output_bytes']} plus FAT overhead")
+        print(f"Board files: {args.out_dir}; App build and SD copy remain manual")
+        return 0
     manifest = export_val_dataset(args)
     print(f"Exported {manifest['num_exported']} samples to: {manifest['out_dir']}")
     print(f"Manifest: {Path(manifest['out_dir']) / 'manifest.json'}")

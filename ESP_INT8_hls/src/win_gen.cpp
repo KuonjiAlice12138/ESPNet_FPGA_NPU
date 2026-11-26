@@ -91,12 +91,18 @@ struct narrow_delta_cache_t {
 };
 static narrow_delta_cache_t s_delta_cache;
 
-// Native C1 source rows are complete AXI words; no padded frame copy is stored.
-static act_vec_t s_c1_rows[3][WINGEN_C1_PACKED_ROW_WORDS];
-static bool s_c1_rows_valid = false;
-static u16_t s_c1_last_row = 0;
-static u32_t s_c1_source_base = 0;
-static u8_t s_c1_source_bank = 0;
+// C1/C3 first-layer ISA modes share one packed-row cache.
+static act_vec_t s_first_rows[3][WINGEN_FIRST_PACKED_ROW_WORDS];
+static bool s_first_rows_valid = false;
+static u16_t s_first_last_row = 0;
+static u32_t s_first_source_base = 0;
+static u8_t s_first_source_bank = 0;
+static u16_t s_first_h = 0, s_first_w = 0, s_first_c = 0;
+
+void reset_window_state() {
+#pragma HLS INLINE
+    s_first_rows_valid = false;
+}
 
 
 struct wide_3x3_cache_t {
@@ -711,6 +717,32 @@ static void build_staged_c17_word(
     }
 }
 
+static void build_staged_c19_word(const narrow_3x3_window_t& cache, int kt, act_vec_t& word) {
+#pragma HLS INLINE
+    switch (kt) {
+        case 0:
+            copy_staged_cache_segment<0, 0, 0, 19>(cache, word);
+            copy_staged_cache_segment<1, 0, 19, 13>(cache, word); break;
+        case 1:
+            copy_staged_cache_segment<1, 13, 0, 6>(cache, word);
+            copy_staged_cache_segment<2, 0, 6, 19>(cache, word);
+            copy_staged_cache_segment<3, 0, 25, 7>(cache, word); break;
+        case 2:
+            copy_staged_cache_segment<3, 7, 0, 12>(cache, word);
+            copy_staged_cache_segment<4, 0, 12, 19>(cache, word);
+            copy_staged_cache_segment<5, 0, 31, 1>(cache, word); break;
+        case 3:
+            copy_staged_cache_segment<5, 1, 0, 18>(cache, word);
+            copy_staged_cache_segment<6, 0, 18, 14>(cache, word); break;
+        case 4:
+            copy_staged_cache_segment<6, 14, 0, 5>(cache, word);
+            copy_staged_cache_segment<7, 0, 5, 19>(cache, word);
+            copy_staged_cache_segment<8, 0, 24, 8>(cache, word); break;
+        case 5: copy_staged_cache_segment<8, 8, 0, 11>(cache, word); break;
+        default: break;
+    }
+}
+
 static void build_staged_c25_word(
     const narrow_3x3_window_t& cache,
     int kt,
@@ -1150,6 +1182,52 @@ static void build_staged_c129_word(
     }
 }
 
+// Each C131 segment is a compile-time slice; no dynamic lane scatter or K division.
+template <int KT, int DST, bool DONE = (DST >= 32 || KT * 32 + DST >= 9 * 131)>
+struct c131_word_segment {
+    static void copy(const wide_3x3_cache_t& cache, const u8_t slots[3], act_vec_t& word) {
+#pragma HLS INLINE
+        constexpr int index = KT * 32 + DST;
+        constexpr int spatial = index / 131;
+        constexpr int channel = index % 131;
+        constexpr int chunk = channel / 32;
+        constexpr int lane = channel % 32;
+        constexpr int chunk_left = 32 - lane;
+        constexpr int channel_left = 131 - channel;
+        constexpr int remaining = channel_left < chunk_left ? channel_left : chunk_left;
+        constexpr int count = remaining < 32 - DST ? remaining : 32 - DST;
+        copy_staged_cache_chunk_segment<spatial, chunk, lane, DST, count>(cache, slots, word);
+        c131_word_segment<KT, DST + count>::copy(cache, slots, word);
+    }
+};
+
+template <int KT, int DST>
+struct c131_word_segment<KT, DST, true> {
+    static void copy(const wide_3x3_cache_t&, const u8_t[3], act_vec_t&) {
+#pragma HLS INLINE
+    }
+};
+
+static void build_staged_c131_word(const wide_3x3_cache_t& cache,
+                                   const u8_t slots[3], int kt, act_vec_t& word) {
+#pragma HLS INLINE off
+#define C131_WORD_CASE(K) case K: c131_word_segment<K, 0>::copy(cache, slots, word); break
+    switch (kt) {
+        C131_WORD_CASE(0); C131_WORD_CASE(1); C131_WORD_CASE(2); C131_WORD_CASE(3);
+        C131_WORD_CASE(4); C131_WORD_CASE(5); C131_WORD_CASE(6); C131_WORD_CASE(7);
+        C131_WORD_CASE(8); C131_WORD_CASE(9); C131_WORD_CASE(10); C131_WORD_CASE(11);
+        C131_WORD_CASE(12); C131_WORD_CASE(13); C131_WORD_CASE(14); C131_WORD_CASE(15);
+        C131_WORD_CASE(16); C131_WORD_CASE(17); C131_WORD_CASE(18); C131_WORD_CASE(19);
+        C131_WORD_CASE(20); C131_WORD_CASE(21); C131_WORD_CASE(22); C131_WORD_CASE(23);
+        C131_WORD_CASE(24); C131_WORD_CASE(25); C131_WORD_CASE(26); C131_WORD_CASE(27);
+        C131_WORD_CASE(28); C131_WORD_CASE(29); C131_WORD_CASE(30); C131_WORD_CASE(31);
+        C131_WORD_CASE(32); C131_WORD_CASE(33); C131_WORD_CASE(34); C131_WORD_CASE(35);
+        C131_WORD_CASE(36);
+        default: break;
+    }
+#undef C131_WORD_CASE
+}
+
 static void emit_narrow_words_for_mode(
     unsigned mode,
     const narrow_3x3_window_t& window,
@@ -1169,6 +1247,15 @@ static void emit_narrow_words_for_mode(
 #pragma HLS PIPELINE II=1
             act_vec_t word = 0;
             build_staged_c17_word(window, kt, word);
+            act_stream.write(word);
+        }
+        return;
+    }
+    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C19)) {
+        for (int kt = 0; kt < 6; ++kt) {
+#pragma HLS PIPELINE II=1
+            act_vec_t word = 0;
+            build_staged_c19_word(window, kt, word);
             act_stream.write(word);
         }
         return;
@@ -1193,7 +1280,8 @@ static void emit_narrow_word_pair_for_mode(
 #pragma HLS INLINE off
     const int k_tiles = (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C12))
                                   ? 4
-                                  : (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C17)) ? 5 : 8;
+                                  : (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C17)) ? 5
+                                  : (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C19)) ? 6 : 8;
     for (int kt = 0; kt < 8; ++kt) {
 #pragma HLS PIPELINE II=1
         if (kt >= k_tiles) {
@@ -1207,6 +1295,9 @@ static void emit_narrow_word_pair_for_mode(
         } else if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C17)) {
             build_staged_c17_word(window0, kt, word0);
             build_staged_c17_word(window1, kt, word1);
+        } else if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C19)) {
+            build_staged_c19_word(window0, kt, word0);
+            build_staged_c19_word(window1, kt, word1);
         } else {
             build_staged_c25_word(window0, kt, word0);
             build_staged_c25_word(window1, kt, word1);
@@ -1246,10 +1337,15 @@ static void emit_wide_words_for_mode(
         }
         return;
     }
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C129)) {
+    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C129) ||
+        mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C131)) {
         for (int kt = 0; kt < 37; ++kt) {
             act_vec_t word = 0;
-            build_staged_c129_word(cache, slot_for_kw, kt, word);
+            if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C131)) {
+                build_staged_c131_word(cache, slot_for_kw, kt, word);
+            } else {
+                build_staged_c129_word(cache, slot_for_kw, kt, word);
+            }
             act_stream.write(word);
         }
         return;
@@ -1620,77 +1716,112 @@ static void scheduled_1x1_window_row(const tensor_desc_t& src_desc,
 }
 
 template <int ROW>
-static void c1_load_packed_source_row(const tensor_desc_t& src, int source_row) {
+static void first_load_packed_source_row(const tensor_desc_t& src, int source_row) {
 #pragma HLS INLINE
-    static_assert(INPUT_FRAME_W % AXI_WORD_BYTES == 0, "Native C1 rows must be AXI aligned");
-    const bool valid = source_row >= 0 && source_row < INPUT_FRAME_H;
+    const unsigned row_bytes = src.w.to_uint() * src.c.to_uint();
+    const unsigned words = (row_bytes + 31U) >> 5;
+    const bool valid = source_row >= 0 && source_row < static_cast<int>(src.h.to_uint());
     const unsigned row_byte = src.base_offset.to_uint() +
-                              static_cast<unsigned>(valid ? source_row : 0) * INPUT_FRAME_W;
-    for (int wi = 0; wi < WINGEN_C1_PACKED_ROW_WORDS; ++wi) {
+        static_cast<unsigned>(valid ? source_row : 0) * tensor_row_stride_bytes(src).to_uint();
+    const unsigned aligned = row_byte & ~31U;
+    const bool half_word = (row_byte & 31U) == 16U;
+    const unsigned source_end = src.base_offset.to_uint() +
+        src.h.to_uint() * tensor_row_stride_bytes(src).to_uint();
+    act_vec_t carry = 0;
+    if (valid && half_word) {
+        on_chip_memory_read_aligned_tensor_word(src, aligned, carry);
+    }
+    for (int wi = 0; wi < WINGEN_FIRST_PACKED_ROW_WORDS; ++wi) {
 #pragma HLS PIPELINE off
+        if (static_cast<unsigned>(wi) >= words) { break; }
         act_vec_t current = 0;
         if (valid) {
-            on_chip_memory_read_aligned_tensor_word(src,
-                static_cast<u32_t>(row_byte + static_cast<unsigned>(wi) * AXI_WORD_BYTES), current);
+            const unsigned address = aligned + static_cast<unsigned>(wi) * AXI_WORD_BYTES;
+            if (half_word) {
+                act_vec_t next = 0;
+                if (address + AXI_WORD_BYTES < source_end) {
+                    on_chip_memory_read_aligned_tensor_word(src, address + AXI_WORD_BYTES, next);
+                }
+                current.range(127, 0) = carry.range(255, 128);
+                current.range(255, 128) = next.range(127, 0);
+                carry = next;
+            } else {
+                on_chip_memory_read_aligned_tensor_word(src, address, current);
+            }
+            if ((row_bytes & 31U) == 16U && static_cast<unsigned>(wi) + 1U == words) {
+                current.range(255, 128) = 0;
+            }
         }
-        s_c1_rows[ROW][wi] = current;
+        s_first_rows[ROW][wi] = current;
     }
 }
 
-template <int ROW>
-static void c1_pack_window_pair(int first_col, act_vec_t& word0, act_vec_t& word1) {
+template <int CHANNELS, int ROW>
+static void first_pack_window_pair(int first_col, act_vec_t& word0, act_vec_t& word1) {
 #pragma HLS INLINE
-    const unsigned col = static_cast<unsigned>(first_col < 0 ? 0 : first_col);
-    const unsigned wi = col >> 5;
-    const unsigned offset = col & 31U;
-    ap_uint<40> bytes = s_c1_rows[ROW][wi] >> (offset * 8U);
-    if (offset > 27U && wi + 1U < static_cast<unsigned>(WINGEN_C1_PACKED_ROW_WORDS)) {
-        bytes |= ap_uint<40>(s_c1_rows[ROW][wi + 1U]) << ((32U - offset) * 8U);
+    const unsigned byte = static_cast<unsigned>(first_col < 0 ? 0 : first_col) * CHANNELS;
+    const unsigned wi = byte >> 5;
+    const unsigned offset = byte & 31U;
+    ap_uint<40 * CHANNELS> bytes = s_first_rows[ROW][wi] >> (offset * 8U);
+    if (offset + 5U * CHANNELS > 32U &&
+        wi + 1U < static_cast<unsigned>(WINGEN_FIRST_PACKED_ROW_WORDS)) {
+        bytes |= ap_uint<40 * CHANNELS>(s_first_rows[ROW][wi + 1U]) << ((32U - offset) * 8U);
     }
     if (first_col < 0) {
-        bytes <<= 8;
+        bytes <<= 8 * CHANNELS;
     }
-    word0.range((ROW * 3 + 0) * 8 + 7, (ROW * 3 + 0) * 8) = bytes.range(7, 0);
-    word0.range((ROW * 3 + 1) * 8 + 7, (ROW * 3 + 1) * 8) = bytes.range(15, 8);
-    word0.range((ROW * 3 + 2) * 8 + 7, (ROW * 3 + 2) * 8) = bytes.range(23, 16);
-    word1.range((ROW * 3 + 0) * 8 + 7, (ROW * 3 + 0) * 8) = bytes.range(23, 16);
-    word1.range((ROW * 3 + 1) * 8 + 7, (ROW * 3 + 1) * 8) = bytes.range(31, 24);
-    word1.range((ROW * 3 + 2) * 8 + 7, (ROW * 3 + 2) * 8) = bytes.range(39, 32);
+    word0.range((ROW + 1) * 24 * CHANNELS - 1, ROW * 24 * CHANNELS) =
+        bytes.range(24 * CHANNELS - 1, 0);
+    word1.range((ROW + 1) * 24 * CHANNELS - 1, ROW * 24 * CHANNELS) =
+        bytes.range(40 * CHANNELS - 1, 16 * CHANNELS);
 }
 
-static void scheduled_c1_packed_row(const tensor_desc_t& src, u16_t out_row,
-                                    hls::stream<act_vec_t>& act_stream0,
-                                    hls::stream<act_vec_t>& act_stream1) {
+static void scheduled_first_packed_row(const tensor_desc_t& src,
+                                       const window_sched_desc_t& sched, u16_t out_row,
+                                       hls::stream<act_vec_t>& act_stream0,
+                                       hls::stream<act_vec_t>& act_stream1) {
 #pragma HLS INLINE off
-#pragma HLS ARRAY_PARTITION variable=s_c1_rows complete dim=1
-#pragma HLS BIND_STORAGE variable=s_c1_rows type=ram_2p impl=lutram
-#pragma HLS RESET variable=s_c1_rows off
-    const bool continuous = s_c1_rows_valid && out_row != 0 &&
-                            out_row.to_uint() == s_c1_last_row.to_uint() + 1U &&
-                            src.base_offset == s_c1_source_base &&
-                            src.bank_id.to_uint() == s_c1_source_bank.to_uint();
+#pragma HLS ARRAY_PARTITION variable=s_first_rows complete dim=1
+#pragma HLS BIND_STORAGE variable=s_first_rows type=ram_2p impl=lutram
+#pragma HLS RESET variable=s_first_rows off
+    const unsigned words = (src.w.to_uint() * src.c.to_uint() + 31U) >> 5;
+    const bool rgb = sched.mode.to_uint() == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C3);
+    const bool continuous = s_first_rows_valid && out_row != 0 &&
+                            out_row.to_uint() == s_first_last_row.to_uint() + 1U &&
+                            src.base_offset == s_first_source_base &&
+                            src.bank_id.to_uint() == s_first_source_bank.to_uint() &&
+                            src.h == s_first_h && src.w == s_first_w && src.c == s_first_c;
     const int base_h = static_cast<int>(out_row.to_uint()) * 2 - 1;
     if (continuous) {
-        for (int wi = 0; wi < WINGEN_C1_PACKED_ROW_WORDS; ++wi) {
+        for (int wi = 0; wi < WINGEN_FIRST_PACKED_ROW_WORDS; ++wi) {
 #pragma HLS PIPELINE II=1
-            s_c1_rows[0][wi] = s_c1_rows[2][wi];
+            if (static_cast<unsigned>(wi) >= words) { break; }
+            s_first_rows[0][wi] = s_first_rows[2][wi];
         }
     } else {
-        c1_load_packed_source_row<0>(src, base_h);
+        first_load_packed_source_row<0>(src, base_h);
     }
-    c1_load_packed_source_row<1>(src, base_h + 1);
-    c1_load_packed_source_row<2>(src, base_h + 2);
-    s_c1_source_base = src.base_offset;
-    s_c1_source_bank = static_cast<u8_t>(src.bank_id.to_uint());
-    s_c1_last_row = out_row;
-    s_c1_rows_valid = true;
-    for (int issue = 0; issue < INPUT_FRAME_W / 4; ++issue) {
+    first_load_packed_source_row<1>(src, base_h + 1);
+    first_load_packed_source_row<2>(src, base_h + 2);
+    s_first_source_base = src.base_offset;
+    s_first_source_bank = static_cast<u8_t>(src.bank_id.to_uint());
+    s_first_h = src.h; s_first_w = src.w; s_first_c = src.c;
+    s_first_last_row = out_row;
+    s_first_rows_valid = true;
+    for (int issue = 0; issue < MAX_INPUT_FRAME_W / 4; ++issue) {
 #pragma HLS PIPELINE II=1
+        if (static_cast<unsigned>(issue) >= sched.out_w.to_uint() / 2U) { break; }
         act_vec_t word0 = 0;
         act_vec_t word1 = 0;
-        c1_pack_window_pair<0>(issue * 4 - 1, word0, word1);
-        c1_pack_window_pair<1>(issue * 4 - 1, word0, word1);
-        c1_pack_window_pair<2>(issue * 4 - 1, word0, word1);
+        if (rgb) {
+            first_pack_window_pair<3, 0>(issue * 4 - 1, word0, word1);
+            first_pack_window_pair<3, 1>(issue * 4 - 1, word0, word1);
+            first_pack_window_pair<3, 2>(issue * 4 - 1, word0, word1);
+        } else {
+            first_pack_window_pair<1, 0>(issue * 4 - 1, word0, word1);
+            first_pack_window_pair<1, 1>(issue * 4 - 1, word0, word1);
+            first_pack_window_pair<1, 2>(issue * 4 - 1, word0, word1);
+        }
         act_stream0.write(word0);
         act_stream1.write(word1);
     }
@@ -1706,8 +1837,9 @@ void scheduled_window_generator_row(const tensor_desc_t& src_desc,
     npu_profile_set_conv_win_state(prof_conv_win_state, PROF_CONV_WIN_ACTIVE);
     const unsigned mode = sched.mode.to_uint();
     const unsigned loader_class = sched.loader_class.to_uint();
-    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C1)) {
-        scheduled_c1_packed_row(src_desc, out_row, act_stream0, act_stream1);
+    if (mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C1) ||
+        mode == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C3)) {
+        scheduled_first_packed_row(src_desc, sched, out_row, act_stream0, act_stream1);
     } else if (loader_class == static_cast<unsigned>(WIN_LOADER_3X3_NARROW) ||
         loader_class == static_cast<unsigned>(WIN_LOADER_3X3_WIDE)) {
         scheduled_3x3_window_row_pipeline(

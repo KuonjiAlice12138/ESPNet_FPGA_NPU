@@ -37,7 +37,7 @@ bool on_chip_memory_write_pool2_abs_word(u32_t byte_offset,
 bool conv_store_write_row_contiguous_word(const tensor_desc_t& dst,
                                           u32_t byte_offset,
                                           const act_vec_t& word);
-void upsample_fused_consume_logits_row(axi_vec_t* gmem_frame_out,
+bool upsample_fused_consume_logits_row(axi_vec_t* gmem_frame_out,
                                        u16_t encoder_row,
                                        u8_t valid_c,
                                        const act_vec_t row_buf[MAX_FM_W]);
@@ -271,6 +271,10 @@ static bool ppu_layout_to_compact_shape(u16_t store_layout, u8_t& valid_c, u8_t&
       valid_c = static_cast<u8_t>(17);
       phys_c = static_cast<u8_t>(17);
       return true;
+    case static_cast<unsigned>(STORE_LAYOUT_COMPACT_C19):
+      valid_c = static_cast<u8_t>(19);
+      phys_c = static_cast<u8_t>(19);
+      return true;
     case static_cast<unsigned>(STORE_LAYOUT_COMPACT_C25):
       valid_c = static_cast<u8_t>(25);
       phys_c = static_cast<u8_t>(25);
@@ -348,6 +352,7 @@ static bool ppu_append_compact_pair(ap_uint<64> input, ap_uint<4> bytes,
 #pragma HLS INLINE
 #pragma HLS ARRAY_PARTITION variable=groups complete dim=1
   if (bytes == 1U) { input &= static_cast<ap_uint<64>>(0xFFU); }
+  else if (bytes == 3U) { input &= static_cast<ap_uint<64>>(0xFFFFFFU); }
   else if (bytes == 4U) { input &= static_cast<ap_uint<64>>(0xFFFFFFFFULL); }
   ap_uint<96> incoming = static_cast<ap_uint<96>>(input);
   switch (carry_bytes.to_uint()) {
@@ -357,10 +362,9 @@ static bool ppu_append_compact_pair(ap_uint<64> input, ap_uint<4> bytes,
     default: break;
   }
   const ap_uint<96> merged = incoming | static_cast<ap_uint<96>>(carry);
-  // Layout tails are 1 or 4 bytes; all other inputs are complete 8-byte pairs.
-  const ap_uint<2> count = bytes == 8U ? static_cast<ap_uint<2>>(2)
-      : ((bytes == 4U || carry_bytes == 3U) ? static_cast<ap_uint<2>>(1)
-                                             : static_cast<ap_uint<2>>(0));
+  // C19 adds a three-byte tail. Account for it in both group and carry state.
+  const ap_uint<4> byte_count = bytes + static_cast<ap_uint<4>>(carry_bytes);
+  const ap_uint<2> count = byte_count.range(3, 2);
   const ap_uint<3> second_group = group_count + static_cast<ap_uint<3>>(1);
   const ap_uint<4> next_group = static_cast<ap_uint<4>>(group_count) +
                                   static_cast<ap_uint<4>>(count);
@@ -386,7 +390,7 @@ static bool ppu_append_compact_pair(ap_uint<64> input, ap_uint<4> bytes,
   carry = count == 2U ? static_cast<ap_uint<32>>(merged.range(95, 64))
                        : (count == 1U ? static_cast<ap_uint<32>>(merged.range(63, 32))
                                       : static_cast<ap_uint<32>>(merged.range(31, 0)));
-  if (bytes == 1U) { carry_bytes += static_cast<ap_uint<2>>(1); }
+  carry_bytes = byte_count.range(1, 0);
   return completed;
 }
 
@@ -1048,6 +1052,7 @@ static bool csim_dump_lowres_logits_row(u16_t out_row,
                                         const act_vec_t row_buf[MAX_FM_W]) {
   const unsigned row = out_row.to_uint();
   const bool first_row = row == 0U || s_csim_lowres_logits_rows == 0U;
+  if (first_row) { s_csim_lowres_logits_rows = 0; }
   std::ofstream out("csim_u72_lowres_logits.bin",
                     std::ios::binary | (first_row ? std::ios::trunc : std::ios::app));
   if (!out) {
@@ -1056,8 +1061,10 @@ static bool csim_dump_lowres_logits_row(u16_t out_row,
   }
 
   const unsigned class_count = valid_c.to_uint();
+  runtime_profile_t profile;
+  runtime_get_profile(profile);
   std::uint8_t bytes[MAX_CLASS_C];
-  for (unsigned ow = 0; ow < static_cast<unsigned>(ENCODER_OUT_W); ++ow) {
+  for (unsigned ow = 0; ow < profile.logits_w; ++ow) {
     const act_vec_t packed = row_buf[ow];
     for (unsigned lane = 0; lane < class_count; ++lane) {
       bytes[lane] = static_cast<std::uint8_t>(packed.range(lane * 8 + 7, lane * 8).to_uint());
@@ -1067,13 +1074,13 @@ static bool csim_dump_lowres_logits_row(u16_t out_row,
   }
 
   ++s_csim_lowres_logits_rows;
-  if (row == static_cast<unsigned>(ENCODER_OUT_H - 1)) {
+  if (row == profile.logits_h - 1U) {
     std::printf("[CSIM-DUMP] wrote csim_u72_lowres_logits.bin rows=%u shape=%ux%ux%u bytes=%u\n",
                 s_csim_lowres_logits_rows,
-                static_cast<unsigned>(ENCODER_OUT_H),
-                static_cast<unsigned>(ENCODER_OUT_W),
+                profile.logits_h,
+                profile.logits_w,
                 class_count,
-                static_cast<unsigned>(ENCODER_OUT_H * ENCODER_OUT_W) * class_count);
+                profile.logits_h * profile.logits_w * class_count);
   }
   return true;
 }
@@ -1089,8 +1096,7 @@ bool ppu_consume_upsample_row(axi_vec_t* gmem_frame_out,
     return false;
   }
 #endif
-  upsample_fused_consume_logits_row(gmem_frame_out, out_row, valid_c, row_buf);
-  return true;
+  return upsample_fused_consume_logits_row(gmem_frame_out, out_row, valid_c, row_buf);
 }
 
 bool ppu_consume_block5_final_row(const block5_sched_desc_t& sched,

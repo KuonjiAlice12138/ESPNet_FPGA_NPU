@@ -59,12 +59,8 @@ bool conv_store_word_span_plan_ok(u8_t bank_id,
                                    u32_t byte_step,
                                    u16_t word_count) {
 #pragma HLS INLINE off
-  static_assert((FMBUF_POOL_TMP_BASE & (AXI_WORD_BYTES - 1)) == 0,
-                "Pool scratch base must be word aligned");
-  static_assert((FMBUF_POOL2_ALIAS_BASE & (AXI_WORD_BYTES - 1)) == 0 &&
-                    BRAM_SCR1_BYTES <= FMBUF_POOL2_ALIAS_BYTES &&
-                    FMBUF_POOL2_ALIAS_BASE + BRAM_SCR1_BYTES <= FMBUF_BYTES,
-                "Pool alias must fit the shared physical memory");
+  runtime_profile_t profile;
+  runtime_get_profile(profile);
   const unsigned count = word_count.to_uint();
   if (count == 0U || count > static_cast<unsigned>(ROW_CONTIG_MAX_WORDS) ||
       first_offset.range(4, 0).to_uint() != 0U ||
@@ -80,17 +76,17 @@ bool conv_store_word_span_plan_ok(u8_t bank_id,
       byte_capacity = FMBUF_BYTES;
       break;
     case static_cast<unsigned>(BANK_BRAM_SCR0):
-      byte_capacity = FMBUF_BYTES - FMBUF_POOL_TMP_BASE;
+      byte_capacity = profile.pool1_bytes;
       break;
     case static_cast<unsigned>(BANK_BRAM_SCR1):
-      byte_capacity = BRAM_SCR1_BYTES;
+      byte_capacity = profile.pool2_bytes;
       break;
     default:
       return false;
   }
   if (first_offset >= static_cast<u64_t>(byte_capacity)) { return false; }
   // Widen before the last-address calculation; a wrapped 32-bit end is not valid.
-  const ap_uint<10> last_word = static_cast<ap_uint<10>>(count - 1U);
+  const ap_uint<11> last_word = static_cast<ap_uint<11>>(count - 1U);
   const u64_t end_offset = first_offset +
       static_cast<u64_t>(last_word * byte_step) + static_cast<u64_t>(AXI_WORD_BYTES);
   return end_offset <= static_cast<u64_t>(byte_capacity);

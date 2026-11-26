@@ -10,11 +10,11 @@ enum window_mode_t : std::uint8_t {
   WIN_MODE_3X3_RESERVED = 1,
   WIN_MODE_1X1_ALIGNED = 2,
   WIN_MODE_1X1_PACKED = 3,
-  WIN_MODE_3X3_STAGED_C3 = 4,  // Retired RGB ABI value; rejected by this build.
+  WIN_MODE_3X3_STAGED_C3 = 4,
   WIN_MODE_3X3_STAGED_C12 = 5,
-  WIN_MODE_3X3_STAGED_C19 = 6,  // Retired RGB ABI value; no hardware handler.
+  WIN_MODE_3X3_STAGED_C19 = 6,
   WIN_MODE_3X3_STAGED_C25 = 7,
-  WIN_MODE_3X3_STAGED_C131 = 8,  // Retired RGB ABI value; no hardware handler.
+  WIN_MODE_3X3_STAGED_C131 = 8,
   WIN_MODE_3X3_STAGED_C28 = 9,
   WIN_MODE_3X3_STAGED_C64 = 10,
   WIN_MODE_3X3_STAGED_C128 = 11,
@@ -63,7 +63,7 @@ constexpr unsigned WINDOW_ROW_REUSE_WORDS_MASK = 0x7FU;
 constexpr unsigned WINDOW_TRANSFER_PROTOCOL_SHIFT = 9U;
 constexpr unsigned WINDOW_TRANSFER_PROTOCOL_MASK = 0x3U;
 constexpr unsigned WINDOW_ROW_REUSE_RESERVED_SHIFT = 11U;
-constexpr int WINGEN_C1_PACKED_ROW_WORDS = INPUT_FRAME_W / AXI_WORD_BYTES;
+constexpr int WINGEN_FIRST_PACKED_ROW_WORDS = MAX_INPUT_FRAME_W * MAX_INPUT_FRAME_C / AXI_WORD_BYTES;
 
 enum window_transfer_protocol_t : std::uint8_t {
   WINDOW_TRANSFER_SPATIAL_WORDS = 0,
@@ -92,7 +92,7 @@ enum store_layout_mode_t : std::uint8_t {
   STORE_LAYOUT_C16_INTO_C19 = 6,  // Retired RGB layout; no hardware handler.
   STORE_LAYOUT_ALIGNED_TILE_COPY = 7,
   STORE_LAYOUT_NARROW_FIXED = 8,
-  STORE_LAYOUT_COMPACT_C19 = 9,  // Retired RGB layout; no hardware handler.
+  STORE_LAYOUT_COMPACT_C19 = 9,
   STORE_LAYOUT_PREFIX_ZERO_PAD = 10,
   STORE_LAYOUT_COMPACT_C17 = 11,
 };

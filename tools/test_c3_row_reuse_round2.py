@@ -93,48 +93,25 @@ class C3RowReuseTests(unittest.TestCase):
 
     def test_schedule_recompile_preserves_every_numeric_byte(self):
         for name in ("binary2", "cityscapes20"):
-            path = ROOT / f"hw_artifacts/{name}_int8_h256w512_r2_v4/PARAM.BIN"
-            original = path.read_bytes()
-            blob = ParamBlob(path)
-            compiled = exporter.compile_window_reuse_param(path)
-            sid = blob.conv_exec_by_index[0].window_sched_id
-            offset = blob.header["window_sched_offset"] + 128 * sid + 126
-            self.assertEqual(compiled[:offset], original[:offset])
-            self.assertEqual(compiled[offset:offset + 2], struct.pack("<H", reuse_word(48)))
-            self.assertEqual(compiled[offset + 2:], original[offset + 2:])
+            path=ROOT/f"hw_artifacts/{name}_int8_h256w512_r2_v4/PARAM.BIN"
+            original=path.read_bytes(); blob=ParamBlob(path)
+            compiled=exporter.compile_window_reuse_param(path)
+            allowed=set()
+            for sid in range(len(blob.window_sched_by_index)):
+                offset=blob.header["window_sched_offset"]+128*sid+126
+                allowed.update((offset,offset+1))
+            self.assertTrue(all(a==b or i in allowed for i,(a,b) in enumerate(zip(original,compiled))))
+            self.assertEqual(compiled[blob.header["weight_packed_offset"]:blob.header["uop_offset"]],
+                             original[blob.header["weight_packed_offset"]:blob.header["uop_offset"]])
 
-    def test_round2_artifacts_keep_frozen_data_and_refresh_contracts(self):
-        for name in ("binary2", "cityscapes20"):
-            frozen = ROOT / f"hw_artifacts/{name}_int8_h256w512_r2_v4"
-            candidate = ROOT / f"hw_artifacts/{name}_int8_h256w512_r2_v4"
-            blob = ParamBlob(candidate / "PARAM.BIN")
-            self.assertEqual(len(blob.conv_exec_by_index), 26)
-            self.assertEqual(blob.window_sched_by_index[0].reserved[9], reuse_word(48))
-            self.assertTrue(all(s.reserved[9] == 0 for s in blob.window_sched_by_index[1:]))
-            # NONE schedules must continue to allow BLOCK5 row-local scratch IDs.
-            self.assertTrue(any(c.src_tensor >= len(blob.tensor_desc)
-                                for c in blob.conv_exec_by_index))
-            self.assertEqual((candidate / "PARAM.BIN").read_bytes(),
-                             exporter.compile_window_reuse_param(frozen / "PARAM.BIN"))
-            self.assertEqual((candidate / "PARAM.BIN").read_bytes(),
-                             (candidate / "param_blob.bin").read_bytes())
-            for filename in ("INPUTQ.BIN", "uop_table.bin", "golden_output_q.bin",
-                             "model_golden_output_q.bin", "model_golden_output_q_nhwc.npy",
-                             "golden_output_fp32.npy", "replay_output_q.bin"):
-                self.assertEqual((candidate / filename).read_bytes(),
-                                 (frozen / filename).read_bytes(), filename)
-            for filename in ("export_manifest.json", "single_manifest.json"):
-                manifest = json.loads((candidate / filename).read_text(encoding="utf-8"))
-                self.assertEqual(manifest["schedule_recompile"]["changed_byte_offsets"], [1982])
-                self.assertEqual(manifest["param_blob_sha256"],
-                                 hashlib.sha256((candidate / "PARAM.BIN").read_bytes()).hexdigest())
-                for entry in manifest["artifact_hashes"].values():
-                    self.assertEqual(entry["sha256"], hashlib.sha256(
-                        (candidate / entry["file"]).read_bytes()).hexdigest())
-            audit = json.loads((candidate / "param_audit.json").read_text(encoding="utf-8"))
-            self.assertEqual(audit["window_schedules"][0]["row_reuse_mode"], 2)
-            self.assertEqual(audit["window_schedules"][0]["packed_words_per_source_row"], 48)
-            exporter.parse_and_check_blob_v4(candidate / "PARAM.BIN", audit)
+    def test_unified_rgb_publication_keeps_frozen_inputs_and_logits(self):
+        for key,name in (("R256B2","binary2"),("R256B20","cityscapes20")):
+            frozen=ROOT/f"hw_artifacts/{name}_int8_h256w512_r2_v4"
+            candidate=ROOT/f"hw_artifacts/unified_int8/{key}"
+            manifest=exporter.validate_runtime_artifact(candidate)
+            self.assertEqual((candidate/"INPUTQ.BIN").read_bytes(),(frozen/"INPUTQ.BIN").read_bytes())
+            self.assertEqual((candidate/"LOGITS.BIN").read_bytes(),(frozen/"golden_output_q.bin").read_bytes())
+            self.assertEqual(manifest["provenance"]["replay_mismatches"],0)
 
     def test_service_model_counts_drain_per_issue_and_per_row(self):
         uop = model.Uop(2, 2, 0, 0, 0, 0, 0, 0, 256, 512, 3, 16,

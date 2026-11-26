@@ -1,76 +1,129 @@
-ESP INT8 board app: native H512W512 grayscale binary2, adapted QAT10 weights.
+ESP INT8 unified runtime App
+Branch: feature/p7-unified-int8
+Tag: INT8-BOARD-20261120-P7-UNIFIED-VAL500-TXT
+Platform: platform_unified_1120 / standalone_psu_cortexa53_0
+Runtime ABI: 0x11160001, capability: 0x00007fff, PARAM v4 unified layout.
 
-Platform: platform_h512_baseline, standalone_psu_cortexa53_0, Cortex-A53 0.
-App tag: INT8-BOARD-20261116-P7-H512W512-GRAY-QAT10-B2.
-Manual rebuild required after future App source changes. The current ELF
-was manually rebuilt on 2026-11-16; its QAT10 tag was confirmed on board.
-The platform, App component, app.yaml, BSP and boot recipe remain native512.
-Only weights/qparams changed: all tensor/Conv/window/consumer/fixed/BLOCK5
-descriptors and the EXEC plan match the implemented hardware's prior model.
-No IP repackaging, platform rebuild or bitstream change is needed for QAT10.
+app.yaml and vitis-comp.json select the new unified platform. The user-built
+ELF includes VAL500 and TXT logging; RUNINFO.JSN records its identity. Rebuild
+manually after any further source changes. No BOOT.BIN was created by data
+preparation. The HAL requires generated runtime register macros, never guessed
+AXI-Lite offsets. -O2 speeds CPU CRC/metric loops, outside inference timing.
 
-One launch runs binary2 once, with all 75 UOPs / 16 EXEC entries of PARAM v4.
-Dual-model, EXEC-prefix and validation-set modes are disabled. All 13 stage
-bins and the three Conv WIN/SA/POST state counters remain enabled and required.
-Input is NHWC signed INT8 512x512x1, with no FPGA input sampler/resize.
-Logits are 64x64x2; exact 8x bilinear logits interpolation then argmax produces
-a 512x512 uint8 mask. DDR input/output buffers are each 262144 bytes and
-64-byte aligned. PARAM capacity is 262144 bytes.
+Automatic TXT log (UART output remains enabled):
+  Each boot creates LOGS/TEST0000.TXT, then TEST0001.TXT, etc., on the mounted
+  SD card. Names use 8.3 components. Existing logs are NEVER overwritten;
+  LOGS is created automatically and the exact path prints at startup.
+  One file contains all cases, first-image stage/conv counters, per-image
+  progress, PA/IoU, timing summaries and App/HAL/SD diagnostics from that boot.
+  Startup messages before mounting are buffered and included after opening.
+  FSBL/PMU messages before this App starts, and direct BSP-internal output,
+  are not captured. UART input echo is not part of the App's printed output.
+  app_log.c is the sole mirror/formatting owner; FatFs operations stay in
+  sd_card.c. Printing only queues text in 64 KiB RAM. Explicit flush/sync is
+  outside MODE_RUN timing, after every image and summary and before the UART
+  command prompt. This increases test wall time, NOT recorded inference time.
+  Logs are closed on quit/normal exit and error exits. Prefer quit and power
+  off before removing the card; the final summary is already synced while
+  waiting at the prompt. No log file is created during host preparation.
+  Open/write/sync/close/overflow/format errors are reported on UART and stop
+  the test. The TXT may then be incomplete; do not treat it as a full result.
+  Without a writable card, there is no persistent log and validation cannot
+  proceed. Do not remove the card or reset/power off while a test is running.
 
-SD files (8.3 names):
-P512F.BIN  QAT10 PARAM, 143040 bytes
-I512F.BIN  input paired with this export, 262144 bytes
-O512F.BIN  fresh board output, 262144 bytes; do not copy golden to this name
-BOOT.BIN   not required for JTAG; SD boot requires newly packaged firmware
+500-image validation, one ELF / one boot:
+  VALRUNS.CSV on the SD root automatically runs every registered case in
+  order, 500 distinct indexed images each. INIT loads the model once per
+  case, then 500 MODE_RUN operations execute. Changing case always redoes
+  INIT, including gray/RGB, resolution and class switches.
+  INT8_APP_AUTORUN_VALSET defaults to 1; use 0 for UART-only operation.
+  A missing VALRUNS.CSV enters UART mode and states validation has NOT run.
+  A malformed/incomplete validation manifest stops with FAILURE.
 
-Source artifact: hw_artifacts/binary2_int8_h512w512_gray_finetuned_v4
-Model export: D:/ESPNet/resolution_h512w512_gray/quantized_artifacts_native512_finetuned
-Hardware profile: p7_h512w512_gray_c1_v1. The selected checkpoint is the best
-of the completed 10-epoch QAT phase, following 40 epochs of native512 FP32
-fine-tuning. The stopped extra phase is not used. Labels are vehicles=0,
-valid background=1, GT255 ignored. The App validates geometry and complete
-EXEC-plan length before INIT and rejects timeout/ERROR/invalid output labels.
+UART commands:
+  list          List single-image cases from optional RUNS.CSV.
+  run G240B2    One golden-CRC checked single-image inference.
+  suite [1..10] Repeat all single-image cases (default 3), then the first.
+  val all       Run all VALRUNS.CSV cases, 500 images each.
+  val G240B2    Run that validation case only, exactly 500 images.
+  help / quit   Help / return from main.
+The single-image catalog/checks are unchanged. Do not resize/readdress a
+different model's weights to stand in for a missing trained model.
 
-Full val500 QAT/PARAM replay: PA=98.2372%, mIoU=86.9902%, vehicle IoU=75.8465%.
-All 4096000 INT8 logits match between QAT and replay. Expected first-sample
-golden histogram: c0=19021, c1=243123, invalid=0. Histogram equality is not
-sufficient: compare O512F.BIN byte-for-byte with golden_fullres_mask.bin.
-CSim was not run for this QAT checkpoint. The 2026-11-16 board mask now
-matches the integer golden exactly: 0/262144 pixels, invalid=0, ERROR=0.
-First-sample board PA=98.9952%, mIoU=93.6241%, vehicle IoU=88.3357% on the
-matching512 center-ROI GT. Full val500 board scoring remains pending.
-The obsolete H240-direct-transfer native512 hardware artifact was removed;
-its historical scores remain in workplan_1110.md, not this release.
+Validation SD contract (ten-case host package: hw_artifacts/unified_val500_1122/board):
+  VALRUNS.CSV                 Case list, 8.3 paths and CRC32.
+  G240B2/PARAM.BIN            Frozen model compiled for unified layout.
+  G240B2/MODEL.JSN            Host-validated model/provenance record.
+  G240B2/SAMPLES.CSV          index,input_crc,target_crc; exactly 0..499.
+  G240B2/VALDATA.JSN          Host identities and image ordering.
+  G240B2/I0000.BIN..I0499.BIN Source HWC signed INT8, not raw PNG/RGB.
+  G240B2/T0000.BIN..T0499.BIN Mapped HW uint8 GT on this output grid.
+  G240B2/O0000.BIN..O0499.BIN Board masks; NEVER prefill from golden.
+Other cases use the same pattern. Root contains manifests, not thousands of
+masks. Reserve staged input/GT space plus output space and FAT overhead; the
+packager prints byte totals. Every output is synced/closed; any failure stops.
 
-ARM timing uses CNTPCT_EL0 / runtime CNTFRQ_EL0, BSP reference 33333000 Hz.
-PL uses nominal 100 MHz (10 ns). SD I/O, MODE_INIT, cache maintenance and
-printing remain outside MODE_RUN. WIN/SA/POST overlap and must not be summed.
-POST staging/commit bins include psum waits, requantization and packing.
-QAT10 board timing is 22228515 PL cycles=222.28515 ms; ARM timing is
-7409496 ticks/33333000 Hz=222.28710 ms. Only one cycle differs from the old
-direct-transfer model; model adaptation improves accuracy, not throughput.
+VALRUNS.CSV header (generated by the host packager, not hand-edited):
+key,profile,classes,source,mask,param,param_crc,samples,samples_crc
+All cases must use the same ordered 500 validation image names. Each retains
+its own preprocessing, input qparams, geometry and ground-truth transform.
 
-Reused implementation: routing errors=0, WNS=+0.439 ns, WHS=+0.010 ns at 100MHz;
-logic/total LUT=205438/223151, FF=172818, BRAM tile=228.5, DSP=1289, URAM=108.
-NPU control=0xA0000000; RTL counter=0xA0010000. JTAG launch uses the platform
-FSBL, the hash-identical cached bitstream, and ESP_INT8_app/build/ESP_INT8_app.elf.
-The optional PSU-init path also points to this platform's psu_init.tcl.
-Create a new Run/Debug configuration if the existing one is removed.
+Accuracy:
+  Validation uses each image's GT, NOT the single-image golden. After all 500
+  succeed it prints per-class PA (=TP/GT support), IoU, confusion counts,
+  global PA and mIoU. *_ppm / 10000 is percent; -1 is undefined. Binary ignores
+  target 255; Cityscapes20 ignores target 19/255 and averages non-void classes.
+  Classes absent from both target and prediction are omitted from mIoU.
+  Lite wide-image output covers the center square ROI; GT must use that ROI
+  and the declared 240/256/512 grid, never the entire wide field of view.
+  Output always interpolates logits then argmax, not label-ID interpolation.
+  Keep LOGS/TESTxxxx.TXT (including VAL_SAMPLE/VAL_CLASS/VAL_CONFUSION/
+  VAL_METRICS/VAL_SUMMARY) together with masks and SUITE.JSN for analysis.
 
-Verified data SHA256:
-P512F.BIN 7c2175418f1f34e53bb3f12f57f8e182df204d27b2df0a3e136ac488baf45d4a
-I512F.BIN b3355dbbd88d11bf34bc984d5591b83a04951a1cf93b7a674c2e908d37bcfe93
-Golden    7bf97daf99a91f6dc41e148ac40c73400a93c7559083e20fcef8fb9ad120cf8c
+Timing / failure:
+  Detailed RTL stage/conv counters print ONLY on the first image of each case
+  (also on hardware errors). All images still check counter closure,
+  ABI/capability/status and valid class IDs. WIN/SA/POST overlap and contain
+  waits; never add them together.
+  ARM frequency is read from CNTFRQ_EL0. ARM ticks and PL cycles are separate.
+  SD I/O, INIT, cache maintenance, CRC, GT scoring and printing are outside
+  timing. MODE_RUN includes hardware input, compute/postprocessing and output.
+  Partial results are FAIL, never VAL500 accuracy/timing. Timeout requires a
+  hardware reset; no further NPU transactions are issued. Invalid GT/masks,
+  runtime/CRC/size/counter errors and failed saves stop the suite.
+  PASS means completed valid execution, not an accuracy threshold or equality
+  with software golden; judge inference quality from the reported GT metrics.
 
-JTAG preparation: manually rebuild, select ESP_INT8_app_app_hw_1, keep FSBL
-initialization selected, and verify the new QAT10 tag at startup.
-Bitstream: platform_h512_baseline/hw/sdt/ESP_INT8_hwplat.bit
-FSBL: platform_h512_baseline/export/platform_h512_baseline/sw/boot/fsbl.elf
-PS init: platform_h512_baseline/hw/sdt/psu_init.tcl
+Capability / model availability:
+  App accepts all 40 valid combinations of 8 encoder profiles, 2/20 classes,
+  native/matching-channel lite sources and supported output modes.
+  Published frozen artifacts currently cover 10 cases: G240B2, R256B2,
+  R256B20, G512B2, G2S1M0/M1, G2S2M0/M1, G2S3M0/M1. These are SINGLE-IMAGE
+  reference artifacts. Separate full-500 input/GT datasets for these ten cases
+  are prepared in hw_artifacts/unified_val500_1122/board. Native RGB512x1024,
+  RGB512 square/240, gray256/wide, gray20 and RGB-lite trained artifacts are
+  not published. SUITE.JSN explicitly lists every mode not included; a
+  passing subset is not complete hardware/mode accuracy validation.
 
-For SD boot only, package after the NEW ELF is built, from D:/ESP_INT8:
-& D:/Xilinx/2025.1/Vivado/bin/bootgen.bat -arch zynqmp -image ESP_INT8_app/src/boot_h512_native.bif -o ESP_INT8_app/BOOT.BIN -w on
-Then copy that new BOOT.BIN to E:/BOOT.BIN and verify its hash. No BOOT.BIN
-was generated during this preparation; data files alone are not boot firmware.
-Remove obsolete P512N.BIN/O512N.BIN and any stale O512F.BIN before testing.
-Preserve unrelated H240/resize comparison data and validation folders B/C/D/Q.
+Host preparation, existing tools/export_val_hw_dataset.py:
+  1. Export each dataset with --runtime-artifact MODEL.JSN --source-manifest
+     SOURCES.JSON --limit 0 --out-dir NEW_DATASET_DIR. Sources use
+     P7_PREQUANTIZED_VAL_SOURCES_V1, frozen model hash/preprocessing, and
+     properly transformed original or mapped GT. No retraining is done.
+  2. Write a suite spec outside immutable model directories:
+     {"format":"P7_UNIFIED_VAL500_SUITE_V1","datasets":[
+       {"key":"G240B2","dataset":"G240_VAL/manifest.json"},
+       {"key":"R256B20","dataset":"R256_VAL/manifest.json"}]}
+     Paths are relative to the spec file, or absolute. Include genuinely
+     prepared 500-image sets, with unique uppercase 1..8 character keys.
+  3. python -B tools/export_val_hw_dataset.py --board-suite SPEC.JSON
+     --out-dir NEW_BOARD_DIR
+     Preflights identities/order/GT, packages inputs/GT/PARAM without replay
+     or training, and writes the autorun marker VALRUNS.CSV LAST. No E: copy,
+     no overwrite of existing result folders.
+  4. Later copy NEW_BOARD_DIR's CONTENTS to SD root preserving folders, using
+     the freshly built unified ELF/bitstream/firmware, not an old BOOT.BIN.
+
+Static maxima: input=1572864, output=524288, GT=524288, PARAM=262144 bytes.
+Only active lengths are loaded/flushed/invalidated/saved. Sample index is
+bounded at 16 KiB; accuracy counters use 64-bit integers and no heap.

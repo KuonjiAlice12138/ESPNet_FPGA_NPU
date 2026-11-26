@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../include/npu_config.hpp"
+#include "../include/npu_types.hpp"
 
 #include <cstdint>
 
@@ -15,13 +16,22 @@ void espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
                               volatile esp_int8::u8_t& prof_issue_kind,
                               volatile esp_int8::u8_t& prof_conv_win_state,
                               volatile esp_int8::u8_t& prof_conv_sa_state,
-                              volatile esp_int8::u8_t& prof_conv_post_state);
+                              volatile esp_int8::u8_t& prof_conv_post_state,
+                              std::uint32_t model_profile_id,
+                              std::uint32_t& runtime_abi_id,
+                              std::uint32_t& runtime_status,
+                              std::uint32_t src_mode,
+                              std::uint32_t mask_mode,
+                              std::uint32_t& runtime_capability);
 
 inline void call_espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_in,
                                           esp_int8::axi_vec_t* gmem_frame_out,
                                           const esp_int8::axi_vec_t* gmem_param,
                                           std::uint32_t mode,
-                                          std::uint32_t uop_count) {
+                                          std::uint32_t uop_count,
+                                          std::uint32_t model_profile_id = esp_int8::DEFAULT_RUNTIME_PROFILE_ID,
+                                          std::uint32_t src_mode = 0,
+                                          std::uint32_t mask_mode = 0) {
   static volatile esp_int8::u8_t prof_stage_id = 0;
   static volatile ap_uint<1> prof_active = 0;
   static volatile esp_int8::u8_t prof_pc = 0;
@@ -29,6 +39,9 @@ inline void call_espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_
   static volatile esp_int8::u8_t prof_conv_win_state = 0;
   static volatile esp_int8::u8_t prof_conv_sa_state = 0;
   static volatile esp_int8::u8_t prof_conv_post_state = 0;
+  static std::uint32_t runtime_abi_id = 0;
+  static std::uint32_t runtime_status = 0;
+  static std::uint32_t runtime_capability = 0;
   espnet_encoder_int8_core(gmem_frame_in,
                            gmem_frame_out,
                            gmem_param,
@@ -40,5 +53,11 @@ inline void call_espnet_encoder_int8_core(const esp_int8::axi_vec_t* gmem_frame_
                            prof_issue_kind,
                            prof_conv_win_state,
                            prof_conv_sa_state,
-                           prof_conv_post_state);
+                           prof_conv_post_state,
+                           model_profile_id,
+                           runtime_abi_id,
+                           runtime_status,
+                           src_mode,
+                           mask_mode,
+                           runtime_capability);
 }

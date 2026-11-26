@@ -6,12 +6,16 @@
 #include "ff.h"
 #include "xil_printf.h"
 #include "xstatus.h"
+#include "../app_log.h"
+#define xil_printf app_log_printf
 
 #define SD_PATH_BUF_BYTES 128U
 
 static FATFS g_fatfs;
 static int g_mounted = 0;
 static char g_mount_path[8] = {0};
+static FIL g_log_file;
+static int g_log_open;
 
 static int build_path(const char *filename, char *out_path, u32 out_size)
 {
@@ -112,7 +116,8 @@ int SD_LoadFileToMemory(const char *filename, UINTPTR dst, u32 max_bytes,
     }
 
     fr = f_read(&file, (void *)dst, (UINT)file_size, &bytes_read);
-    (void)f_close(&file);
+    FRESULT close_result = f_close(&file);
+    if (fr == FR_OK) fr = close_result;
     if (fr != FR_OK || bytes_read != (UINT)file_size) {
         xil_printf("SD: read failed %s, fr=%d read=%u size=%u\r\n", filename,
                    fr, (u32)bytes_read, (u32)file_size);
@@ -150,7 +155,8 @@ int SD_SaveMemoryToFile(const char *filename, const void *src, u32 byte_size)
     if (fr == FR_OK) {
         fr = f_sync(&file);
     }
-    (void)f_close(&file);
+    FRESULT close_result = f_close(&file);
+    if (fr == FR_OK) fr = close_result;
 
     if (fr != FR_OK || bytes_written != (UINT)byte_size) {
         xil_printf("SD: write failed %s, fr=%d written=%u size=%u\r\n",
@@ -160,4 +166,43 @@ int SD_SaveMemoryToFile(const char *filename, const void *src, u32 byte_size)
 
     xil_printf("SD: saved %s, bytes=%u\r\n", filename, byte_size);
     return XST_SUCCESS;
+}
+
+int SD_LogOpen(char *relative_path, u32 capacity)
+{
+    char directory[SD_PATH_BUF_BYTES],path[SD_PATH_BUF_BYTES];
+    if (!relative_path || capacity<18U || g_log_open ||
+        build_path("LOGS",directory,sizeof(directory))!=XST_SUCCESS) return XST_FAILURE;
+    FRESULT fr=f_mkdir(directory);
+    if (fr!=FR_OK && fr!=FR_EXIST) return XST_FAILURE;
+    for (unsigned i=0;i<10000U;++i) {
+        (void)snprintf(relative_path,capacity,"LOGS/TEST%04u.TXT",i);
+        if (build_path(relative_path,path,sizeof(path))!=XST_SUCCESS) return XST_FAILURE;
+        fr=f_open(&g_log_file,path,FA_CREATE_NEW|FA_WRITE);
+        if (fr==FR_EXIST) continue;
+        if (fr!=FR_OK) return XST_FAILURE;
+        g_log_open=1; return XST_SUCCESS;
+    }
+    return XST_FAILURE;
+}
+
+int SD_LogAppend(const void *data, u32 bytes)
+{
+    UINT written=0;
+    if (!g_log_open || !data || !bytes) return XST_FAILURE;
+    FRESULT fr=f_write(&g_log_file,data,(UINT)bytes,&written);
+    return fr==FR_OK && written==bytes?XST_SUCCESS:XST_FAILURE;
+}
+
+int SD_LogSync(void)
+{
+    return g_log_open && f_sync(&g_log_file)==FR_OK?XST_SUCCESS:XST_FAILURE;
+}
+
+int SD_LogClose(void)
+{
+    if (!g_log_open) return XST_FAILURE;
+    FRESULT fr=f_close(&g_log_file);
+    g_log_open=0;
+    return fr==FR_OK?XST_SUCCESS:XST_FAILURE;
 }

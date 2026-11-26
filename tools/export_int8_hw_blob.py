@@ -12,11 +12,15 @@ the current ESP_INT8_hls implementation.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import math
+import re
 import shutil
 import struct
+import tempfile
+import zlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
@@ -24,7 +28,12 @@ from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 import numpy as np
 import torch
 
-from geometry_contract import DEFAULT_GEOMETRY, DeploymentGeometry, geometry_from_manifest
+from geometry_contract import (
+    DEFAULT_GEOMETRY, DeploymentGeometry, RUNTIME_ABI_ID, RUNTIME_CAPABILITY, RUNTIME_LAYOUT_VERSION, RUNTIME_PROFILES,
+    RuntimeSelection, geometry_from_manifest, profile_for_geometry, runtime_selection,
+    runtime_io_fields,
+    runtime_selection_from_manifest, select_runtime_input, runtime_mask_from_logits, runtime_target_view,
+)
 
 
 PARAM_BLOB_MAGIC = 0x544E4945
@@ -42,9 +51,10 @@ MAX_K_TILE_COUNT = 40
 MAX_PACK_CMDS_PER_KT = 9
 MAX_STAGED_WINDOW_PACK_CMDS = 64
 MAX_WINDOW_PACK_CMD_COUNT = 256
-MAX_FIXED_EXEC_DESC_COUNT = 64
-MAX_EXEC_PLAN_COUNT = 96
+MAX_FIXED_EXEC_DESC_COUNT = 10
+MAX_EXEC_PLAN_COUNT = 16
 MAX_BLOCK5_SCHED_COUNT = 8
+WINDOW_SCHED_DESC_BLOB_BYTES = 128
 
 ACT_NONE = 0
 ACT_RELU = 1
@@ -219,6 +229,170 @@ class MemoryLayout:
     l3_block5_bytes: int
     pool1_bytes: int
     pool2_bytes: int
+
+
+@dataclass(frozen=True)
+class RuntimeMemoryLayout(MemoryLayout):
+    """Offline unified layout; not compatible with the unchanged baseline HLS."""
+
+    profile_id: int
+    b1_base: int
+    l30_base: int
+    out_base: int
+    l2b0_c1_base: int
+    l30_c1_base: int
+    l3b0_c1_base: int
+    l2b0_block5_base: int
+    l30_block5_base: int
+    l3b0_block5_base: int
+    row_group_rows: int
+    b2_backup_base: int
+    b2_backup_rows: int
+
+
+RUNTIME_FMBUF_URAM_BYTES = 0x380000
+RUNTIME_FMBUF_BYTES = 0x530000
+
+
+def build_runtime_memory_layout(geometry: DeploymentGeometry) -> RuntimeMemoryLayout:
+    """Allocate phase-specific workspaces with a single fixed physical RAM split.
+
+    L20 C1/branches reuse the dead frame input. L2B0 uses the high scratch, which
+    becomes the B2 reverse-row backup after all branch consumers have finished.
+    Pool2 is above the complete B2 output, not inside its residual source.
+    """
+    profile = profile_for_geometry(geometry)
+    h, w, c = geometry.input_shape_nhwc
+    h1, w1, h2, w2, h3, w3 = h//2, w//2, h//4, w//4, h//8, w//8
+    stride = lambda width, channels: _align_up(width*channels, 32)
+    primary = h2*stride(w2, 128+c)
+    b1_base = _align_up(h*w*c, 32)
+    b1_bytes = h1*stride(w1, 16+c)
+    residual_base = h2*w2*64
+    l30_base = residual_base
+    l30_bytes = h3*w3*128
+    c1_bytes = h2*stride(w2, 16)
+    l3_c1_bytes = h3*stride(w3, 25)
+    pool1_bytes = h1*stride(w1, c)
+    pool2_bytes = h2*stride(w2, c)
+    pool1_base = _align_up(max(RUNTIME_FMBUF_URAM_BYTES, primary,
+                               b1_base+b1_bytes, residual_base+h2*w2*64), 32)
+    high_scratch = pool1_base+pool2_bytes
+    group = 32
+    l2_workspace = min(group, h2)*sum(stride(w2, ch) for ch in (16, 12, 12, 12, 12))
+    l3_workspace = min(group, h3)*sum(stride(w3, ch) for ch in (28, 25, 25, 25, 25))
+    backup_rows = 1 << (((h2+1)//2)-1).bit_length()
+    return RuntimeMemoryLayout(
+        fmbuf_bytes=RUNTIME_FMBUF_BYTES, uram_bytes=RUNTIME_FMBUF_URAM_BYTES,
+        bram_bytes=RUNTIME_FMBUF_BYTES-RUNTIME_FMBUF_URAM_BYTES,
+        primary_base=0, block5_base=c1_bytes, residual_base=residual_base,
+        c1_scratch_base=0, pool1_base=pool1_base, pool_tmp_base=pool1_base+pool1_bytes,
+        l2_scratch_slot_bytes=c1_bytes, l3_scratch_slot_bytes=l3_c1_bytes,
+        l2_block5_bytes=l2_workspace, l3_block5_bytes=l3_workspace,
+        pool1_bytes=pool1_bytes, pool2_bytes=pool2_bytes,
+        profile_id=profile.profile_id, b1_base=b1_base, l30_base=l30_base,
+        out_base=residual_base, l2b0_c1_base=high_scratch,
+        l30_c1_base=high_scratch, l3b0_c1_base=high_scratch,
+        l2b0_block5_base=high_scratch+c1_bytes, l30_block5_base=0,
+        l3b0_block5_base=l30_base+l30_bytes, row_group_rows=group,
+        b2_backup_base=high_scratch, b2_backup_rows=backup_rows,
+    )
+
+
+def runtime_profile_fields(profile) -> dict[str, int]:
+    g = profile.geometry
+    m = build_runtime_memory_layout(g)
+    return {
+        "profile_id": profile.profile_id,
+        "input_h": g.input_height, "input_w": g.input_width, "input_c": g.input_channels,
+        "logits_h": g.logits_height, "logits_w": g.logits_width,
+        "input_bytes": g.input_bytes, "mask_bytes": g.output_mask_bytes,
+        "b1_base": m.b1_base, "l20_base": m.residual_base, "l30_base": m.l30_base,
+        "out_base": m.out_base, "pool1_base": m.pool1_base, "pool_tmp_base": m.pool_tmp_base,
+        "pool1_bytes": m.pool1_bytes, "pool2_bytes": m.pool2_bytes,
+        "l20_c1_base": m.c1_scratch_base, "l2b0_c1_base": m.l2b0_c1_base,
+        "l30_c1_base": m.l30_c1_base, "l3b0_c1_base": m.l3b0_c1_base,
+        "l2_scratch_slot_bytes": m.l2_scratch_slot_bytes,
+        "l3_scratch_slot_bytes": m.l3_scratch_slot_bytes,
+        "l20_block5_base": m.block5_base, "l2b0_block5_base": m.l2b0_block5_base,
+        "l30_block5_base": m.l30_block5_base, "l3b0_block5_base": m.l3b0_block5_base,
+        "b2_backup_base": m.b2_backup_base, "b2_backup_rows": m.b2_backup_rows,
+        "block5_rows": m.row_group_rows,
+    }
+
+
+def render_runtime_hls_profiles() -> str:
+    """Canonical POD table for the existing HLS configuration header."""
+    fields = tuple(runtime_profile_fields(RUNTIME_PROFILES[0]))
+    lines = ["// BEGIN GENERATED RUNTIME PROFILES", "struct runtime_profile_t {"]
+    lines.extend(f"  std::uint32_t {field};" for field in fields)
+    lines.extend(("};", f"constexpr unsigned RUNTIME_PROFILE_COUNT = {len(RUNTIME_PROFILES)};",
+                  f"constexpr std::uint32_t RUNTIME_ABI_ID = 0x{RUNTIME_ABI_ID:08X}U;",
+                  f"constexpr std::uint32_t RUNTIME_CAPABILITY = 0x{RUNTIME_CAPABILITY:08X}U;",
+                  "constexpr runtime_profile_t RUNTIME_PROFILES[RUNTIME_PROFILE_COUNT] = {"))
+    for profile in RUNTIME_PROFILES:
+        values = ", ".join(f"0x{value:X}U" for value in runtime_profile_fields(profile).values())
+        lines.append(f"  {{{values}}},")
+    lines.extend(("};", "inline bool runtime_profile_lookup(std::uint32_t id, runtime_profile_t& profile) {",
+                  "#pragma HLS INLINE", "  profile = {};",
+                  "  if (id >= RUNTIME_PROFILE_COUNT) { return false; }",
+                  "  profile = RUNTIME_PROFILES[id];", "  return true;", "}",
+                  "// END GENERATED RUNTIME PROFILES"))
+    return "\n".join(lines)
+
+
+def render_runtime_hls_io() -> str:
+    fields = tuple(runtime_io_fields(runtime_selection(0, 2)))
+    lines = ['// BEGIN GENERATED RUNTIME IO', 'struct runtime_io_t {']
+    lines.extend(f"  std::{'int32_t' if field == 'axis_origin' else 'uint32_t'} {field};" for field in fields)
+    lines.extend(('};', 'inline bool runtime_io_lookup(std::uint32_t profile, std::uint32_t source,',
+                  '                              std::uint32_t mask, runtime_io_t& io) {',
+                  '#pragma HLS INLINE', '  io = {};',
+                  '  if (profile >= RUNTIME_PROFILE_COUNT || source > 6U || mask > 1U) { return false; }',
+                  '  switch ((profile << 4) | (source << 1) | mask) {'))
+    for profile in RUNTIME_PROFILES:
+        for source in range(7):
+            for mask in range(2):
+                try:
+                    selection = runtime_selection(profile.profile_id, 2, src_mode=source, mask_mode=mask)
+                except ValueError:
+                    continue
+                key = (profile.profile_id << 4) | (source << 1) | mask
+                values = ', '.join(str(value) for value in runtime_io_fields(selection).values())
+                lines.append(f'    case {key}: io = {{{values}}}; return true;')
+    lines.extend(('    default: return false;', '  }', '}', '// END GENERATED RUNTIME IO'))
+    return '\n'.join(lines)
+
+
+def render_runtime_app_contract() -> str:
+    """Generated C-compatible counterpart of the canonical HLS POD tables."""
+    profiles=render_runtime_hls_profiles().replace('std::','').replace('constexpr ','static const ')
+    profiles=profiles[:profiles.index('inline bool runtime_profile_lookup')]
+    profiles=profiles.replace('struct runtime_profile_t {','typedef struct {').replace('};\nstatic const unsigned',
+        '} runtime_profile_t;\n#define RUNTIME_PROFILE_COUNT 8U\nstatic const unsigned',1)
+    profiles=profiles.replace('static const unsigned RUNTIME_PROFILE_COUNT = 8;\n','')
+    io=render_runtime_hls_io()
+    io=io[io.index('struct runtime_io_t {'):io.index('inline bool runtime_io_lookup')]
+    io=io.replace('struct runtime_io_t {','typedef struct {').replace('std::','').replace('};','} runtime_io_t;')
+    lines=['/* Generated by export_int8_hw_blob.py; do not edit the tables. */',
+           '#ifndef ESP_RUNTIME_PROFILES_H','#define ESP_RUNTIME_PROFILES_H','#include <stdint.h>',
+           profiles.strip(),io.strip(),
+           'static inline int runtime_profile_lookup(uint32_t id, runtime_profile_t *p) {',
+           '  if (!p || id >= RUNTIME_PROFILE_COUNT) return 0;',
+           '  *p=RUNTIME_PROFILES[id]; return 1;','}',
+           'static inline int runtime_io_lookup(uint32_t profile, uint32_t source, uint32_t mask, runtime_io_t *io) {',
+           '  if (!io || profile >= RUNTIME_PROFILE_COUNT || source > 6U || mask > 1U) return 0;',
+           '  switch ((profile << 4) | (source << 1) | mask) {']
+    for profile in RUNTIME_PROFILES:
+        for source in range(7):
+            for mask in range(2):
+                try: selected=runtime_selection(profile.profile_id,2,src_mode=source,mask_mode=mask)
+                except ValueError: continue
+                key=(profile.profile_id<<4)|(source<<1)|mask
+                values=', '.join(str(v) for v in runtime_io_fields(selected).values())
+                lines.append(f'    case {key}: {{ const runtime_io_t value = {{{values}}}; *io=value; return 1; }}')
+    lines.extend(['    default: return 0;','  }','}','#endif',''])
+    return '\n'.join(lines)
 
 
 def build_memory_layout(geometry: DeploymentGeometry = DEFAULT_GEOMETRY) -> MemoryLayout:
@@ -621,36 +795,44 @@ def _check_class_count(classes: int) -> int:
 def build_tensor_plan(
     geometry: DeploymentGeometry = DEFAULT_GEOMETRY,
     classes: int = 2,
+    *,
+    layout: MemoryLayout | None = None,
 ) -> List[TensorDesc]:
     classes = _check_class_count(classes)
     h0, w0 = geometry.input_height, geometry.input_width
     h1, w1 = h0 // 2, w0 // 2
     h2, w2 = h0 // 4, w0 // 4
     ho, wo = geometry.logits_height, geometry.logits_width
-    layout = build_memory_layout(geometry)
+    layout = build_memory_layout(geometry) if layout is None else layout
+    runtime = isinstance(layout, RuntimeMemoryLayout)
+    if runtime and layout.profile_id != profile_for_geometry(geometry).profile_id:
+        raise ValueError("runtime memory layout does not match encoder profile")
+    b1_base = layout.b1_base if runtime else layout.residual_base
+    l30_base = layout.l30_base if runtime else layout.residual_base
+    out_base = layout.out_base if runtime else layout.residual_base
     input_c = geometry.input_channels
     b1_c, b2_c = 16 + input_c, 128 + input_c
-    row_pad = input_c == 1
+    row_pad = runtime or input_c == 1
     return [
         TensorDesc(0, "T_INPUT", BANK_FMEM0, layout.primary_base, h0, w0, input_c, input_c, 0),
-        TensorDesc(1, "T_POOL1", BANK_FMEM0, layout.pool1_base, h1, w1, input_c, input_c, 0),
-        TensorDesc(2, "T_B1_CAT", BANK_FMEM1, layout.residual_base, h1, w1, b1_c, b1_c, 0, row_pad),
-        TensorDesc(3, "T_B1_ACT", BANK_FMEM1, layout.residual_base, h1, w1, b1_c, b1_c, 0, row_pad),
+        TensorDesc(1, "T_POOL1", BANK_FMEM0, layout.pool1_base, h1, w1, input_c, input_c, 0, runtime),
+        TensorDesc(2, "T_B1_CAT", BANK_FMEM1, b1_base, h1, w1, b1_c, b1_c, 0, row_pad),
+        TensorDesc(3, "T_B1_ACT", BANK_FMEM1, b1_base, h1, w1, b1_c, b1_c, 0, row_pad),
         TensorDesc(4, "T_L20_CAT", BANK_FMEM0, layout.residual_base, h2, w2, 64, FMBUF_L20_PHYS_C, FMBUF_L20_C_OFFSET),
         TensorDesc(5, "T_L20_ACT", BANK_FMEM0, layout.residual_base, h2, w2, 64, FMBUF_L20_PHYS_C, FMBUF_L20_C_OFFSET),
         TensorDesc(6, "T_L2B0_CAT", BANK_FMEM0, layout.primary_base, h2, w2, 64, 64, 0),
         TensorDesc(7, "T_L2B0_ACT", BANK_FMEM0, layout.primary_base, h2, w2, 64, 64, 0),
-        TensorDesc(8, "T_POOL2", BANK_BRAM_SCR1, 0x000000, h2, w2, input_c, input_c, 0),
+        TensorDesc(8, "T_POOL2", BANK_BRAM_SCR1, 0x000000, h2, w2, input_c, input_c, 0, runtime),
         TensorDesc(9, "T_B2_CAT", BANK_FMEM0, layout.primary_base, h2, w2, b2_c, b2_c, 0, row_pad),
         TensorDesc(10, "T_B2_ACT", BANK_FMEM0, layout.primary_base, h2, w2, b2_c, b2_c, 0, row_pad),
-        TensorDesc(11, "T_L30_CAT", BANK_FMEM1, layout.residual_base, ho, wo, 128, 128, 0),
-        TensorDesc(12, "T_L30_ACT", BANK_FMEM1, layout.residual_base, ho, wo, 128, 128, 0),
+        TensorDesc(11, "T_L30_CAT", BANK_FMEM1, l30_base, ho, wo, 128, 128, 0),
+        TensorDesc(12, "T_L30_ACT", BANK_FMEM1, l30_base, ho, wo, 128, 128, 0),
         TensorDesc(13, "T_L3B0_CAT", BANK_FMEM0, layout.primary_base, ho, wo, 128, 256, 128),
         TensorDesc(14, "T_L3B0_ACT", BANK_FMEM0, layout.primary_base, ho, wo, 128, 256, 128),
         TensorDesc(15, "T_B3_CAT", BANK_FMEM0, layout.primary_base, ho, wo, 256, 256, 0),
         TensorDesc(16, "T_B3_ACT", BANK_FMEM0, layout.primary_base, ho, wo, 256, 256, 0),
-        TensorDesc(17, "T_OUT", BANK_FMEM0, layout.residual_base, ho, wo, classes, classes, 0, row_pad),
-        TensorDesc(18, "T_POOL_TMP", BANK_BRAM_SCR0, 0x000000, h1, w1, input_c, input_c, 0),
+        TensorDesc(17, "T_OUT", BANK_FMEM0, out_base, ho, wo, classes, classes, 0, row_pad),
+        TensorDesc(18, "T_POOL_TMP", BANK_BRAM_SCR0, 0x000000, h1, w1, input_c, input_c, 0, runtime),
     ]
 
 
@@ -1693,20 +1875,16 @@ def compile_window_row_reuse_word(
     ):
         return 0
 
-    if in_c == 1 and source_w in (240, 512) and stride == 2:
+    if in_c == 1 and source_w in (240, 512, 1024) and stride == 2:
         words = (source_w + TK - 1) // TK
         return WINDOW_ROW_REUSE_STRIDE2_KEEP1 | (words << WINDOW_ROW_REUSE_WORDS_SHIFT)
-    # Preserve offline RGB compilation; it is not a handler in the H240 IP.
     if in_c != 3 or stride != 2:
         return 0
+    if source_w not in (240,512,1024):
+        raise ValueError('first-conv row reuse requires a declared runtime encoder width')
 
     row_bytes = source_w * in_c
-    if row_bytes % TK:
-        raise ValueError(
-            f"row-reuse source row is not {TK}-byte aligned: "
-            f"source_w={source_w} in_c={in_c}"
-        )
-    packed_words = row_bytes // TK
+    packed_words = (row_bytes + TK - 1) // TK
     if packed_words <= 0 or packed_words > WINGEN_NARROW_ROW_WORDS:
         raise ValueError(
             f"row-reuse packed word count out of range: {packed_words}"
@@ -1716,7 +1894,7 @@ def compile_window_row_reuse_word(
 
 def compile_window_transfer_protocol(in_c: int, kernel: int, stride: int,
                                      dilation: int, flags: int) -> int:
-    if kernel != 3 or in_c not in (12, 17, 25):
+    if kernel != 3 or in_c not in (12, 17, 19, 25):
         return WINDOW_TRANSFER_SPATIAL_WORDS
     if in_c == 12 and stride == 1 and dilation == 1 and flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2:
         return WINDOW_TRANSFER_C12_S1_INCREMENTAL
@@ -1729,7 +1907,7 @@ def audit_window_transfer_contract(desc: WindowSchedDesc) -> dict:
     word = desc.reserved[WINDOW_LOADER_ROW_REUSE_WORD]
     protocol = (word >> WINDOW_TRANSFER_PROTOCOL_SHIFT) & WINDOW_TRANSFER_PROTOCOL_MASK
     produced = consumed = 0
-    if desc.kernel == 3 and desc.in_c in (12, 17, 25) and protocol:
+    if desc.kernel == 3 and desc.in_c in (12, 17, 19, 25) and protocol:
         tags = [None] * desc.cache_col_slots
         for issue in range(issues):
             mask = desc.loader_warmup_mask if issue < desc.loader_warmup_issues else desc.loader_steady_mask
@@ -1753,7 +1931,7 @@ def audit_window_transfer_contract(desc: WindowSchedDesc) -> dict:
                 raise ValueError("invalid fixed C12 incremental protocol")
             if produced != 12 + (issues - 1) * 6:
                 raise ValueError("fixed C12 stream length does not match its program")
-    elif desc.kernel == 3 and desc.in_c == 1 and word & WINDOW_ROW_REUSE_MODE_MASK:
+    elif desc.kernel == 3 and desc.in_c in (1, 3) and word & WINDOW_ROW_REUSE_MODE_MASK:
         produced = consumed = 0  # Direct packed-row -> act streams, no spatial FIFO.
     else:
         produced = consumed = 9 * desc.out_w if desc.kernel == 3 and desc.in_c <= 25 else 0
@@ -4107,6 +4285,226 @@ def build_memory_lifetime_audit(
     }
 
 
+def _audit_b2_reverse_rows(tensors: Sequence[TensorDesc], layout: RuntimeMemoryLayout) -> dict:
+    """Trace each source row before a staged reverse-order destination commit.
+
+    A backup slot is populated before its original row is overwritten. Slots
+    cannot be reused until that row is consumed; a row-count bound alone is
+    insufficient to prove a modulo-indexed rolling backup safe.
+    """
+    sources = (tensors[7], tensors[5], tensors[8])
+    dst = tensors[9]
+    rows = dst.h
+    capacity = layout.b2_backup_rows
+    if capacity < 0 or (capacity and capacity & (capacity-1)):
+        raise ValueError("B2 rolling backup row capacity must be zero or a power of two")
+    saved: Dict[int, int] = {}
+    damaged = set()
+    peak = copies = 0
+    for row in reversed(range(rows)):
+        for index, _ in enumerate(sources):
+            if (index, row) in damaged and not (index == 1 and row in saved):
+                raise ValueError(f"B2 source {index} row {row} was overwritten before read")
+        saved.pop(row, None)
+        begin = dst.base_offset+row*dst.row_stride_bytes
+        end = begin+dst.row_stride_bytes
+        for index, src in enumerate(sources):
+            base = layout.pool1_base if src.bank_id == BANK_BRAM_SCR1 else src.base_offset
+            for future in range(row):
+                lo = base+future*src.row_stride_bytes
+                hi = lo+src.row_stride_bytes
+                if begin >= hi or lo >= end:
+                    continue
+                if index != 1:
+                    raise ValueError(f"B2 commit row {row} overlaps unread source {index} row {future}")
+                if future not in saved:
+                    if capacity == 0 or (index, future) in damaged:
+                        raise ValueError("B2 residual requires a valid pre-overwrite backup")
+                    slot = future & (capacity-1)
+                    if slot in saved.values():
+                        raise ValueError("B2 rolling backup slot still holds an unread row")
+                    saved[future] = slot
+                    copies += 1
+                damaged.add((index, future))
+        peak = max(peak, len(saved))
+    if saved:
+        raise ValueError("B2 backup contains unconsumed rows")
+    return {
+        "peak_rows": peak, "copied_rows": copies,
+        "read_write_words": 2*copies*sources[1].row_stride_bytes//AXI_WORD_BYTES,
+    }
+
+
+def audit_runtime_memory(geometry: DeploymentGeometry, classes: int = 2, *,
+                         layout: RuntimeMemoryLayout | None = None) -> dict:
+    """Check all live spans and the B2 row handoff without running convolution."""
+    layout = build_runtime_memory_layout(geometry) if layout is None else layout
+    if (layout.uram_bytes, layout.fmbuf_bytes) != (RUNTIME_FMBUF_URAM_BYTES, RUNTIME_FMBUF_BYTES):
+        raise ValueError("runtime profiles must share the physical FMBUF split")
+    if classes not in (2, 20):
+        raise ValueError("runtime classifier must have 2 or 20 classes")
+    tensors = build_tensor_plan(geometry, classes, layout=layout)
+    uops = build_uops(geometry=geometry, classes=classes)
+    reads: Dict[int, List[int]] = {}
+    writes: Dict[int, List[int]] = {}
+    for index, uop in enumerate(uops):
+        for tid in (uop.src0, uop.src1):
+            reads.setdefault(tid, []).append(index)
+        writes.setdefault(uop.dst, []).append(index)
+    regions = []
+    for tensor in tensors:
+        uses = reads.get(tensor.tensor_id, [])+writes.get(tensor.tensor_id, [])
+        if not uses:
+            continue
+        base = (layout.pool1_base if tensor.bank_id == BANK_BRAM_SCR1 else
+                layout.pool_tmp_base if tensor.bank_id == BANK_BRAM_SCR0 else tensor.base_offset)
+        regions.append(dict(name=tensor.name, tensor_id=tensor.tensor_id, base=base,
+                            end=base+tensor_storage_bytes(tensor), begin=min(uses), last=max(uses)))
+    h2, h3, w2, w3 = geometry.input_height//4, geometry.logits_height, geometry.input_width//4, geometry.logits_width
+    if (layout.l2_scratch_slot_bytes < h2*_align_up(w2*12, 32) or
+            layout.l3_scratch_slot_bytes < h3*_align_up(w3*25, 32) or
+            layout.pool1_bytes < tensor_storage_bytes(tensors[1]) or
+            layout.pool2_bytes < tensor_storage_bytes(tensors[8])):
+        raise ValueError("runtime scratch/pool capacity is smaller than its physical tensor rows")
+    for name, base, size, first, last in (
+        ("L20_C1", layout.c1_scratch_base, layout.l2_scratch_slot_bytes, 7, 20),
+        ("L20_BLOCK5", layout.block5_base, layout.l2_block5_bytes, 8, 20),
+        ("L2B0_C1", layout.l2b0_c1_base, layout.l2_scratch_slot_bytes, 21, 35),
+        ("L2B0_BLOCK5", layout.l2b0_block5_base, layout.l2_block5_bytes, 22, 35),
+        ("L30_C1", layout.l30_c1_base, layout.l3_scratch_slot_bytes, 40, 53),
+        ("L30_BLOCK5", layout.l30_block5_base, layout.l3_block5_bytes, 41, 53),
+        ("L3B0_C1", layout.l3b0_c1_base, layout.l3_scratch_slot_bytes, 54, 68),
+        ("L3B0_BLOCK5", layout.l3b0_block5_base, layout.l3_block5_bytes, 55, 68),
+        ("B2_BACKUP", layout.b2_backup_base, layout.b2_backup_rows*w2*64, 36, 39),
+    ):
+        regions.append(dict(name=name, tensor_id=None, base=base, end=base+size, begin=first, last=last))
+    if layout.row_group_rows <= 0 or layout.row_group_rows > 64:
+        raise ValueError("runtime BLOCK5 row group exceeds the existing 64-row maximum")
+    for channels, width, height, capacity in (
+        ((16, 12, 12, 12, 12), w2, h2, layout.l2_block5_bytes),
+        ((28, 25, 25, 25, 25), w3, h3, layout.l3_block5_bytes),
+    ):
+        required = min(height, layout.row_group_rows)*sum(_align_up(width*c, 32) for c in channels)
+        if required > capacity:
+            raise ValueError("BLOCK5 padded segment rows exceed scratch capacity")
+    in_bounds = all(0 <= r["base"] <= r["end"] <= layout.fmbuf_bytes for r in regions)
+    if not in_bounds:
+        raise ValueError("runtime live span exceeds physical FMBUF capacity")
+    if min(layout.pool1_base, layout.pool_tmp_base) < layout.uram_bytes:
+        raise ValueError("runtime pool must stay in the shared BRAM partition")
+    row_audit = _audit_b2_reverse_rows(tensors, layout)
+    allowed = {frozenset(pair) for pair in ((2, 3), (4, 5), (6, 7), (7, 9), (5, 9),
+                                            (9, 10), (11, 12), (13, 14), (14, 15), (15, 16))}
+    overlaps, unsafe = [], []
+    for index, left in enumerate(regions):
+        for right in regions[index+1:]:
+            if (left["base"] >= right["end"] or right["base"] >= left["end"] or
+                    left["begin"] > right["last"] or right["begin"] > left["last"]):
+                continue
+            record = dict(lhs=left["name"], rhs=right["name"],
+                          span=[max(left["base"], right["base"]), min(left["end"], right["end"])])
+            pair = frozenset((left["tensor_id"], right["tensor_id"]))
+            (overlaps if None not in pair and pair in allowed else unsafe).append(record)
+    if unsafe:
+        raise ValueError(f"unsafe runtime memory lifetime overlap: {unsafe}")
+    extra_groups_l2 = (h2+layout.row_group_rows-1)//layout.row_group_rows-(h2+63)//64
+    extra_groups_l3 = (h3+layout.row_group_rows-1)//layout.row_group_rows-(h3+63)//64
+    return {
+        "layout_version": RUNTIME_LAYOUT_VERSION, "profile_id": layout.profile_id,
+        "regions": regions, "unsafe_overlaps": unsafe, "approved_overlaps": overlaps,
+        "regions_in_bounds": in_bounds, "row_handoffs_safe": True,
+        "backup_peak_rows": row_audit["peak_rows"], "backup_copied_rows": row_audit["copied_rows"],
+        "backup_read_write_words": row_audit["read_write_words"],
+        "extra_branch_weight_words_vs_group64": 2*(extra_groups_l2*4*64+extra_groups_l3*8*128),
+        "traffic_note": "word counts only; cache warmup/control cycles require later RTL profiling",
+        "memory_port_contract": "existing serialized owners; at most one read and one write per backup step",
+    }
+
+
+def runtime_memory_budget() -> dict:
+    """Budget the fixed shared RAM, retaining the entire measured H512 BRAM use.
+
+    457 BRAM18K is the stable H512 physical total (workplan_1110), not zero-cost
+    non-FMBUF logic. Adding all of the new FMBUF double-counts its old pool RAM.
+    The 128-block adapter allowance remains a synthesis gate, not measured area.
+    """
+    words = (RUNTIME_FMBUF_BYTES-RUNTIME_FMBUF_URAM_BYTES)//AXI_WORD_BYTES
+    fmbuf_bram = 8*((words+511)//512)  # 4 x 72-bit RAMB36, rounded in depth
+    measured_baseline = 457
+    adapter_allowance = 128
+    return {
+        "uram": 4*((RUNTIME_FMBUF_URAM_BYTES+0x1FFFF)//0x20000),
+        "fmbuf_bram18k": fmbuf_bram,
+        "other_bram18k_reserve": measured_baseline+adapter_allowance,
+        "measured_baseline_bram18k": measured_baseline,
+        "unverified_adapter_allowance_bram18k": adapter_allowance,
+        "bram18k_upper_bound": fmbuf_bram+measured_baseline+adapter_allowance,
+        "available_bram18k": 1488, "available_uram": 112,
+        "evidence": "pre-synthesis estimate; requires csynth/implementation",
+    }
+
+
+def recompile_runtime_param(source: bytes, selection: RuntimeSelection) -> bytes:
+    """Readdress a frozen model without requantizing or changing its arithmetic.
+
+    The result requires the unified HLS layout/ABI; it must NOT be sent
+    to a baseline IP just because the PARAM record version remains four.
+    No files or compiler-global activation state are changed by this function.
+    """
+    checked = runtime_selection(selection.profile.profile_id, selection.classes,
+                                src_mode=selection.src_mode, mask_mode=selection.mask_mode)
+    if selection.to_manifest() != checked.to_manifest():
+        raise ValueError("runtime selection disagrees with the canonical profile registry")
+    if not PARAM_HEADER_BYTES <= len(source) <= 262144:
+        raise ValueError("source PARAM size is outside the v4 capacity")
+    header = struct.unpack_from("<32I", source)
+    if header[:3] != (PARAM_BLOB_MAGIC, PARAM_BLOB_VERSION_SCHED, 19):
+        raise ValueError("runtime recompile requires the existing 19-tensor PARAM v4 ABI")
+    if (header[4], header[8], header[9]) != (26, 75, 16):
+        raise ValueError("runtime recompile requires the frozen ESPNet execution graph")
+    table, block = header[10], header[30]
+    # Descriptor sections precede weights/qparams; legacy UOP debug is last.
+    section_offsets = [header[index] for index in (10, 11, 22, 23, 24, 25, 26, 27,
+                                                   30, 17, 18, 19, 20, 21, 16)]
+    if (section_offsets != sorted(section_offsets) or
+            any(offset < PARAM_HEADER_BYTES or offset % SECTION_ALIGN or offset > len(source)
+                for offset in section_offsets) or
+            table+19*16 > header[11] or block+4*32 > header[17]):
+        raise ValueError("source PARAM sections are truncated, unaligned or overlapping")
+    geometry = checked.profile.geometry
+    layout = build_runtime_memory_layout(geometry)
+    audit_runtime_memory(geometry, checked.classes, layout=layout)
+    tensors = build_tensor_plan(geometry, checked.classes, layout=layout)
+    for tensor in tensors:
+        old = struct.unpack_from("<BBHIHHHH", source, table+tensor.tensor_id*16)
+        if (old[1] != 1 or old[2] & TENSOR_PHYS_C_MASK != tensor.phys_c or
+                old[4:] != (tensor.h, tensor.w, tensor.c, tensor.c_offset)):
+            raise ValueError(f"source tensor {tensor.tensor_id} geometry/class/view mismatch")
+    result = bytearray(source)
+    result[table:table+19*16] = b"".join(pack_tensor_desc(tensor) for tensor in tensors)
+    for index in range(4):
+        base = block+index*32
+        pattern, branches = struct.unpack_from("<BB", source, base)
+        h, w = struct.unpack_from("<HH", source, base+16)
+        level = 4 if index < 2 else 8
+        expected_pattern = BLOCK5_PATTERN_L2_C16_4C12 if index < 2 else BLOCK5_PATTERN_L3_C28_4C25
+        if (pattern != expected_pattern or branches != 5 or
+                (h, w) != (geometry.input_height//level, geometry.input_width//level)):
+            raise ValueError("source BLOCK5 descriptor does not match the frozen model graph")
+        struct.pack_into("<H", result, base+20, layout.row_group_rows)
+    for index in range(header[28]):
+        base = header[23] + index * WINDOW_SCHED_DESC_BLOB_BYTES
+        if base + WINDOW_SCHED_DESC_BLOB_BYTES > header[24]:
+            raise ValueError("source window schedule section is truncated")
+        in_c = struct.unpack_from("<H", source, base+8)[0]
+        kernel, stride, dilation, flags = source[base+1], source[base+2], source[base+3], source[base+7]
+        protocol = compile_window_transfer_protocol(in_c, kernel, stride, dilation, flags)
+        word = struct.unpack_from("<H", source, base+126)[0]
+        word = (word & ~(WINDOW_TRANSFER_PROTOCOL_MASK << WINDOW_TRANSFER_PROTOCOL_SHIFT)) | (protocol << WINDOW_TRANSFER_PROTOCOL_SHIFT)
+        struct.pack_into("<H", result, base+126, word)
+    return bytes(result)
+
+
 def build_param_audit(
     *,
     geometry: DeploymentGeometry,
@@ -5098,20 +5496,274 @@ def recompile_window_reuse_artifact(source_dir: Path, out_dir: Path) -> dict:
     return load_json(out_dir / "export_manifest.json")
 
 
+def _runtime_file_identity(path: Path, semantics: str) -> dict:
+    data=path.read_bytes()
+    return {'file':path.name,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),
+            'crc32':f'{zlib.crc32(data)&0xffffffff:08X}','semantics':semantics}
+
+
+def validate_runtime_artifact(directory: Path) -> dict:
+    from hw_param_replay import ParamBlob
+    directory=Path(directory)
+    manifest=load_json(directory/'MODEL.JSN')
+    selected=runtime_selection_from_manifest(manifest)
+    for entry in manifest['files'].values():
+        path=directory/entry['file']
+        if path.parent!=directory or not path.is_file() or not re.fullmatch(r'[A-Z0-9_]{1,8}\.[A-Z0-9_]{1,3}',path.name):
+            raise ValueError('invalid runtime artifact file path')
+        identity=_runtime_file_identity(path,entry['semantics'])
+        if identity!=entry:
+            raise ValueError(f'runtime artifact hash/identity mismatch: {path}')
+    blob=ParamBlob(directory/'PARAM.BIN')
+    if blob.geometry!=selected.profile.geometry or blob.class_count!=selected.classes:
+        raise ValueError('runtime PARAM geometry/class count mismatch')
+    data=(directory/'PARAM.BIN').read_bytes()
+    if recompile_runtime_param(data,selected)!=data:
+        raise ValueError('runtime PARAM still has baseline addresses or transport annotations')
+    header=struct.unpack_from('<32I',data)
+    if hashlib.sha256(data[header[17]:header[16]]).hexdigest()!=manifest['provenance']['numeric_sha256']:
+        raise ValueError('runtime weights/qparams identity mismatch')
+    expected={'input':selected.input_bytes,'logits':selected.profile.geometry.logits_height*
+              selected.profile.geometry.logits_width*selected.classes,'mask':selected.mask_bytes}
+    for key,size in expected.items():
+        if manifest['files'][key]['bytes']!=size:
+            raise ValueError(f'runtime artifact size mismatch: {key}')
+    if np.any(np.fromfile(directory/'MASK.BIN',dtype=np.uint8)>=selected.classes):
+        raise ValueError('runtime mask has invalid class IDs')
+    source=np.fromfile(directory/'INPUTQ.BIN',dtype=np.int8).reshape(selected.source_shape)
+    encoder=select_runtime_input(source,selected)
+    if encoder.tobytes()!=(directory/'ENCODER.BIN').read_bytes():
+        raise ValueError('runtime selected encoder input mismatch')
+    logits=np.fromfile(directory/'LOGITS.BIN',dtype=np.int8)
+    if sha256_file(directory/'LOGITS.BIN')!=manifest['provenance']['frozen_logits_sha256'] or \
+            runtime_mask_from_logits(logits,selected).tobytes()!=(directory/'MASK.BIN').read_bytes():
+        raise ValueError('runtime logits/mask identity or interpolation mismatch')
+    return manifest
+
+
+def _publish_runtime_artifact(source_dir: Path, out_dir: Path, *, src_mode: int = 0,
+                             mask_mode: int = 0, source_input: Path | None = None,
+                             frozen_logits: Path | None = None,
+                             source_contract: Path | None = None,
+                             dataset_root: Path | None = None) -> dict:
+    """Publish a frozen trained model for the unified ABI, without changing arithmetic."""
+    from hw_param_replay import ParamBlob, replay_prefix
+    source_dir,out_dir=Path(source_dir).resolve(),Path(out_dir).resolve()
+    if source_dir==out_dir or out_dir.exists():
+        raise ValueError('runtime output must be a new directory, separate from its frozen source')
+    source_manifest=load_json(source_dir/'export_manifest.json')
+    old=ParamBlob(source_dir/'PARAM.BIN')
+    selected=runtime_selection(profile_for_geometry(old.geometry).profile_id,old.class_count,
+                               src_mode=src_mode,mask_mode=mask_mode)
+    original=(source_dir/'PARAM.BIN').read_bytes()
+    original_hash=hashlib.sha256(original).hexdigest()
+    if source_manifest['artifact_hashes']['param']['sha256']!=original_hash:
+        raise ValueError('frozen source PARAM identity disagrees with its manifest')
+    contract=load_json(source_contract) if source_contract is not None else None
+    input_path=Path(source_input) if source_input is not None else source_dir/'input_q.bin'
+    logits_path=Path(frozen_logits) if frozen_logits is not None else source_dir/'golden_output_q.bin'
+    if src_mode:
+        if contract is None or contract.get('param_sha256')!=original_hash:
+            raise ValueError('lite publication requires a source contract bound to the frozen PARAM')
+        if contract.get('golden_authority')!='PARAM_V4_INTEGER_REPLAY':
+            raise ValueError('lite source contract has the wrong golden authority')
+        if 'cases' in contract:
+            entry=next((item for item in contract['cases'] if item['src_mode']==src_mode),None)
+            if entry is None or tuple(entry['shape'])!=selected.source_shape:
+                raise ValueError('lite source geometry disagrees with its source contract')
+            input_hash=entry['sha256']; logits_hash=entry['references']['logits']['sha256']
+            encoder_hash=entry['references']['preprocessed']['sha256']
+        else:
+            if contract.get('source_mode')!=src_mode or tuple(contract['source_shape'])!=selected.source_shape:
+                raise ValueError('lite source geometry disagrees with its source contract')
+            input_hash=contract['files'][input_path.name]['sha256']
+            logits_hash=contract['files'][logits_path.name]['sha256']
+            encoder_hash=contract['files']['Q240.BIN']['sha256']
+    else:
+        input_hash=source_manifest['artifact_hashes']['input']['sha256']
+        logits_hash=source_manifest['artifact_hashes']['golden_output']['sha256']
+        encoder_hash=input_hash
+    if sha256_file(input_path)!=input_hash or sha256_file(logits_path)!=logits_hash:
+        raise ValueError('input/golden identity does not match its frozen contract')
+    input_data=np.fromfile(input_path,dtype=np.int8)
+    if input_data.size!=selected.input_bytes:
+        raise ValueError('runtime input length disagrees with its declared source shape')
+    encoder=select_runtime_input(input_data.reshape(selected.source_shape),selected)
+    if hashlib.sha256(encoder.tobytes()).hexdigest()!=encoder_hash:
+        raise ValueError('runtime selected bytes differ from the frozen encoder input')
+    g=selected.profile.geometry
+    logits=np.fromfile(logits_path,dtype=np.int8)
+    if logits.size!=g.logits_height*g.logits_width*selected.classes:
+        raise ValueError('frozen logits length disagrees with the model geometry')
+    # Only the small declared output set is written; do not copy obsolete debug exports.
+    out_dir.mkdir(parents=True)
+    (out_dir/'PARAM.BIN').write_bytes(recompile_runtime_param(original,selected))
+    (out_dir/'INPUTQ.BIN').write_bytes(input_data.tobytes())
+    (out_dir/'ENCODER.BIN').write_bytes(encoder.tobytes())
+    actual=replay_prefix(ParamBlob(out_dir/'PARAM.BIN'),out_dir/'ENCODER.BIN',74).tensors[17]
+    if actual.tobytes()!=logits.tobytes():
+        raise ValueError('new PARAM replay changed frozen logits; refusing to publish a replacement golden')
+    (out_dir/'LOGITS.BIN').write_bytes(logits.tobytes())
+    runtime_mask_from_logits(logits,selected).tofile(out_dir/'MASK.BIN')
+    sample=load_json(source_dir/'sample_info.json') if (source_dir/'sample_info.json').is_file() else {}
+    preprocessing=dict(source_manifest.get('preprocessing',{}))
+    deployment=dict(source_manifest['deployment'])
+    semantics={'param':'PARAM_v4_unified','input':'source_HWC_int8_prequantized',
+               'encoder':'encoder_HWC_int8_selected','logits':'logits_HWC_int8',
+               'mask':'mask_HW_uint8_logits_then_argmax'}
+    filenames={'param':'PARAM.BIN','input':'INPUTQ.BIN','encoder':'ENCODER.BIN',
+               'logits':'LOGITS.BIN','mask':'MASK.BIN'}
+    target_info={'available':False}
+    target_file=source_dir/'target.npy'
+    if not src_mode and target_file.is_file() and np.load(target_file).size==selected.mask_bytes:
+        target=np.load(target_file).reshape(selected.mask_shape).astype(np.uint8)
+        target_info={'available':True,'sampling':'frozen_model_target_at_encoder_grid'}
+    else:
+        image=sample.get('sample_name','')
+        if dataset_root is not None and image and not Path(image).is_absolute():
+            image=str(Path(dataset_root)/image)
+        label=Path(image.replace('leftImg8bit','gtFine').replace('_gtFine.png','_gtFine_labelTrainIds.png'))
+        if contract is not None and contract.get('original_gt'):
+            label=Path(contract['original_gt'])
+        if label.is_file():
+            import cv2
+            target=cv2.imread(str(label),cv2.IMREAD_UNCHANGED)
+            if target is None: raise ValueError(f'unreadable ground truth: {label}')
+            target=runtime_target_view(target,selected,center_square_source=(
+                bool(preprocessing.get('center_square_crop',False)) if not src_mode else src_mode==3))
+            if selected.classes==2:
+                target=np.where(target==255,255,np.where((target>=13)&(target<=18),0,1)).astype(np.uint8)
+            else:
+                target=np.where(target==255,19,target).astype(np.uint8)
+            target_info={'available':True,'sampling':'half_pixel_nearest_source_then_center_ROI_then_mask',
+                         'original_path':str(label),'original_sha256':sha256_file(label)}
+    if target_info['available']:
+        target.tofile(out_dir/'TARGET.BIN')
+        semantics['target']='mapped_target_HW_uint8'; filenames['target']='TARGET.BIN'
+    header=struct.unpack_from('<32I',original)
+    manifest={'format':'P7_UNIFIED_INT8_ARTIFACT_V1','runtime':selected.to_manifest(),
+        'deployment':deployment,'geometry':g.to_manifest(),'preprocessing':preprocessing,
+        'sample':sample,'target':target_info,
+        'provenance':{'source_artifact_dir':str(source_dir),'source_param_sha256':original_hash,
+            'source_manifest_sha256':sha256_file(source_dir/'export_manifest.json'),
+            'numeric_sha256':hashlib.sha256(original[header[17]:header[16]]).hexdigest(),
+            'source_contract_sha256':sha256_file(source_contract) if source_contract else None,
+            'frozen_logits_sha256':logits_hash,'replay_mismatches':0,
+            'accuracy_status':'frozen_model_readdressed; no new training or accuracy claim'},
+        'files':{key:_runtime_file_identity(out_dir/filename,semantics[key]) for key,filename in filenames.items()}}
+    (out_dir/'MODEL.JSN').write_text(json.dumps(manifest,indent=2,ensure_ascii=False),encoding='utf-8')
+    return validate_runtime_artifact(out_dir)
+
+
+def publish_runtime_artifact(source_dir: Path, out_dir: Path, **options) -> dict:
+    """Atomic publication: a failed replay never leaves a usable partial artifact."""
+    out_dir=Path(out_dir).resolve()
+    source_dir=Path(source_dir).resolve()
+    if source_dir==out_dir or source_dir in out_dir.parents:
+        raise ValueError('runtime output must be separate from its immutable source')
+    if out_dir.exists(): raise ValueError('runtime output must be a new directory')
+    out_dir.parent.mkdir(parents=True,exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.publish-',dir=out_dir.parent) as temp:
+        staged=Path(temp)/'MODEL'
+        manifest=_publish_runtime_artifact(source_dir,staged,**options)
+        staged.rename(out_dir)
+    return manifest
+
+
+RUNTIME_CATALOG_HEADER=('key','profile','classes','source','mask','param','input','output',
+                        'param_crc','input_crc','mask_crc')
+
+
+def validate_runtime_catalog(root: Path) -> list[dict]:
+    root=Path(root)
+    with (root/'RUNS.CSV').open(newline='',encoding='ascii') as stream:
+        reader=csv.DictReader(stream)
+        if tuple(reader.fieldnames or ())!=RUNTIME_CATALOG_HEADER: raise ValueError('runtime catalog header mismatch')
+        rows=list(reader)
+    if not rows or len(rows)>32: raise ValueError('runtime catalog case count outside App capacity')
+    seen=set()
+    for row in rows:
+        key=row['key']
+        if not re.fullmatch('[A-Z0-9_]{1,8}',key) or key in seen: raise ValueError('invalid/duplicate case key')
+        seen.add(key)
+        model=validate_runtime_artifact(root/key); selected=runtime_selection_from_manifest(model)
+        expected=(key,str(selected.profile.profile_id),str(selected.classes),str(selected.src_mode),str(selected.mask_mode),
+                  f'{key}/PARAM.BIN',f'{key}/INPUTQ.BIN',f'{key}/OUT.BIN',
+                  model['files']['param']['crc32'],model['files']['input']['crc32'],model['files']['mask']['crc32'])
+        if tuple(row.values())!=expected: raise ValueError(f'catalog identity mismatch: {key}')
+    return rows
+
+
+def publish_runtime_catalog(root: Path, frozen_root: Path, model_root: Path) -> list[dict]:
+    """Publish only frozen, locally reproducible models; never invent missing models."""
+    root=Path(root).resolve(); frozen_root=Path(frozen_root); model_root=Path(model_root)
+    if root.exists(): raise ValueError('catalog output must be a new directory')
+    root.parent.mkdir(parents=True,exist_ok=True)
+    native=(('G240B2','binary2_int8_h240w240_gray_r6_v4'),
+            ('R256B2','binary2_int8_h256w512_r2_v4'),
+            ('R256B20','cityscapes20_int8_h256w512_r2_v4'),
+            ('G512B2','binary2_int8_h512w512_gray_finetuned_v4'))
+    with tempfile.TemporaryDirectory(prefix='.catalog-',dir=root.parent) as temp:
+        staged=Path(temp)/'RELEASE'; staged.mkdir(); models={}
+        for key,directory in native:
+            models[key]=publish_runtime_artifact(frozen_root/directory,staged/key,dataset_root=model_root)
+        resize=model_root/'resolution_h240w240_gray/input_resize_1023/selected_int8_reference'
+        restore=model_root/'resolution_h240w240_gray/output_restore_1104/selected_reference'
+        for source in (1,2,3):
+            for mask in (0,1):
+                key=f'G2S{source}M{mask}'
+                files=(resize/f'I{256 if source==1 else 512}Q.BIN',resize/f'L{256 if source==1 else 512}.BIN',resize/'RESIZEQ.json') if source<3 else (
+                    restore/'I512S.BIN',restore/'L30.BIN',restore/'RESTORE.json')
+                models[key]=publish_runtime_artifact(frozen_root/native[0][1],staged/key,
+                    src_mode=source,mask_mode=mask,source_input=files[0],frozen_logits=files[1],source_contract=files[2])
+        with (staged/'RUNS.CSV').open('w',newline='',encoding='ascii') as stream:
+            writer=csv.writer(stream,lineterminator='\n'); writer.writerow(RUNTIME_CATALOG_HEADER)
+            for key,model in models.items():
+                s=runtime_selection_from_manifest(model)
+                writer.writerow((key,s.profile.profile_id,s.classes,s.src_mode,s.mask_mode,
+                    f'{key}/PARAM.BIN',f'{key}/INPUTQ.BIN',f'{key}/OUT.BIN',
+                    model['files']['param']['crc32'],model['files']['input']['crc32'],model['files']['mask']['crc32']))
+        availability=[]
+        for profile in RUNTIME_PROFILES:
+            for classes in (2,20):
+                keys=[key for key,m in models.items() if m['runtime']['model_profile_id']==profile.profile_id and m['runtime']['class_count']==classes]
+                availability.append({'profile':profile.profile_id,'classes':classes,'cases':keys,
+                    'status':'frozen_replay_verified_pending_csynth_and_board' if keys else 'unavailable_frozen_model_artifact_not_present'})
+        (staged/'MODELS.JSN').write_text(json.dumps({'runtime_abi_id':RUNTIME_ABI_ID,'capability':RUNTIME_CAPABILITY,
+            'models':availability,'note':'Capability is not trained model availability. RGB maximum/lite fixtures are not deployment models.'},indent=2),encoding='ascii')
+        rows=validate_runtime_catalog(staged)
+        staged.rename(root)
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument('--runtime-from',type=Path,help='Publish a frozen hardware artifact for the unified ABI.')
+    parser.add_argument('--publish-runtime-catalog',action='store_true')
+    parser.add_argument('--emit-app-contract',type=Path)
+    parser.add_argument('--legacy-layout',action='store_true',help='Explicit historical reproduction only; not compatible with the unified IP.')
+    parser.add_argument('--src-mode',type=int,default=0)
+    parser.add_argument('--mask-mode',type=int,default=0)
+    parser.add_argument('--source-input',type=Path)
+    parser.add_argument('--frozen-logits',type=Path)
+    parser.add_argument('--source-contract',type=Path)
+    parser.add_argument('--dataset-root',type=Path,help='Explicit root resolving relative frozen sample/GT paths.')
+    parser.add_argument(
+        "--audit-runtime-memory", action="store_true",
+        help="Read-only unified profile/lifetime/budget audit; never exports or launches HLS.",
+    )
     parser.add_argument(
         "--recompile-window-reuse-from", type=Path,
         help="Schedule-only export from a frozen H256 RGB or native H240/H512 grayscale v4 artifact; never retrains.",
     )
     parser.add_argument(
         "--artifact-dir",
-        default=r"D:\ESP_INT8\quantized_artifacts_hw_constrained_qat_3ep",
+        default=None,
         help="Existing quantized artifact directory produced from D:\\ESPNet.",
     )
     parser.add_argument(
         "--out-dir",
-        default=r"D:\ESP_INT8\hw_artifacts\sched_v4_p7_0702",
+        default=r"D:\ESP_INT8\hw_artifacts\unified_int8",
         help="Hardware-facing output directory.",
     )
     parser.add_argument(
@@ -5141,6 +5793,59 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.emit_app_contract:
+        args.emit_app_contract.write_text(render_runtime_app_contract(),encoding='ascii')
+        return
+    if args.publish_runtime_catalog:
+        rows=publish_runtime_catalog(Path(args.out_dir),Path(__file__).resolve().parents[1]/'hw_artifacts',Path('D:/ESPNet'))
+        print(f'Published {len(rows)} frozen runtime cases to {args.out_dir}')
+        return
+    if args.runtime_from is not None:
+        manifest=publish_runtime_artifact(args.runtime_from,Path(args.out_dir),src_mode=args.src_mode,
+            mask_mode=args.mask_mode,source_input=args.source_input,frozen_logits=args.frozen_logits,
+            source_contract=args.source_contract,dataset_root=args.dataset_root)
+        print(f"Unified artifact: {args.out_dir}; runtime={manifest['runtime']}")
+        return
+
+    if args.audit_runtime_memory:
+        print("pre_csynth_estimate=1 physical_resource_gate_pending=1")
+        print("profile,classes,shape,fmbuf,uram,backup_peak,backup_rw_words,extra_weight_words")
+        checked = 0
+        for profile in RUNTIME_PROFILES:
+            layout = build_runtime_memory_layout(profile.geometry)
+            for classes in (2, 20):
+                audit = audit_runtime_memory(profile.geometry, classes, layout=layout)
+                shape = "x".join(str(value) for value in profile.geometry.input_shape_nhwc)
+                print(f"{profile.profile_id},{classes},{shape},0x{layout.fmbuf_bytes:X},"
+                      f"0x{layout.uram_bytes:X},{audit['backup_peak_rows']},"
+                      f"{audit['backup_read_write_words']},{audit['extra_branch_weight_words_vs_group64']}")
+                checked += 1
+        budget = runtime_memory_budget()
+        if (budget["uram"] > budget["available_uram"] or
+                budget["bram18k_upper_bound"] > budget["available_bram18k"]):
+            raise ValueError(f"unified memory budget exceeds device: {budget}")
+        print(f"checked_profile_class_pairs={checked}")
+        print(f"budget={budget}")
+        return
+
+    if not args.legacy_layout:
+        if args.src_mode or args.mask_mode:
+            parser.error('publish frozen lite inputs with --runtime-from and an explicit --source-contract')
+        if not args.artifact_dir and not args.recompile_window_reuse_from:
+            parser.error('select --runtime-from, --publish-runtime-catalog, or an explicit --artifact-dir')
+        final=Path(args.out_dir).resolve()
+        if final.exists(): raise ValueError('runtime output must be a new directory')
+        final.parent.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='.compile-',dir=final.parent) as temp:
+            args.out_dir=str(Path(temp)/'FROZEN')
+            base=(recompile_window_reuse_artifact(args.recompile_window_reuse_from,Path(args.out_dir))
+                  if args.recompile_window_reuse_from else build_blob_v4(args))
+            parse_and_check_blob_v4(Path(base['param_blob']),load_json(Path(args.out_dir)/'param_audit.json'))
+            publish_runtime_artifact(Path(args.out_dir),final)
+        print(f'Unified artifact: {final}')
+        return
+    if not args.artifact_dir and not args.recompile_window_reuse_from:
+        parser.error('--legacy-layout requires --artifact-dir or --recompile-window-reuse-from')
     manifest = (recompile_window_reuse_artifact(args.recompile_window_reuse_from, Path(args.out_dir))
                 if args.recompile_window_reuse_from is not None else build_blob_v4(args))
     parse_and_check_blob_v4(Path(manifest["param_blob"]), load_json(Path(args.out_dir) / "param_audit.json"))

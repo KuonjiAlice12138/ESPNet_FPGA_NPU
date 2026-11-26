@@ -6,6 +6,18 @@
 #include "xil_printf.h"
 #include "xparameters.h"
 #include "xstatus.h"
+#include <string.h>
+#include "../app_log.h"
+#define xil_printf app_log_printf
+
+#if !defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_MODEL_PROFILE_ID_DATA) || \
+    !defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_SRC_MODE_DATA) || \
+    !defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_MASK_MODE_DATA) || \
+    !defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_RUNTIME_ABI_ID_DATA) || \
+    !defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_RUNTIME_STATUS_DATA) || \
+    !defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_RUNTIME_CAPABILITY_DATA)
+#error "Rebuild the platform/BSP from the unified INT8 IP; legacy AXI-Lite map is unsupported."
+#endif
 
 #if defined(XPAR_NPU_STAGE_COUNTER_0_S00_AXI_BASEADDR)
 #define INT8_STAGE_COUNTER_BASEADDR XPAR_NPU_STAGE_COUNTER_0_S00_AXI_BASEADDR
@@ -390,118 +402,6 @@ static void print_u64_arg(const char *name, u64 value)
     xil_printf("%s=0x%08x%08x ", name, (u32)(value >> 32), (u32)value);
 }
 
-#if defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_STATUS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_HEARTBEAT_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_ACT_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_WGT_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_PSUM_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_OUT_WORDS_DATA) && \
-    defined(XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_HW_VERSION_DATA)
-#define INT8_NPU_HAS_DEBUG_REGS 1
-#else
-#define INT8_NPU_HAS_DEBUG_REGS 0
-#endif
-
-#if INT8_NPU_HAS_DEBUG_REGS
-static const char *debug_phase_name(u32 phase)
-{
-    switch (phase) {
-    case 0U: return "IDLE";
-    case 1U: return "INIT";
-    case 2U: return "PARAM";
-    case 3U: return "IF_DEC";
-    case 4U: return "FM_LOAD";
-    case 5U: return "UOP_FETCH";
-    case 6U: return "POOL";
-    case 7U: return "STORE";
-    case 8U: return "ADD";
-    case 9U: return "AFFINE";
-    case 10U: return "CONV";
-    case 11U: return "DUMP";
-    case 12U: return "FM_STORE";
-    case 13U: return "DONE";
-    case 14U: return "ERROR";
-    default: return "UNKNOWN";
-    }
-}
-
-static const char *debug_opcode_name(u32 opcode)
-{
-    switch (opcode) {
-    case 0U: return "NOP";
-    case 1U: return "LOAD_FM";
-    case 2U: return "CONV";
-    case 3U: return "POOL";
-    case 4U: return "ADD";
-    case 5U: return "AFFINE";
-    case 6U: return "STORE";
-    case 15U: return "END";
-    default: return "UNKNOWN";
-    }
-}
-#endif
-
-static void int8_npu_dump_debug_regs(const Int8NpuContext *ctx, const char *tag)
-{
-#if INT8_NPU_HAS_DEBUG_REGS
-    u32 status;
-    u32 heartbeat;
-    u32 act_words;
-    u32 wgt_words;
-    u32 psum_words;
-    u32 out_words;
-    u32 hw_version;
-    u32 phase;
-    u32 opcode;
-    u32 current_uop;
-    u32 last_done_uop;
-    u32 error_code;
-
-    if (ctx == NULL) {
-        return;
-    }
-
-    status = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_STATUS_DATA);
-    heartbeat = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_HEARTBEAT_DATA);
-    act_words = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_ACT_WORDS_DATA);
-    wgt_words = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_WGT_WORDS_DATA);
-    psum_words = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_PSUM_WORDS_DATA);
-    out_words = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_OUT_WORDS_DATA);
-    hw_version = XEspnet_encoder_int8_core_ReadReg(
-        ctx->ip.Control_BaseAddress,
-        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_DBG_HW_VERSION_DATA);
-
-    phase = status & 0xffU;
-    opcode = (status >> 8) & 0xffU;
-    current_uop = (status >> 16) & 0xffU;
-    last_done_uop = (status >> 24) & 0xffU;
-    error_code = (heartbeat >> 16) & 0xffffU;
-
-    xil_printf("NPU: dbg %s status=0x%08x phase=%u/%s opcode=%u/%s "
-               "cur=%u last=%u hb=%u err=%u\r\n",
-               tag, status, phase, debug_phase_name(phase), opcode,
-               debug_opcode_name(opcode), current_uop, last_done_uop,
-               heartbeat & 0xffffU, error_code);
-    xil_printf("NPU: dbg %s stream act=%u wgt=%u psum=%u out=%u hw=0x%08x\r\n",
-               tag, act_words, wgt_words, psum_words, out_words, hw_version);
-#else
-    (void)ctx;
-    (void)tag;
-#endif
-}
-
 void int8_npu_dump_regs(const Int8NpuContext *ctx, const char *tag)
 {
     u32 ap_ctrl;
@@ -541,7 +441,8 @@ void int8_npu_dump_regs(const Int8NpuContext *ctx, const char *tag)
     print_u64_arg("out", output_addr);
     print_u64_arg("param", param_addr);
     xil_printf("\r\n");
-    int8_npu_dump_debug_regs(ctx, tag);
+    xil_printf("NPU: runtime abi=%08x capability=%08x status=%08x\r\n",
+        int8_npu_runtime_abi(ctx),int8_npu_runtime_capability(ctx),int8_npu_runtime_status(ctx));
 }
 
 int int8_npu_init(Int8NpuContext *ctx)
@@ -553,6 +454,8 @@ int int8_npu_init(Int8NpuContext *ctx)
         return XST_FAILURE;
     }
 
+    memset(ctx,0,sizeof(*ctx));
+    memset(&cfg,0,sizeof(cfg));
 #ifdef SDT
     cfg.Name = (char *)"espnet_encoder_int8_0";
 #else
@@ -692,134 +595,79 @@ int int8_npu_validate_param_header(const Int8ParamBlobHeader *header,
     return XST_SUCCESS;
 }
 
-int int8_npu_validate_deployment_geometry(const u8 *param_blob, u32 param_bytes,
-                                          const Int8ParamBlobHeader *header)
-{
-    const u8 *input;
-    const u8 *logits;
-    u32 input_hw;
-    u32 logits_hw;
-    u32 input_c;
-    u32 logits_c;
 
-    if (param_blob == NULL || header == NULL ||
-        header->tensor_desc_count <= INT8_PARAM_LOGITS_TENSOR_ID ||
-        header->tensor_desc_offset > param_bytes ||
-        header->tensor_desc_count >
-            (param_bytes - header->tensor_desc_offset) / INT8_PARAM_TENSOR_DESC_BYTES) {
-        xil_printf("NPU: invalid deployment tensor section\r\n");
-        return XST_FAILURE;
-    }
-    /* PARAM v4 TID_INPUT/TID_OUT; same-size H240 blobs must not pass this gate. */
-    input = param_blob + header->tensor_desc_offset +
-            INT8_PARAM_INPUT_TENSOR_ID * INT8_PARAM_TENSOR_DESC_BYTES;
-    logits = param_blob + header->tensor_desc_offset +
-             INT8_PARAM_LOGITS_TENSOR_ID * INT8_PARAM_TENSOR_DESC_BYTES;
-    input_hw = read_u32_le(input + 8U);
-    logits_hw = read_u32_le(logits + 8U);
-    input_c = read_u32_le(input + 12U) & 0xffffU;
-    logits_c = read_u32_le(logits + 12U) & 0xffffU;
-    if (input[1] != 1U || logits[1] != 1U ||
-        (input_hw & 0xffffU) != INT8_APP_INPUT_H ||
-        (input_hw >> 16) != INT8_APP_INPUT_W || input_c != INT8_APP_INPUT_C ||
-        (logits_hw & 0xffffU) != INT8_APP_LOGITS_H ||
-        (logits_hw >> 16) != INT8_APP_LOGITS_W ||
-        logits_c != INT8_APP_EXPECTED_CLASS_COUNT) {
-        xil_printf("NPU: incompatible geometry input=%ux%ux%u logits=%ux%ux%u\r\n",
-                   input_hw & 0xffffU, input_hw >> 16, input_c,
-                   logits_hw & 0xffffU, logits_hw >> 16, logits_c);
-        return XST_FAILURE;
+u32 int8_npu_runtime_abi(const Int8NpuContext *ctx) {
+    return XEspnet_encoder_int8_core_ReadReg(ctx->ip.Control_BaseAddress,
+        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_RUNTIME_ABI_ID_DATA);
+}
+u32 int8_npu_runtime_capability(const Int8NpuContext *ctx) {
+    return XEspnet_encoder_int8_core_ReadReg(ctx->ip.Control_BaseAddress,
+        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_RUNTIME_CAPABILITY_DATA);
+}
+u32 int8_npu_runtime_status(const Int8NpuContext *ctx) {
+    return XEspnet_encoder_int8_core_ReadReg(ctx->ip.Control_BaseAddress,
+        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_RUNTIME_STATUS_DATA);
+}
+int int8_npu_select_runtime(Int8NpuContext *ctx,u32 profile,u32 classes,u32 source,u32 mask) {
+    if (!ctx || ctx->blocked) return XST_FAILURE;
+    ctx->selected=ctx->ready=0;
+    if ((classes!=2U && classes!=20U) || !runtime_profile_lookup(profile,&ctx->profile) ||
+        !runtime_io_lookup(profile,source,mask,&ctx->io)) return XST_FAILURE;
+    ctx->classes=classes; ctx->selected=1;
+    return XST_SUCCESS;
+}
+int int8_npu_validate_deployment_geometry(const Int8NpuContext *ctx,const u8 *param_blob,
+                                           u32 param_bytes,const Int8ParamBlobHeader *header) {
+    if (!ctx || !ctx->selected || !param_blob || !header ||
+        header->tensor_desc_count!=19U || header->tensor_desc_offset>param_bytes ||
+        19U*INT8_PARAM_TENSOR_DESC_BYTES>param_bytes-header->tensor_desc_offset) return XST_FAILURE;
+    const u8 *input=param_blob+header->tensor_desc_offset;
+    const u8 *logits=input+INT8_PARAM_LOGITS_TENSOR_ID*INT8_PARAM_TENSOR_DESC_BYTES;
+    u32 in_hw=read_u32_le(input+8),out_hw=read_u32_le(logits+8);
+    if (input[1]!=1U || logits[1]!=1U || (in_hw&65535U)!=ctx->profile.input_h ||
+        (in_hw>>16)!=ctx->profile.input_w || (read_u32_le(input+12)&65535U)!=ctx->profile.input_c ||
+        (out_hw&65535U)!=ctx->profile.logits_h || (out_hw>>16)!=ctx->profile.logits_w ||
+        (read_u32_le(logits+12)&65535U)!=ctx->classes) {
+        xil_printf("NPU: PARAM/profile geometry or class count mismatch\r\n"); return XST_FAILURE;
     }
     return XST_SUCCESS;
 }
 
-int int8_npu_read_exec_plan_entry(const u8 *param_blob, u32 param_bytes,
-                                  const Int8ParamBlobHeader *header,
-                                  u32 index, Int8ExecPlanEntry *entry)
-{
-    u32 offset;
-
-    if (param_blob == NULL || header == NULL || entry == NULL ||
-        index >= header->exec_plan_count) {
-        return XST_FAILURE;
-    }
-    offset = header->exec_plan_offset + index * INT8_EXEC_PLAN_ENTRY_BYTES;
-    if (offset < header->exec_plan_offset ||
-        offset + INT8_EXEC_PLAN_ENTRY_BYTES > param_bytes) {
-        return XST_FAILURE;
-    }
-
-    entry->kind = param_blob[offset + 0U];
-    entry->desc_id = param_blob[offset + 1U];
-    entry->logical_uop_id = param_blob[offset + 2U];
-    entry->flags = param_blob[offset + 3U];
-    return XST_SUCCESS;
-}
-
-static int wait_done(Int8NpuContext *ctx, u32 timeout_polls, const char *tag)
-{
-    u32 i;
-#if INT8_NPU_LIVE_DEBUG_INTERVAL_POLLS > 0U
-    u32 next_live_poll = INT8_NPU_LIVE_DEBUG_INTERVAL_POLLS;
-#endif
-
-    for (i = 0U; i < timeout_polls; ++i) {
-        if (XEspnet_encoder_int8_core_IsDone(&ctx->ip)) {
-#if !INT8_APP_QUIET_PERF
-            xil_printf("NPU: done %s, ap_ctrl=0x%08x\r\n", tag,
-                       int8_npu_read_ap_ctrl(ctx));
-            int8_npu_dump_regs(ctx, tag);
-#endif
-            return XST_SUCCESS;
-        }
-#if INT8_NPU_LIVE_DEBUG_INTERVAL_POLLS > 0U && !INT8_APP_QUIET_PERF
-        if (i == next_live_poll) {
-            xil_printf("NPU: wait %s poll=%u ap_ctrl=0x%08x\r\n", tag, i,
-                       int8_npu_read_ap_ctrl(ctx));
-            int8_npu_dump_debug_regs(ctx, tag);
-            if (next_live_poll <=
-                timeout_polls - INT8_NPU_LIVE_DEBUG_INTERVAL_POLLS) {
-                next_live_poll += INT8_NPU_LIVE_DEBUG_INTERVAL_POLLS;
-            } else {
-                next_live_poll = timeout_polls;
-            }
-        }
-#endif
-    }
-
-    xil_printf("NPU: timeout in %s, ap_ctrl=0x%08x\r\n", tag,
-               int8_npu_read_ap_ctrl(ctx));
-    int8_npu_dump_regs(ctx, tag);
-    return XST_FAILURE;
-}
-
-static int run_once(Int8NpuContext *ctx, u32 mode, UINTPTR input_addr,
-                    UINTPTR output_addr, UINTPTR param_addr, u32 uop_count,
-                    u32 timeout_polls, const char *tag)
-{
-    if (ctx == NULL) {
-        return XST_FAILURE;
-    }
-    if (!XEspnet_encoder_int8_core_IsReady(&ctx->ip)) {
-        xil_printf("NPU: not ready before %s, ap_ctrl=0x%08x\r\n", tag,
-                   int8_npu_read_ap_ctrl(ctx));
-        return XST_FAILURE;
-    }
-
-    XEspnet_encoder_int8_core_Set_gmem_frame_in(&ctx->ip, (u64)input_addr);
-    XEspnet_encoder_int8_core_Set_gmem_frame_out(&ctx->ip, (u64)output_addr);
-    XEspnet_encoder_int8_core_Set_gmem_param(&ctx->ip, (u64)param_addr);
-    XEspnet_encoder_int8_core_Set_mode(&ctx->ip, mode);
-    XEspnet_encoder_int8_core_Set_uop_count(&ctx->ip, uop_count);
-
-#if !INT8_APP_QUIET_PERF
-    xil_printf("NPU: start %s mode=0x%08x uops=0x%08x\r\n", tag, mode,
-               uop_count);
-    int8_npu_dump_regs(ctx, tag);
-#endif
+static int run_once(Int8NpuContext *ctx,u32 mode,UINTPTR input_addr,UINTPTR output_addr,
+                    UINTPTR param_addr,u32 uop_count,u32 timeout_polls,const char *tag) {
+    if (!ctx || ctx->blocked || !ctx->selected || (mode==INT8_NPU_MODE_RUN && !ctx->ready) ||
+        !param_addr || uop_count!=INT8_EXPECTED_UOP_COUNT ||
+        !XEspnet_encoder_int8_core_IsReady(&ctx->ip)) return XST_FAILURE;
+    if (mode==INT8_NPU_MODE_INIT) ctx->ready=0;
+    XEspnet_encoder_int8_core_Set_gmem_frame_in(&ctx->ip,(u64)input_addr);
+    XEspnet_encoder_int8_core_Set_gmem_frame_out(&ctx->ip,(u64)output_addr);
+    XEspnet_encoder_int8_core_Set_gmem_param(&ctx->ip,(u64)param_addr);
+    XEspnet_encoder_int8_core_Set_mode(&ctx->ip,mode);
+    XEspnet_encoder_int8_core_Set_uop_count(&ctx->ip,uop_count);
+    XEspnet_encoder_int8_core_WriteReg(ctx->ip.Control_BaseAddress,
+        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_MODEL_PROFILE_ID_DATA,ctx->profile.profile_id);
+    XEspnet_encoder_int8_core_WriteReg(ctx->ip.Control_BaseAddress,
+        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_SRC_MODE_DATA,ctx->io.src_mode);
+    XEspnet_encoder_int8_core_WriteReg(ctx->ip.Control_BaseAddress,
+        XESPNET_ENCODER_INT8_CORE_CONTROL_ADDR_MASK_MODE_DATA,ctx->io.mask_mode);
     XEspnet_encoder_int8_core_Start(&ctx->ip);
-
-    return wait_done(ctx, timeout_polls, tag);
+    for (u32 poll=0;poll<timeout_polls;++poll) {
+        if (XEspnet_encoder_int8_core_IsDone(&ctx->ip)) {
+            const u32 status=int8_npu_runtime_status(ctx);
+            if (int8_npu_runtime_abi(ctx)!=RUNTIME_ABI_ID ||
+                int8_npu_runtime_capability(ctx)!=RUNTIME_CAPABILITY ||
+                status!=((ctx->profile.profile_id<<16)|1U)) {
+                ctx->ready=0;
+                xil_printf("NPU: %s runtime ABI/capability/status rejected\r\n",tag);
+                int8_npu_dump_regs(ctx,tag); return XST_FAILURE;
+            }
+            ctx->ready=1; return XST_SUCCESS;
+        }
+    }
+    ctx->blocked=1; ctx->ready=0;
+    xil_printf("NPU: timeout in %s; reset the hardware before retrying\r\n",tag);
+    int8_npu_dump_regs(ctx,tag);
+    return XST_FAILURE;
 }
 
 int int8_npu_run_init(Int8NpuContext *ctx, UINTPTR param_addr, u32 uop_count,

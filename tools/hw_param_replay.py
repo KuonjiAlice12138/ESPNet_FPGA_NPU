@@ -167,7 +167,7 @@ def window_row_reuse_contract_valid(
     protocol = (word >> WINDOW_TRANSFER_PROTOCOL_SHIFT) & WINDOW_TRANSFER_PROTOCOL_MASK
     expected = (1 if desc.in_c == 12 and desc.stride == desc.dilation == 1 and
                 desc.flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2 else 2)
-    if protocol and (desc.kernel != 3 or desc.in_c not in (12, 17, 25) or
+    if protocol and (desc.kernel != 3 or desc.in_c not in (12, 17, 19, 25) or
                      protocol != expected or desc.loader_class != WIN_LOADER_3X3_NARROW):
         return False
     if protocol:
@@ -186,7 +186,7 @@ def window_row_reuse_contract_valid(
     if mode == WINDOW_ROW_REUSE_NONE:
         return words == 0
     if desc.mode == WIN_MODE_3X3_STAGED_C1:
-        common = (mode == WINDOW_ROW_REUSE_STRIDE2_KEEP1 and (words, desc.out_w) in ((8, 120), (16, 256)) and protocol == 0
+        common = (mode == WINDOW_ROW_REUSE_STRIDE2_KEEP1 and (words, desc.out_w) in ((8, 120), (16, 256), (32, 512)) and protocol == 0
                   and desc.kernel == 3 and desc.in_c == 1 and desc.stride == 2
                   and desc.dilation == 1 and desc.padding == 1 and desc.k_tiles == 1
                   and desc.loader_class == WIN_LOADER_3X3_NARROW
@@ -194,7 +194,9 @@ def window_row_reuse_contract_valid(
         if not common or conv is None or src is None:
             return False
         width = 2 * desc.out_w
-        return (src.h == src.w == conv.in_h == conv.in_w == width and src.c == src.phys_c == 1
+        return (src.h == conv.in_h and src.w == conv.in_w == width and
+                (src.h, src.w) in ((240, 240), (256, 512), (512, 512), (512, 1024)) and
+                src.c == src.phys_c == 1
                 and src.row_stride_bytes == width and src.elem_bytes == 1 and src.c_offset == 0
                 and src.base_offset % 32 == 0 and 0 < conv.out_c <= 16
                 and all(getattr(conv, f) == getattr(desc, f) for f in
@@ -218,7 +220,7 @@ def window_row_reuse_contract_valid(
         src.h > 0 and src.w > 0 and src.c == 3 and src.phys_c == 3
         and src.elem_bytes == 1 and src.c_offset == 0 and src.base_offset % 32 == 0
         and src.h == conv.in_h and src.w == conv.in_w
-        and row_bytes % 32 == 0 and row_bytes // 32 == words
+        and (row_bytes + 31) // 32 == words
         and conv.out_c > 0 and conv.out_c <= 16
         and all(getattr(conv, field) == getattr(desc, field)
                 for field in ("in_c", "kernel", "stride", "dilation", "padding", "k_tiles"))
@@ -778,21 +780,31 @@ class ParamBlob:
 # ── on-chip feature memory ─────────────────────────────────
 class FeatureMemory:
     """Minimal on-chip FMBUF simulation for replay."""
-    def __init__(self, capacity_bytes: int = FMBUF_BYTES):
+    def __init__(self, capacity_bytes: int | None = None, *, layout=None):
+        if layout is not None and capacity_bytes is not None:
+            raise ValueError("choose a layout or an explicit capacity, not both")
+        capacity_bytes = int(layout.fmbuf_bytes) if layout is not None else (
+            FMBUF_BYTES if capacity_bytes is None else int(capacity_bytes))
         if capacity_bytes <= 0:
             raise ValueError("feature memory capacity must be positive")
+        self.pool1_base = int(layout.pool1_base) if layout is not None else FMBUF_POOL1_BASE
+        self.pool_tmp_base = int(layout.pool_tmp_base) if layout is not None else FMBUF_POOL_TMP_BASE
+        if layout is not None:
+            for base, size in ((self.pool1_base, int(layout.pool1_bytes)),
+                               (self.pool_tmp_base, int(layout.pool1_bytes))):
+                if base < 0 or size < 0 or base+size > capacity_bytes:
+                    raise ValueError("pool span exceeds feature memory layout")
         self.buf = np.zeros(capacity_bytes, dtype=np.uint8)
 
     def check_span(self, offset: int, count: int) -> None:
         if offset < 0 or count < 0 or offset + count > self.buf.size:
             raise ValueError(f"feature memory span {offset}+{count} exceeds {self.buf.size}")
 
-    @staticmethod
-    def physical_base(desc: TensorDesc) -> int:
+    def physical_base(self, desc: TensorDesc) -> int:
         if int(desc.bank_id) == BANK_BRAM_SCR0:
-            return FMBUF_POOL_TMP_BASE + int(desc.base_offset)
+            return self.pool_tmp_base + int(desc.base_offset)
         if int(desc.bank_id) == BANK_BRAM_SCR1:
-            return FMBUF_POOL1_BASE + int(desc.base_offset)
+            return self.pool1_base + int(desc.base_offset)
         return int(desc.base_offset)
 
     def load_tile(self, desc: TensorDesc, h: int, w: int, c_begin: int, count: int) -> np.ndarray:
@@ -911,14 +923,27 @@ def replay_conv_array(blob: ParamBlob, param_id: int, src: np.ndarray) -> np.nda
     out_w = math.ceil(desc.in_w / stride_val)
     out_c = int(desc.out_c)
 
-    src_desc = TensorDesc(base_offset=0, h=desc.in_h, w=desc.in_w, c=desc.in_c, reserved0=desc.in_c)
-    src_bytes = int(desc.in_h) * int(desc.in_w) * int(desc.in_c)
-    dst_base = ((src_bytes + 63) // 64) * 64
-    dst_desc = TensorDesc(base_offset=dst_base, h=out_h, w=out_w, c=out_c, reserved0=out_c)
-    fmem = FeatureMemory(dst_base + out_h * out_w * out_c)
-    _write_array_to_fmem(fmem, src_desc, src)
-    replay_conv(fmem, blob, param_id, src_desc, dst_desc, RowConsumerDesc())
-    return fmem.dump_tensor(dst_desc)
+    import torch
+    k=int(desc.kernel)*int(desc.kernel)*int(desc.in_c)
+    if k*128*128 >= 2**31:
+        raise ValueError('replay convolution exceeds the supported INT32 accumulation bound')
+    weights=np.stack([np.concatenate([blob.get_packed_weight_tile(param_id,oc,kt)
+        for kt in range(desc.k_tiles)])[:k] for oc in range(out_c)])
+    weights=weights.reshape(out_c,desc.kernel,desc.kernel,desc.in_c).transpose(0,3,1,2).copy()
+    tensor=torch.from_numpy(np.ascontiguousarray(src.transpose(2,0,1))).to(torch.float64)[None]
+    # Float64 exactly represents every bounded integer product/sum; requantization stays integer.
+    with torch.no_grad():
+        accum=torch.nn.functional.conv2d(tensor,torch.from_numpy(weights).to(torch.float64),
+            stride=stride_val,padding=desc.padding,dilation=desc.dilation)
+    accum=accum[0].permute(1,2,0).numpy().astype(np.int32)
+    if accum.shape!=(out_h,out_w,out_c):
+        raise ValueError('convolution output geometry disagrees with PARAM')
+    bias,mult,shift=blob.conv_qparam[desc.qparam_id]
+    result=np.empty(accum.shape,dtype=np.int8)
+    for c in range(out_c):
+        result[:,:,c]=requant_i32_to_i8(accum[:,:,c],bias[c],mult[c],shift[c],
+            ACT_RELU if desc.flags&FLAG_RELU_EN else ACT_NONE)
+    return result
 
 
 def replay_affine_array(blob: ParamBlob,
@@ -1451,8 +1476,9 @@ def replay_conv(fmem: FeatureMemory, blob: ParamBlob, param_id: int, src_desc: T
 # ── main ────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Offline P7 PARAM replay")
-    parser.add_argument("--param", type=Path, required=True)
-    parser.add_argument("--input", type=Path, required=True)
+    parser.add_argument("--runtime-artifact",type=Path,help="Validate MODEL.JSN and replay its selected encoder input.")
+    parser.add_argument("--param", type=Path)
+    parser.add_argument("--input", type=Path)
     parser.add_argument(
         "--dump-dir",
         type=Path,
@@ -1475,6 +1501,16 @@ def main():
     )
     args = parser.parse_args()
 
+    runtime=None
+    if args.runtime_artifact:
+        if args.param or args.input: parser.error('--runtime-artifact cannot be mixed with --param/--input')
+        from export_int8_hw_blob import validate_runtime_artifact
+        from geometry_contract import runtime_selection_from_manifest
+        runtime=runtime_selection_from_manifest(validate_runtime_artifact(args.runtime_artifact))
+        args.param=args.runtime_artifact/'PARAM.BIN'
+        args.input=args.runtime_artifact/'ENCODER.BIN'
+    elif args.param is None or args.input is None:
+        parser.error('use --runtime-artifact, or explicit --param and --input')
     blob = ParamBlob(args.param)
     input_desc = blob.tensor_desc[0]
     input_data = np.fromfile(args.input, dtype=np.int8)
@@ -1504,6 +1540,15 @@ def main():
     if 17 in replay.tensors:
         output = replay.tensors[17]
         print(f"T_OUT: shape={output.shape} bytes={output.nbytes}")
+        if runtime is not None:
+            from geometry_contract import runtime_mask_from_logits
+            golden=np.fromfile(args.runtime_artifact/'LOGITS.BIN',dtype=np.int8).reshape(output.shape)
+            mask=runtime_mask_from_logits(output,runtime)
+            golden_mask=np.fromfile(args.runtime_artifact/'MASK.BIN',dtype=np.uint8).reshape(mask.shape)
+            logits_errors=int(np.count_nonzero(output!=golden))
+            mask_errors=int(np.count_nonzero(mask!=golden_mask))
+            print(f'Runtime replay: logits_mismatches={logits_errors} mask_mismatches={mask_errors}')
+            if logits_errors or mask_errors: raise ValueError('runtime replay disagrees with frozen golden')
         if args.output is not None:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             np.ascontiguousarray(output, dtype=np.int8).tofile(args.output)

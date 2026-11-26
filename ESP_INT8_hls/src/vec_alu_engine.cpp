@@ -23,15 +23,18 @@ bool conv_store_row_contiguous_plan_ok(const tensor_desc_t& dst,
                                        u16_t valid_c);
 bool resolve_tensor_read(u8_t tensor_id, tensor_desc_t& desc);
 bool resolve_tensor_write(u8_t tensor_id, u16_t h, u16_t w, u16_t c, tensor_desc_t& desc);
+bool b2_src1_row_base(const tensor_desc_t& src, u16_t row, u32_t& base);
+bool backup_b2_src1_rows_before_write(const tensor_desc_t& src,
+                                      const tensor_desc_t& dst, u16_t row);
 
 static axi_vec_t s_shared_row_contig_words[ROW_CONTIG_MAX_WORDS];
 
 constexpr int VEC_AFF_HALF_LANES = TM / 2;
 constexpr int VEC_AFF_HALF_COUNT = TM / VEC_AFF_HALF_LANES;
 constexpr int VEC_AFF_RESIDENT_BLOCKS = MAX_C_TILE_COUNT;
-constexpr int VEC_MAX_ROW_TILES = (INPUT_FRAME_W / 4) * ((ROW_CONTIG_MAX_C + TM - 1) / TM);
+constexpr int VEC_MAX_ROW_TILES = (MAX_INPUT_FRAME_W / 4) * ((ROW_CONTIG_MAX_C + TM - 1) / TM);
 static_assert(VEC_MAX_ROW_TILES < 2048, "Vec tile counter is 11 bits");
-static_assert(ROW_CONTIG_MAX_WORDS < 1024, "Vec commit counter is 10 bits");
+static_assert(ROW_CONTIG_MAX_WORDS < 2048, "Vec commit counter is 11 bits");
 static_assert(MAX_FM_W <= ROW_CONTIG_MAX_WORDS, "Aligned Vec row fits the shared buffer");
 
 using vec_aff_half_t = ap_uint<VEC_AFF_HALF_LANES * 8>;
@@ -383,7 +386,7 @@ static bool vec_stage_compact_word(const act_vec_t& out_packed,
                                     u8_t lanes,
                                     u32_t& carry, ap_uint<2>& carry_bytes,
                                     vec_affine_group_buffer_t& groups,
-                                    ap_uint<3>& slot, ap_uint<10>& word_index,
+                                    ap_uint<3>& slot, ap_uint<11>& word_index,
                                     unsigned row_word_count) {
 #pragma HLS INLINE
   const unsigned lane_count = lanes.to_uint();
@@ -433,7 +436,7 @@ static bool vec_stage_compact_word(const act_vec_t& out_packed,
 
 static bool vec_finish_compact_row(u32_t carry, ap_uint<2> carry_bytes,
                                     vec_affine_group_buffer_t& groups,
-                                    unsigned slot, ap_uint<10>& word_index,
+                                    unsigned slot, ap_uint<11>& word_index,
                                     unsigned row_word_count) {
 #pragma HLS INLINE
   if (carry_bytes != 0U) {
@@ -486,6 +489,10 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
   if (row_contiguous == cblock_major) {
     return ERR_UOP_DECODE;
   }
+  const bool b2_backup = desc.dst_tensor.to_uint() == static_cast<unsigned>(TID_B2_ACT);
+  if (b2_backup && (!row_contiguous || !has_src2 || src0.c != 64 || src1.c != 64)) {
+    return ERR_TENSOR_DESC_RANGE;
+  }
 
   i32_t qmul[TM][VEC_AFF_RESIDENT_BLOCKS];
   i32_t qbias[TM][VEC_AFF_RESIDENT_BLOCKS];
@@ -504,7 +511,7 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
   const int outer_count = cblock_major ? c_blocks : h_count;
   const int tile_service_count = cblock_major ? w_count : w_count * c_blocks;
   if (tile_service_count > VEC_MAX_ROW_TILES) { return ERR_TENSOR_DESC_RANGE; }
-  const ap_uint<10> commit_word_count = static_cast<ap_uint<10>>(
+  const ap_uint<11> commit_word_count = static_cast<ap_uint<11>>(
       row_contiguous ? row_word_count : w_count);
   const int rows_per_outer = cblock_major ? h_count : 1;
   const u32_t stride0 = tensor_row_stride_bytes(src0);
@@ -536,7 +543,10 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
     const int row_h_i = h_count - 1 - outer;
     const int first_h = cblock_major ? 0 : row_h_i;
     const u32_t source_row0 = base0 + static_cast<u32_t>(first_h) * stride0;
-    const u32_t source_row1 = base1 + static_cast<u32_t>(first_h) * stride1;
+    u32_t source_row1 = base1 + static_cast<u32_t>(first_h) * stride1;
+    if (b2_backup && !b2_src1_row_base(src1, static_cast<u16_t>(first_h), source_row1)) {
+      return ERR_BANK_OVERFLOW;
+    }
     const u32_t source_row2 = base2 + static_cast<u32_t>(first_h) * stride2;
     vec_source_span_t aligned_source = {0, 0, 0, 0, 0};
     if (cblock_major &&
@@ -560,7 +570,7 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
       u32_t packed_carry = 0;
       ap_uint<2> packed_carry_bytes = 0;
       ap_uint<3> packed_group_slot = 0;
-      ap_uint<10> packed_word_idx = 0;
+      ap_uint<11> packed_word_idx = 0;
 
       // Stage a compact row or one aligned channel-block row before any writeback.
       VEC_AFFINE_TILES:
@@ -609,11 +619,14 @@ static error_code_t run_fixed_affine_common(const fixed_exec_desc_t& desc,
               packed_word_idx, static_cast<unsigned>(row_word_count))) {
         return ERR_BANK_OVERFLOW;
       }
+      if (b2_backup && !backup_b2_src1_rows_before_write(src1, dst, static_cast<u16_t>(first_h))) {
+        return ERR_BANK_OVERFLOW;
+      }
 
       // One local BRAM read and one independent destination write per word.
       u32_t commit_offset = dst_row + static_cast<u32_t>(cblock_major ? outer * TM : 0);
       VEC_COMMIT_WORDS:
-      for (ap_uint<10> word = 0; word < ROW_CONTIG_MAX_WORDS; ++word) {
+      for (ap_uint<11> word = 0; word < ROW_CONTIG_MAX_WORDS; ++word) {
 #pragma HLS PIPELINE II=1
         if (word.to_uint() >= commit_word_count.to_uint()) { break; }
         const axi_vec_t packed = s_shared_row_contig_words[word.to_uint()];

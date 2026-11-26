@@ -9,5 +9,9 @@ int SD_FileExists(const char *filename);
 int SD_LoadFileToMemory(const char *filename, UINTPTR dst, u32 max_bytes,
                          u32 *byte_size);
 int SD_SaveMemoryToFile(const char *filename, const void *src, u32 byte_size);
+int SD_LogOpen(char *relative_path, u32 capacity);
+int SD_LogAppend(const void *data, u32 bytes);
+int SD_LogSync(void);
+int SD_LogClose(void);
 
 #endif

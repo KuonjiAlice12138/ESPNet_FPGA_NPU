@@ -7,7 +7,11 @@ namespace esp_int8 {
 static param_blob_header_t s_header;
 static tensor_desc_t s_tensor_desc[MAX_TENSOR_DESC_COUNT];
 static conv_qparam_t s_conv_qparam[MAX_CONV_PARAM_DESC_COUNT];
-static affine_qparam_t s_affine_qparam[MAX_AFFINE_PARAM_DESC_COUNT][8];
+constexpr int AFFINE_CACHE_GROUPS = TM / 4;
+constexpr int AFFINE_CACHE_DEPTH = 32;
+// Four complete 80-bit lane records per word. Address nets terminate at BRAMs,
+// rather than driving separately inferred memories for every scalar field.
+static ap_uint<320> s_affine_qparam_words[AFFINE_CACHE_GROUPS][AFFINE_CACHE_DEPTH];
 static u8_t s_affine_qparam_count[MAX_AFFINE_PARAM_DESC_COUNT];
 static add_qparam_t s_add_qparam[MAX_ADD_PARAM_DESC_COUNT];
 static pool_qparam_t s_pool_qparam[MAX_POOL_PARAM_DESC_COUNT];
@@ -22,31 +26,77 @@ static u32_t s_weight_bytes = 0;
 static bool s_ready = false;
 static u32_t s_param_generation = 0;
 
-static const unsigned k_v3_affine_blocks[MAX_AFFINE_PARAM_DESC_COUNT] = {1, 2, 2, 5, 4, 4, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+static constexpr unsigned k_affine_qparam_blocks[MAX_AFFINE_PARAM_DESC_COUNT] = {1, 2, 2, 5, 4, 4, 8};
+static constexpr unsigned k_affine_qparam_base[MAX_AFFINE_PARAM_DESC_COUNT] = {0, 1, 3, 5, 10, 14, 18};
+static_assert(MAX_AFFINE_PARAM_DESC_COUNT == 7 && TM == 32 && AFFINE_CACHE_DEPTH >= 26,
+              "Packed affine cache must cover every v4 coefficient block");
+static_assert(k_affine_qparam_base[6] + k_affine_qparam_blocks[6] <= AFFINE_CACHE_DEPTH,
+              "The last affine block must fit in the packed cache");
 
 static bool validate_deployment_geometry() {
 #pragma HLS INLINE
-    const unsigned input_idx = static_cast<unsigned>(TID_INPUT);
-    const unsigned output_idx = static_cast<unsigned>(TID_OUT);
-    if (s_header.tensor_desc_count.to_uint() <= output_idx) {
-        return false;
+    if (!runtime_profile_ready() || s_header.tensor_desc_count != 19) { return false; }
+    runtime_profile_t profile;
+    runtime_get_profile(profile);
+    const unsigned classes = s_tensor_desc[static_cast<unsigned>(TID_OUT)].c.to_uint();
+    if (classes != 2U && classes != 20U) { return false; }
+    // Validate the complete physical contract once at INIT. Version four alone
+    // cannot distinguish a baseline PARAM from a readdressed unified PARAM.
+    for (int id = 0; id < 19; ++id) {
+#pragma HLS PIPELINE off
+        unsigned h = profile.logits_h, w = profile.logits_w, c = 128U;
+        unsigned phys = 128U, offset = 0U, base = 0U;
+        unsigned bank = static_cast<unsigned>(BANK_FMEM0);
+        bool padded = false;
+        switch (id) {
+            case 0:
+                h = profile.input_h; w = profile.input_w; c = phys = profile.input_c;
+                break;
+            case 1:
+                h = profile.input_h / 2U; w = profile.input_w / 2U;
+                c = phys = profile.input_c; base = profile.pool1_base; padded = true;
+                break;
+            case 2: case 3:
+                h = profile.input_h / 2U; w = profile.input_w / 2U;
+                c = phys = 16U + profile.input_c; base = profile.b1_base;
+                bank = static_cast<unsigned>(BANK_FMEM1); padded = true;
+                break;
+            case 4: case 5:
+                h = profile.input_h / 4U; w = profile.input_w / 4U;
+                c = phys = 64U; base = profile.l20_base;
+                break;
+            case 6: case 7:
+                h = profile.input_h / 4U; w = profile.input_w / 4U; c = phys = 64U;
+                break;
+            case 8:
+                h = profile.input_h / 4U; w = profile.input_w / 4U;
+                c = phys = profile.input_c; bank = static_cast<unsigned>(BANK_BRAM_SCR1); padded = true;
+                break;
+            case 9: case 10:
+                h = profile.input_h / 4U; w = profile.input_w / 4U;
+                c = phys = 128U + profile.input_c; padded = true;
+                break;
+            case 11: case 12:
+                bank = static_cast<unsigned>(BANK_FMEM1); base = profile.l30_base;
+                break;
+            case 13: case 14:
+                phys = 256U; offset = 128U;
+                break;
+            case 15: case 16: c = phys = 256U; break;
+            case 17: c = phys = classes; base = profile.out_base; padded = true; break;
+            case 18:
+                h = profile.input_h / 2U; w = profile.input_w / 2U;
+                c = phys = profile.input_c; bank = static_cast<unsigned>(BANK_BRAM_SCR0); padded = true;
+                break;
+        }
+        const tensor_desc_t& tensor = s_tensor_desc[id];
+        const unsigned packed_phys = phys | (padded ? TENSOR_ROW_ALIGN32 : 0U);
+        if (tensor.bank_id.to_uint() != bank || tensor.elem_bytes != 1 ||
+            tensor.h.to_uint() != h || tensor.w.to_uint() != w || tensor.c.to_uint() != c ||
+            tensor.reserved0.to_uint() != packed_phys || tensor.reserved1.to_uint() != offset ||
+            tensor.base_offset.to_uint() != base) { return false; }
     }
-
-    const tensor_desc_t& input = s_tensor_desc[input_idx];
-    const tensor_desc_t& output = s_tensor_desc[output_idx];
-    const unsigned output_c = output.c.to_uint();
-    return input.elem_bytes.to_uint() == 1U &&
-           input.h.to_uint() == static_cast<unsigned>(INPUT_FRAME_H) &&
-           input.w.to_uint() == static_cast<unsigned>(INPUT_FRAME_W) &&
-           input.c.to_uint() == static_cast<unsigned>(INPUT_FRAME_C) &&
-           tensor_phys_c(input).to_uint() == static_cast<unsigned>(INPUT_FRAME_C) &&
-           (input.reserved0.to_uint() & TENSOR_ROW_ALIGN32) == 0U &&
-           input.reserved1.to_uint() == 0U && input.base_offset.to_uint() == 0U &&
-           input.bank_id.to_uint() == static_cast<unsigned>(BANK_FMEM0) &&
-           output.elem_bytes.to_uint() == 1U &&
-           output.h.to_uint() == static_cast<unsigned>(ENCODER_OUT_H) &&
-           output.w.to_uint() == static_cast<unsigned>(ENCODER_OUT_W) &&
-           output_c == static_cast<unsigned>(ENCODER_OUT_C);
+    return true;
 }
 
 static axi_vec_t* get_wbuf() {
@@ -418,12 +468,20 @@ static bool window_schedule_contract_valid(const window_sched_desc_t& desc) {
     unsigned channels = 0U;
     switch (desc.mode.to_uint()) {
         case WIN_MODE_3X3_STAGED_C1:
-            return word == (static_cast<unsigned>(WINDOW_ROW_REUSE_STRIDE2_KEEP1) |
-                            (WINGEN_C1_PACKED_ROW_WORDS << WINDOW_ROW_REUSE_WORDS_SHIFT)) &&
+        case WIN_MODE_3X3_STAGED_C3: {
+            runtime_profile_t profile;
+            runtime_get_profile(profile);
+            const unsigned first_c = desc.mode.to_uint() == WIN_MODE_3X3_STAGED_C1 ? 1U : 3U;
+            const unsigned packed_words = (profile.input_w * first_c + 31U) / 32U;
+            const bool reuse_ok = (reuse == static_cast<unsigned>(WINDOW_ROW_REUSE_STRIDE2_KEEP1) &&
+                                   words == packed_words) || (first_c == 3U && reuse == 0U && words == 0U);
+            return profile.input_c == first_c && protocol == 0U && reuse_ok &&
                    desc.kernel == 3 && desc.stride == 2 && desc.dilation == 1 && desc.padding == 1 &&
-                   desc.in_c == 1 && desc.k_tiles == 1 && desc.out_w == INPUT_FRAME_W / 2 &&
+                   desc.in_c.to_uint() == first_c && desc.k_tiles == 1 && desc.out_w.to_uint() == profile.input_w / 2U &&
+                   desc.cache_chunks == 1 &&
                    desc.loader_class.to_uint() == static_cast<unsigned>(WIN_LOADER_3X3_NARROW) &&
                    desc.flags.to_uint() == static_cast<unsigned>(WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2);
+        }
         case WIN_MODE_3X3_STAGED_C12:
             channels = 12U;
             if (protocol != ((desc.stride == 1 && desc.dilation == 1 &&
@@ -435,6 +493,10 @@ static bool window_schedule_contract_valid(const window_sched_desc_t& desc) {
             channels = 17U;
             if (protocol != static_cast<unsigned>(WINDOW_TRANSFER_COLUMN_DELTA)) { return false; }
             break;
+        case WIN_MODE_3X3_STAGED_C19:
+            channels = 19U;
+            if (protocol != static_cast<unsigned>(WINDOW_TRANSFER_COLUMN_DELTA)) { return false; }
+            break;
         case WIN_MODE_3X3_STAGED_C25:
             channels = 25U;
             if (protocol != static_cast<unsigned>(WINDOW_TRANSFER_COLUMN_DELTA)) { return false; }
@@ -443,6 +505,7 @@ static bool window_schedule_contract_valid(const window_sched_desc_t& desc) {
         case WIN_MODE_3X3_STAGED_C64: channels = 64U; break;
         case WIN_MODE_3X3_STAGED_C128: channels = 128U; break;
         case WIN_MODE_3X3_STAGED_C129: channels = 129U; break;
+        case WIN_MODE_3X3_STAGED_C131: channels = 131U; break;
         case WIN_MODE_1X1_ALIGNED:
         case WIN_MODE_1X1_PACKED:
             return word == 0U && desc.kernel.to_uint() == 1U && desc.in_c.to_uint() > 0U &&
@@ -455,7 +518,8 @@ static bool window_schedule_contract_valid(const window_sched_desc_t& desc) {
     const unsigned flags = desc.flags.to_uint();
     const bool paired = (flags & WINDOW_SCHED_FLAG_PIXEL_PARALLEL_2) != 0U;
     const unsigned requests = paired ? 6U : 3U;
-    if ((flags & ~3U) != 0U || desc.out_w == 0 ||
+    if ((flags & ~3U) != 0U || desc.out_w == 0 || desc.out_w > MAX_FM_W ||
+        (desc.stride != 1 && desc.stride != 2) || desc.dilation == 0 || desc.dilation > 16 ||
         (((flags & WINDOW_SCHED_FLAG_ODD_TAIL) != 0U) !=
          (paired && (desc.out_w.to_uint() & 1U) != 0U))) {
         return false;
@@ -473,7 +537,10 @@ static bool window_schedule_contract_valid(const window_sched_desc_t& desc) {
          desc.reserved[WINDOW_LOADER_STEADY_RUN_WORD] != 0x0202)) {
         return false;
     }
-    if (!narrow && paired) { return false; }
+    if (!narrow && (paired || desc.cache_chunks.to_uint() != (channels + 31U) / 32U ||
+                    desc.loader_words_per_col.to_uint() != 3U * desc.cache_chunks.to_uint() ||
+                    desc.loader_class.to_uint() != static_cast<unsigned>(WIN_LOADER_3X3_WIDE) ||
+                    desc.loader_request_cols != 3 || desc.loader_warmup_mask > 7 || desc.loader_steady_mask > 7)) { return false; }
     return reuse == 0U && words == 0U && (narrow || protocol == 0U) &&
            slots > 0U && (slots & (slots - 1U)) == 0U &&
            slots <= static_cast<unsigned>(narrow ? WINGEN_NARROW_CACHE_COL_SLOTS : WINGEN_WIDE_CACHE_COL_SLOTS) &&
@@ -629,8 +696,16 @@ static bool read_wbuf_word(u32_t local_word_offset, wgt_vec_t& word) {
     return true;
 }
 
+void param_dma_invalidate() {
+#pragma HLS INLINE
+    s_ready = false;
+}
+
 void param_dma_init(const axi_vec_t* gmem_param) {
 #pragma HLS INLINE off
+#pragma HLS ARRAY_PARTITION variable=s_affine_qparam_words complete dim=1
+#pragma HLS BIND_STORAGE variable=s_affine_qparam_words type=ram_2p impl=bram
+#pragma HLS RESET variable=s_affine_qparam_words off
 // PARAM v4 control tables are shallow descriptor memories. Binding them to
 // BRAM wastes one BRAM per decomposed struct field; LUTRAM keeps the ABI and
 // read latency unchanged while recovering scarce block RAM for data buffers.
@@ -649,6 +724,9 @@ void param_dma_init(const axi_vec_t* gmem_param) {
     ++s_param_generation;
     s_ready = false;
     s_weight_bytes = 0;
+    if (!runtime_profile_ready()) { return; }
+    runtime_profile_t profile;
+    runtime_get_profile(profile);
 
     load_header(gmem_param, s_header);
     const error_code_t header_error = validate_header(s_header);
@@ -701,12 +779,15 @@ void param_dma_init(const axi_vec_t* gmem_param) {
             conv.padding != sched.padding || conv.k_tiles != sched.k_tiles) {
             return;
         }
-        if (sched.mode.to_uint() == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C1)) {
+        if (sched.mode.to_uint() == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C1) ||
+            sched.mode.to_uint() == static_cast<unsigned>(WIN_MODE_3X3_STAGED_C3)) {
             const unsigned tid = conv.src_tensor.to_uint();
             if (tid >= s_header.tensor_desc_count.to_uint()) { return; }
             const tensor_desc_t& src = s_tensor_desc[tid];
-            if (src.h != INPUT_FRAME_H || src.w != INPUT_FRAME_W || src.c != 1 ||
-                tensor_phys_c(src) != 1 || tensor_row_stride_bytes(src) != INPUT_FRAME_W ||
+            if (tid != static_cast<unsigned>(TID_INPUT) || conv.param_id != 0 ||
+                src.h.to_uint() != profile.input_h || src.w.to_uint() != profile.input_w ||
+                src.c.to_uint() != profile.input_c || tensor_phys_c(src).to_uint() != profile.input_c ||
+                tensor_row_stride_bytes(src).to_uint() != profile.input_w * profile.input_c ||
                 src.reserved1 != 0 || src.elem_bytes != 1 ||
                 (src.base_offset.to_uint() & 31U) != 0U ||
                 conv.in_h != src.h || conv.in_w != src.w || conv.out_c == 0 || conv.out_c > 16) {
@@ -739,6 +820,13 @@ void param_dma_init(const axi_vec_t* gmem_param) {
 #pragma HLS PIPELINE off
         s_block5_sched[i] =
             load_block5_sched_desc(gmem_param, v4_block5_sched_offset(s_header) + i * BLOCK5_SCHED_DESC_BLOB_BYTES);
+        if (i < 4) {
+            const unsigned level = i < 2 ? 4U : 8U;
+            if (s_block5_sched[i].row_group_h.to_uint() != profile.block5_rows ||
+                s_block5_sched[i].branch_count != 5 ||
+                s_block5_sched[i].out_h.to_uint() != profile.input_h / level ||
+                s_block5_sched[i].out_w.to_uint() != profile.input_w / level) { return; }
+        }
     }
     for (int i = 0; i < MAX_CONV_PARAM_DESC_COUNT; ++i) {
 #pragma HLS PIPELINE off
@@ -750,13 +838,27 @@ void param_dma_init(const axi_vec_t* gmem_param) {
     u32_t affine_cursor = s_header.affine_qparam_offset;
     for (int i = 0; i < MAX_AFFINE_PARAM_DESC_COUNT; ++i) {
         if (i < static_cast<int>(s_header.affine_desc_count.to_uint())) {
-            const unsigned blocks = k_v3_affine_blocks[i];
+            const unsigned blocks = k_affine_qparam_blocks[i];
             s_affine_qparam_count[i] = static_cast<u8_t>((blocks > 8U) ? 8U : blocks);
             for (int block = 0; block < 8; ++block) {
 #pragma HLS PIPELINE off
                 if (static_cast<unsigned>(block) < blocks && block < 8) {
-                    s_affine_qparam[i][block] =
+                    const affine_qparam_t loaded =
                         load_affine_qparam_wordwise(gmem_param, affine_cursor + block * sizeof(affine_qparam_t));
+                    const unsigned record = k_affine_qparam_base[i] + static_cast<unsigned>(block);
+                    for (int group = 0; group < AFFINE_CACHE_GROUPS; ++group) {
+#pragma HLS UNROLL
+                        ap_uint<320> packed = 0;
+                        for (int lane = 0; lane < 4; ++lane) {
+#pragma HLS UNROLL
+                            const int channel = group * 4 + lane;
+                            packed.range(lane * 80 + 31, lane * 80) = loaded.mul[channel].range(31, 0);
+                            packed.range(lane * 80 + 63, lane * 80 + 32) = loaded.bias[channel].range(31, 0);
+                            packed.range(lane * 80 + 71, lane * 80 + 64) = loaded.shift[channel];
+                            packed.range(lane * 80 + 79, lane * 80 + 72) = loaded.reserved[channel];
+                        }
+                        s_affine_qparam_words[group][record] = packed;
+                    }
                 }
             }
             affine_cursor += static_cast<u32_t>(blocks * sizeof(affine_qparam_t));
@@ -917,7 +1019,19 @@ bool param_dma_get_affine_qparam(u8_t param_id, u8_t block_id, aff_q_t& qparam) 
         block < 0 || block >= static_cast<int>(s_affine_qparam_count[idx].to_uint())) {
         return false;
     }
-    qparam = s_affine_qparam[idx][block];
+    const unsigned record = k_affine_qparam_base[idx] + static_cast<unsigned>(block);
+    for (int group = 0; group < AFFINE_CACHE_GROUPS; ++group) {
+#pragma HLS UNROLL
+        const ap_uint<320> packed = s_affine_qparam_words[group][record];
+        for (int lane = 0; lane < 4; ++lane) {
+#pragma HLS UNROLL
+            const int channel = group * 4 + lane;
+            qparam.mul[channel].range(31, 0) = packed.range(lane * 80 + 31, lane * 80);
+            qparam.bias[channel].range(31, 0) = packed.range(lane * 80 + 63, lane * 80 + 32);
+            qparam.shift[channel] = packed.range(lane * 80 + 71, lane * 80 + 64);
+            qparam.reserved[channel] = packed.range(lane * 80 + 79, lane * 80 + 72);
+        }
+    }
     return true;
 }
 

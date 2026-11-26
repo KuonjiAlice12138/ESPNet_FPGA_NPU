@@ -1,41 +1,51 @@
-# ESP_INT8_hls Component Notes
+# Unified INT8 HLS Component
 
-当前目录是实际使用中的 `Vitis HLS` component 根目录。
+Branch: feature/p7-unified-int8. Production entry: hls_config.cfg;
+top: espnet_encoder_int8_core. Synthesis/implementation remain manual.
 
-## 目录约定
+## Module Owners
 
-```text
-ESP_INT8_hls/
-├── include/
-├── src/
-├── tb/
-├── hls_config.cfg
-└── vitis-comp.json
-```
+- int8_core.cpp: external interfaces, runtime validation and INIT/RUN.
+- main_ctrl.cpp: PARAM EXEC scheduling, single dispatch tail.
+- conv_engine.cpp: one shared Conv row DATAFLOW and one SA call site.
+- win_gen.cpp: PARAM-scheduled windows; shared C1/C3 input-row reuse.
+- sa_core.cpp: shared 32x32 MAC/reduction, 16-lane psum output.
+- ppu.cpp: fused row consumers and local BLOCK5 finalization.
+- vec_alu_engine.cpp: fixed affine/add families and row commit.
+- avgpool_unit.cpp: one shared C1/C3 group engine.
+- memory.cpp / scratch_mgr.cpp: one physical RAM owner and lifetime protection.
+- conv_store.cpp: compact/aligned store and writeback owner.
+- frame_dma.cpp: bounded native/crop-select-pack input pipeline.
+- upsample_unit.cpp: shared bilinear-logits/argmax mask-output owner.
+- param_dma.cpp: PARAM v4 descriptor/qparam loading and validation.
 
-## 当前逻辑模块与文件名映射
+No legacy if_dec, concat, standalone BLOCK5 finalizer, task-sequence mux or
+ALLOCATION directive is required. Different modes do not instantiate separate NPUs.
 
-| 逻辑模块 | 当前文件名 |
-|---|---|
-| `espnet_encoder_int8_core` | `src/int8_core.cpp` |
-| `instruction_fetch_decode` | `src/if_dec.cpp` |
-| `frame_dma` | `src/frame_dma.cpp` |
-| `param_dma` | `src/param_dma.cpp` |
-| `on_chip_memory` | `src/memory.cpp` |
-| `window_generator_row` | `src/win_gen.cpp` |
-| `systolic_array_core_row` | `src/sa_core.cpp` |
-| `conv_post_process / row_store` | `src/int8_core.cpp` |
-| `avgpool_unit_checked / affine / add / store` | `src/avgpool_unit.cpp` |
-| `concat_writer` | `src/concat_unit.cpp` |
-| `fullres_upsample` | `src/upsample_unit.cpp` |
+## Runtime Contract
 
-公共头文件：
+See tools/geometry_contract.py and report_and_workplans/workplan_1116.md.
+Eight encoder profiles share 0x530000 bytes FMBUF, including 0x380000 bytes
+URAM prefix with one shared 256-bit word bus. The four-bank experiment was
+removed after physical routing and packing regressed; logical addresses and
+the unified layout are unchanged. Affine coefficients use eight packed 320-bit
+BRAM groups, with 26 live records in a 32-record allocation, not lane-wise auto RAMs.
+Descriptor caches are bounded by the finite 19-tensor/16-EXEC graph; frame resets
+invalidate aliases without resetting feature RAM. Conv configuration loads one
+shared descriptor/schedule/qparam set before inline mode adapters. Actual RAM binding, resource
+use and read-path throughput still require csynth and implementation review.
+Runtime ports: model_profile_id, src_mode, mask_mode; readable runtime_abi_id,
+runtime_capability, runtime_status. Profiling outputs are unchanged.
+The unified ABI/layout requires new PARAMs, a repackaged IP and a new platform.
 
-- `include/npu_types.hpp`
-- `include/npu_config.hpp`
-- `include/npu_uop.hpp`
-- `include/npu_q.hpp`
+## Verification
 
-当前测试骨架：
+The default TB reads hw_artifacts/unified_int8/RUNS.CSV, not a fixed native512
+artifact. Override only with ESP_INT8_CSIM_RUNTIME_ROOT pointing at another
+validated unified catalog. It checks ten published cases plus a return to the
+first model, logits/mask bytes, active output bounds and negative commands.
+Use tools/test_unified_runtime_contract.py for host CSim and component checks.
 
-- `tb/top_tb.cpp`
+An optional Vitis CSim runner is run_csim_unified.tcl; it never launches csynth.
+Host CSim is not RTL co-simulation or a routing/resource guarantee. Sequential
+stream-depth diagnostics must not be used to size DATAFLOW FIFOs.
